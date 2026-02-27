@@ -1,0 +1,4 @@
+output_dir: ${private.output_dir}
+data_dir: ${private.data_dir}/single_layer.h5
+root_dir: ${private.root_dir}
+full_path: ${private.output_dir}/${project_name}/${network_name}/

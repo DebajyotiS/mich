@@ -1,0 +1,115 @@
+_target_: src.models.mich.MICH
+
+# ── Free scalars ──────────────────────────────────────────────────────────────
+# Constraints on derived values are annotated inline with "# = <expression>".
+#
+#   L         number of cortical input layers
+#   C         MaskedLayerMixing output channels → first spatial encoder cin
+#   c_enc     final spatial encoder output channels → all temporal cin + decoder cin
+#   c_dec     decoder feature channels → time_film_config.c_dec must equal this
+#   num_freqs Fourier frequencies → time_film_config.embed_dim = 2 * num_freqs
+# ─────────────────────────────────────────────────────────────────────────────
+
+heinzle_net:
+  _target_: src.models.blocks.HeinzleNet
+  layer_mixing_config:
+    L: 3                #  L
+    C: 32               #  C
+    init_identity: true
+
+  # Each layer's cin must equal the previous layer's cout.
+  # First cin = C; last cout = c_enc.
+  spatial_encoder_config:
+    - cin: 32           # = C
+      cout: 64          # = c_enc (single-stage: set to c_enc directly)
+      stride: 1
+      dw_kernel: 3
+      pw_kernel: 1
+      num_groups: 4     # must divide cout
+      activation: silu
+    - cin: 64           # = previous cout
+      cout: 64          # = c_enc
+      stride: 1
+      dw_kernel: 3
+      pw_kernel: 1
+      num_groups: 4     # must divide cout
+      activation: silu
+
+  # Dilations are auto-set to 2^i by TemporalMixingEncoder so do not add dilation.
+  # All layers must share the same cin (residual skip connection x + residual).
+  temporal_mixing_config:
+    - cin: 64           # = c_enc
+      kernel_size: 3
+      num_groups: 4     # must divide cin
+      activation: silu
+    - cin: 64           # = c_enc
+      kernel_size: 3
+      num_groups: 4
+      activation: silu
+    - cin: 64           # = c_enc
+      kernel_size: 3
+      num_groups: 4
+      activation: silu
+    - cin: 64           # = c_enc
+      kernel_size: 3
+      num_groups: 4
+      activation: silu
+
+  time_embedding_config:
+    num_freqs: 16       #  num_freqs
+    max_freq: 10.0
+
+  time_film_config:
+    embed_dim: 32       # = 2 * num_freqs
+    hidden_dim: 64
+    activation: silu
+    c_dec: 32           #  c_dec; must equal spatial_decoder_config.c_dec
+
+  spatial_decoder_config:
+    cin: 64             # = c_enc
+    c_dec: 32           # c_dec; must equal time_film_config.c_dec
+    out_channels: 21    # = 7 * L  (hardcoded reshape in SpatialDecoder.forward:255)
+    activation: silu
+    L: 3                # = L
+
+loss_config:
+  lambda_data: 1.0
+  lambda_physics: 1e-3
+  n_time: 1000
+  n_space: 100
+
+haemo:
+  kappa: 0.65       # Vasodilatory signal decay rate
+  gamma: 0.41       # Autoregulatory feedback rate
+  alpha: 0.32       # Grubb's exponent
+  tau: 2.66          # Mean transit time (s)
+  lambda_d: 0.5
+
+acquisition:
+  f0: 28.625        # Frequency offset at outer vessel surface (Hz)
+  E0: 0.34          # Resting oxygen extraction fraction
+  TE: 0.25          # Echo time (s)
+  r0: 340           # Intravascular relaxation rate (Hz)
+  eps: 1.0e-32
+  k1: 10.4624375
+  k2: 2.433125e-32
+  k3: 1.0
+
+V0: 0.5
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _partial_: true
+  T_max: 100
+  eta_min: 1.0e-6
+
+lightning:
+  interval: epoch
+  frequency: 1
+  monitor: val/loss

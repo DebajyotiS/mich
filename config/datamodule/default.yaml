@@ -1,0 +1,37 @@
+_target_: src.data.synthetic.SyntheticDataModule
+
+data:
+  path: ${paths.data_dir}
+  layers: [layer_0, layer_1, layer_2]
+  dtype: float16   # float16 recommended for large full-window tensors
+  return_meta: true
+
+split:
+  # Use fractions OR explicit counts
+  train_frac: 0.8
+  val_frac: 0.1
+  test_frac: 0.1
+
+  train_count: null
+  val_count: null
+  test_count: null
+
+  seed: 123
+  shuffle: true
+
+loader:
+  batch_size: 2
+  num_workers: 1
+
+  pin_memory: true
+  persistent_workers: true # Always keep this true
+  prefetch_factor: 1
+  drop_last: true
+  use_block_shuffle: false
+  block_size: 16
+
+h5_cache:
+  # Per-worker cache. With 4 workers and 1GB each,
+  rdcc_nbytes: 1073741824
+  rdcc_nslots: 1000003
+  rdcc_w0: 0.75

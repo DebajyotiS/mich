@@ -1,0 +1,11 @@
+wandb:
+  _target_: pytorch_lightning.loggers.wandb.WandbLogger
+  entity: ${private.entity}
+  offline: True
+  id: null
+  log_model: False
+  group: null
+  project: ${project_name}
+  name: ${network_name}
+  save_dir: ${paths.full_path}
+  resume: ${resume.state}
