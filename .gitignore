@@ -54,8 +54,11 @@ lightning_logs/
 # --------------------------------------------------
 # Private / local configuration
 # --------------------------------------------------
-config/private/
+config/private/private.yaml
 
 # --------------------------------------------------
 # Data (if not versioned)
 # --------------------------------------------------
+notebooks/*.mp4
+notebooks/*.py
+data/
