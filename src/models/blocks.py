@@ -20,75 +20,44 @@ class SpatialDecoderManifest:
 
 
 class MaskedLayerMixing(nn.Module):
-    """
-    Masked layer mixing (L -> L) with a 1x1 convolution, then expands to C channels.
-    """
-
     def __init__(self, L: int = 3, C: int = 16, init_identity: bool = True):
         super().__init__()
-        self.C = C
-        self.L = L
-        self.mask: torch.Tensor
-        self._generate_mask()
-        self._register_mask()
+        self.C = int(C)
+        self.L = int(L)
 
-        self.W = nn.Parameter(torch.zeros((L, L, 1, 1)))  # [L, L, 1, 1]
-        self.b = nn.Parameter(torch.zeros((L,)))  # [L]
-        self.expand_net = nn.Conv2d(L, C, kernel_size=1, bias=True)
+        self._generate_mask()
+
+        self.W = nn.Parameter(torch.zeros((self.L, self.L, 1, 1)))  # fp32 params
+        self.b = nn.Parameter(torch.zeros((self.L,)))  # fp32 params
+        self.expand_net = nn.Conv2d(self.L, self.C, kernel_size=1, bias=True)
+
         if init_identity:
             with torch.no_grad():
                 self.W.zero_()
-                self.W[0, 0, 0, 0] = 1.0
-                self.W[1, 1, 0, 0] = 1.0
-                self.W[2, 2, 0, 0] = 1.0
+                for i in range(self.L):
+                    self.W[i, i, 0, 0] = 1.0
 
-    def _generate_mask(self):
-        mask = torch.zeros((self.L, self.L))
+    def _generate_mask(self) -> None:
+        mask = torch.zeros((self.L, self.L), dtype=torch.float32)
         idx = torch.arange(self.L)
         mask[idx, idx] = 1.0
-        mask[idx[1:], idx[:-1]] = 1.0
-        self.register_buffer("mask", mask.view(self.L, self.L, 1, 1))  # [L, L, 1, 1]
-
-    def _register_mask(self):
-        pass
+        if self.L > 1:
+            mask[idx[1:], idx[:-1]] = 1.0
+        self.register_buffer("mask", mask.view(self.L, self.L, 1, 1), persistent=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Process input tensor through convolution and expansion layers.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape [B, L, T, H, W] where:
-                - B: batch size
-                - L: number of layers (must match self.L)
-                - T: temporal dimension
-                - H: height
-                - W: width
-
-        Returns:
-            torch.Tensor: Output tensor of shape [B, T, C, H, W] where:
-                - B: batch size
-                - T: temporal dimension
-                - C: number of output channels (self.C)
-                - H: height
-                - W: width
-
-        Raises:
-            AssertionError: If input layer dimension L does not match self.L
-        """
         B, L, T, H, W = x.shape
-        assert L == self.L, f"Expected input with {self.L} layers, got {L}"
+        if L != self.L:
+            raise AssertionError(f"Expected input with {self.L} layers, got {L}")
 
-        x = x.permute(0, 2, 1, 3, 4).reshape(B * T, L, H, W)  # [B*T, L, H, W]
+        x2d = x.permute(0, 2, 1, 3, 4).reshape(B * T, L, H, W)
 
+        # No dtype casting. Autocast will handle mixed precision safely.
         W_eff = self.W * self.mask
-        if W_eff.dtype != x.dtype:
-            W_eff = W_eff.to(x.dtype)
-        if self.b.dtype != x.dtype:
-            self.b = self.b.to(x.dtype)
-        x = F.conv2d(x, W_eff, bias=self.b)  # [B*T, L, H, W]
-        x = self.expand_net(x)  # [B*T, C, H, W]
-        x = x.view(B, T, self.C, H, W)  # [B, T, C, H, W]
-        return x
+        y = F.conv2d(x2d, W_eff, bias=self.b)
+        y = self.expand_net(y)
+        y = y.view(B, T, self.C, H, W)
+        return y
 
 
 class DepthWiseSeparableConvLayer(nn.Module):
@@ -209,37 +178,71 @@ class TemporalMixingEncoder(nn.Module):
 class FourierTimeEmbedding(nn.Module):
     def __init__(self, num_freqs: int = 16, max_freq: float = 10.0):
         super().__init__()
-        self.num_freqs = num_freqs
-        self.max_freq = max_freq
+        self.num_freqs = int(num_freqs)
+        self.max_freq = float(max_freq)
 
-    def forward(self, t):
-        # t: [B, T]
+        # Precompute freqs in float32 on CPU; it'll move with the module to GPU.
         freqs = torch.logspace(
-            0.0,
-            torch.log10(torch.tensor(self.max_freq, device=t.device, dtype=t.dtype)),
+            start=0.0,
+            end=torch.log10(torch.tensor(self.max_freq, dtype=torch.float32)),
             steps=self.num_freqs,
-            device=t.device,
-            dtype=t.dtype,
+            dtype=torch.float32,
         )  # [F]
+        self.register_buffer("freqs", freqs, persistent=True)
 
-        ang = 2 * torch.pi * t[..., None] * freqs  # [B, T, F]
-        emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [B, T, 2F]
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        t: [B, T] (or [T], or [B,T,1])
+        returns: [B, T, 2F] (or [T, 2F] if input was [T])
+        """
+        # Squeeze trailing singleton dim if present
+        if t.dim() >= 1 and t.shape[-1] == 1:
+            t = t.squeeze(-1)
+
+        # Ensure floating and run the embedding math in float32 for autocast safety.
+        if not torch.is_floating_point(t):
+            t = t.float()
+        else:
+            t = t.to(torch.float32)
+
+        freqs = self.freqs.to(device=t.device, dtype=torch.float32)
+
+        # Disable autocast for trig to avoid unexpected dtype promotion paths.
+        device_type = "cuda" if t.is_cuda else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            ang = (2.0 * torch.pi) * t[..., None] * freqs  # [..., F]
+            emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [..., 2F]
+
         return emb
 
 
 class TimeFiLM(nn.Module):
     def __init__(self, embed_dim: int, hidden_dim: int, activation: str, c_dec: int):
         super().__init__()
+        self.c_dec = int(c_dec)
         self.linear = nn.Linear(embed_dim, hidden_dim)
         self.activation = get_activation(activation)
-        self.out = nn.Linear(hidden_dim, 2 * c_dec)  # output gamma and beta for FiLM modulation
+        self.out = nn.Linear(hidden_dim, 2 * self.c_dec)
 
     def forward(self, e_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        B, T, E = e_t.shape
-        out = self.linear(e_t)  # [B, T, hidden_dim]
-        out = self.activation(out)
-        out = self.out(out)  # [B, T, 2*c_dec]
-        gamma, beta = out.chunk(2, dim=-1)  # [B, T, c_dec], [B, T, c_dec]
+        """
+        e_t: [..., E]
+        returns gamma, beta: [..., c_dec]
+        """
+        if e_t.dim() < 1:
+            raise ValueError(f"Expected e_t with at least 1 dim (E). Got shape {tuple(e_t.shape)}")
+
+        orig_shape = e_t.shape[:-1]
+        E = e_t.shape[-1]
+
+        x = e_t.reshape(-1, E)  # [N, E]
+        x = self.linear(x)  # [N, hidden]
+        x = self.activation(x)
+        x = self.out(x)  # [N, 2*c_dec]
+        x = x.view(*orig_shape, 2, self.c_dec)  # [..., 2, c_dec]
+
+        gamma = x[..., 0, :]  # [..., c_dec]
+        beta = x[..., 1, :]  # [..., c_dec]
         return gamma, beta
 
 
@@ -323,10 +326,11 @@ class SpatioTemporalDecoder(nn.Module):
 
     def _gamma_beta(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        t: [B,T] -> gamma,beta: [B,T,c_dec]
+        t: [...], typically [B,T]
+        -> gamma,beta: [..., c_dec]
         """
-        emb = self.time_embedding(t)  # [B,T,E]
-        gamma, beta = self.time_film(emb)  # [B,T,c_dec] each
+        emb = self.time_embedding(t)  # [..., E]
+        gamma, beta = self.time_film(emb)  # [..., c_dec]
         return gamma, beta
 
     def _decode_from_film(
@@ -377,24 +381,20 @@ class SpatioTemporalDecoder(nn.Module):
 
     def _gamma_beta_time_grads(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute diagonal time derivatives for each (b,t):
-        dgamma[b,t,:] / dt[b,t]  and  dbeta[b,t,:] / dt[b,t]
-
         Returns:
         dgamma_dt, dbeta_dt: [B,T,c_dec]
         """
         B, T = t.shape
-        t_bt = t.reshape(B * T)  # [BT]
+        t_bt = t.reshape(-1)  # [BT]
 
-        def one(t_scalar: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            # scalar -> (gamma_vec, beta_vec) both [c_dec]
-            tt = t_scalar.view(1, 1)
-            g, b = self._gamma_beta(tt)
-            return g.view(-1), b.view(-1)
+        def one_scalar(ts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # ts is a scalar tensor (shape [])
+            emb = self.time_embedding(ts)  # [E]
+            g, b = self.time_film(emb)  # [c_dec], [c_dec]
+            return g, b
 
-        # elementwise derivatives wrt scalar input
-        dg_bt = vmap(lambda ti: jacrev(lambda x: one(x)[0])(ti))(t_bt)  # [BT,c_dec]
-        db_bt = vmap(lambda ti: jacrev(lambda x: one(x)[1])(ti))(t_bt)  # [BT,c_dec]
+        dg_bt = vmap(lambda ts: jacrev(lambda x: one_scalar(x)[0])(ts))(t_bt)  # [BT, c_dec]
+        db_bt = vmap(lambda ts: jacrev(lambda x: one_scalar(x)[1])(ts))(t_bt)  # [BT, c_dec]
 
         c_dec = dg_bt.shape[-1]
         return dg_bt.view(B, T, c_dec), db_bt.view(B, T, c_dec)

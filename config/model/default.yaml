@@ -75,8 +75,8 @@ heinzle_net:
 loss_config:
   lambda_data: 1.0
   lambda_physics: 1e-3
-  n_time: 1000
-  n_space: 100
+  n_time: 2000
+  n_space: 400
 
 haemo:
   kappa: 0.65       # Vasodilatory signal decay rate
