@@ -14,7 +14,8 @@ from src.utils.hydra_utils import (
     reload_original_config,
     save_config,
 )
-
+import rootutils
+root = rootutils.setup_root(__file__, pythonpath=True, cwd=False)
 log = logging.getLogger(__name__)
 
 
