@@ -25,7 +25,6 @@ loader:
   drop_last: true
 
 h5_cache:
-  # Don’t make this huge on startup. Your previous values are overkill.
   rdcc_nbytes: 268435456   # 256MB per worker
   rdcc_nslots: 200003     
   rdcc_w0: 0.75

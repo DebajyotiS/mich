@@ -1,12 +1,3 @@
-# synthetic.py
-# HDF5 (single-file) loader for layered BOLD + x with full-window reads.
-# Optimized for fast startup + fast per-sample reads:
-# - per-worker lazy open
-# - caches dataset handles (avoids repeated h5py group traversal)
-# - avoids np.stack and extra allocations
-# - respects requested dtype (fp16/fp32)
-# - DataLoader actually uses pin_memory / persistent_workers / prefetch_factor
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -306,7 +297,7 @@ class SyntheticH5Dataset(Dataset):
                 {
                     "num_pulses": int(self._m_num_pulses[idx]),
                     "source_layer": int(self._m_source_layer[idx]),
-                    "source_position": self._m_source_position[idx],  # keep as-is (could be array)
+                    "source_position": self._m_source_position[idx],
                 }
             )
 
