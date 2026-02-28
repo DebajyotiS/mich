@@ -1,6 +1,8 @@
 # MICH: Machine Inference for Cortical Haemodynamics
 
-**BOLD signal inversion to neural activity across cortical layers**
+[![pipeline status](https://gitlab.epfl.ch/sengupta/mich/-/badges/main/pipeline.svg)](https://gitlab.epfl.ch/sengupta/mich/-/commits/main)
+[![coverage](https://gitlab.epfl.ch/sengupta/mich/-/badges/main/coverage.svg)](https://gitlab.epfl.ch/sengupta/mich/-/graphs/main/charts)
+
 
 This project aims to solve the inverse problem: inferring latent neural signals from observed BOLD (Blood Oxygen Level Dependent) signals measured across cortical layers. We use physics-informed neural networks (PINNs) and the Balloon hemodynamic model to address the challenge, focusing on:
 

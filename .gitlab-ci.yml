@@ -1,7 +1,12 @@
-# .gitlab-ci.yml
 stages:
   - lint
   - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
 
 default:
   image: python:3.13-slim
@@ -10,36 +15,22 @@ default:
     paths:
       - .cache/pip
       - .venv/
-  variables:
-    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-    PYTHONDONTWRITEBYTECODE: "1"
-    PIP_DISABLE_PIP_VERSION_CHECK: "1"
-    PIP_NO_PYTHON_VERSION_WARNING: "1"
 
-# Reusable install step
 .install_deps: &install_deps
   before_script:
     - python --version
-    - python -m venv .venv
+    - pip install -U uv
+    - uv venv .venv
     - . .venv/bin/activate
-    - python -m pip install -U pip wheel
-    # Install your package + dev deps. If you don't package/install the project,
-    # use "pip install -r requirements.txt" instead.
-    - pip install -e ".[dev]"
-    # If torch install is flaky on slim images, you can pin CPU wheels here.
-    # - pip install --index-url https://download.pytorch.org/whl/cpu torch
+    - uv pip install -e ".[dev]"
 
 ruff:
   stage: lint
   <<: *install_deps
   script:
     - . .venv/bin/activate
-    - ruff --version
     - ruff check src tests
     - ruff format --check src tests
-  rules:
-    - if: $CI_PIPELINE_SOURCE
-  allow_failure: false
 
 pytest:
   stage: test
@@ -57,14 +48,8 @@ pytest:
     when: always
     reports:
       junit: junit.xml
-      coverage_report:
-        coverage_format: cobertura
-        path: coverage.xml
     paths:
-      - htmlcov/
-      - coverage.xml
       - junit.xml
+      - coverage.xml
+      - htmlcov/
     expire_in: 7 days
-  rules:
-    - if: $CI_PIPELINE_SOURCE
-  allow_failure: false

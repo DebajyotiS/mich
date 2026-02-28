@@ -1,3 +1,5 @@
+from dataclasses import FrozenInstanceError
+
 import numpy as np
 import pytest
 
@@ -110,11 +112,9 @@ def test_params_frozen_and_defaults():
     assert p.max_substeps == 128
     assert p.noise_as_sde is True
 
-    with pytest.raises(Exception):
-        # frozen dataclass: cannot reassign
+    with pytest.raises((FrozenInstanceError, AttributeError)):
         p.dt = 0.02  # type: ignore[misc]
-
-
+        
 # -------------------------
 # LayeredDiffusionSimulator.__init__
 # -------------------------
