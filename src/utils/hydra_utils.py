@@ -13,8 +13,8 @@ import rich.syntax
 import rich.tree
 import wandb
 from lightning import LightningModule, Trainer
-from omegaconf import DictConfig, ListConfig, OmegaConf
 from lightning_fabric.utilities.rank_zero import rank_zero_only
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 log = logging.getLogger(__name__)
 

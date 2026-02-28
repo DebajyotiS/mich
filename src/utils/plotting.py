@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
 import numpy as np
 import torch
+from matplotlib.figure import Figure
 
 
 def plot_layers(

@@ -4,17 +4,15 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal, Mapping
 
-import rootutils
+import matplotlib.pyplot as plt  # for closing figures after logging to wandb
 import torch
 import torch.nn.functional as F
 import wandb
 from pytorch_lightning import LightningModule
 
-root = rootutils.setup_root(__file__, pythonpath=True)
 from src.data.balloon import AcquisitionConstants
 from src.models.blocks import HeinzleSignal, SpatialDecoderManifest
 from src.utils.plotting import plot_layers
-import matplotlib.pyplot as plt  # for closing figures after logging to wandb
 
 
 @dataclass(frozen=True)
@@ -159,16 +157,27 @@ class MICH(LightningModule):
         n_space: int,
         device: torch.device,
     ) -> CollocationBatch:
-        """Sample collocation points uniformly at random for n_times time points and n_space spatial points."""
-        n_space_h = int(n_space**0.5)
-        n_space_w = n_space // n_space_h
-        t_idx = torch.randint(0, T, (n_times, 1, 1), device=device)
-        h_coords = torch.randint(0, H, (n_space_h,), device=device)
-        w_coords = torch.randint(0, W, (n_space_w,), device=device)
-        h_grid, w_grid = torch.meshgrid(h_coords, w_coords, indexing="ij")
-        t = t_idx.expand(-1, n_space_h, n_space_w).unsqueeze(0).unsqueeze(0)
-        h = h_grid.unsqueeze(0).expand(n_times, -1, -1).unsqueeze(0).unsqueeze(0)
-        w = w_grid.unsqueeze(0).expand(n_times, -1, -1).unsqueeze(0).unsqueeze(0)
+        """
+        Sample collocation points uniformly at random.
+
+        Returns tensors shaped:
+            t: [1, 1, n_times, n_space]
+            h: [1, 1, n_times, n_space]
+            w: [1, 1, n_times, n_space]
+        """
+
+        # Sample independent time indices
+        t = torch.randint(0, T, (n_times, n_space), device=device)
+
+        # Sample independent spatial coordinates
+        h = torch.randint(0, H, (n_times, n_space), device=device)
+        w = torch.randint(0, W, (n_times, n_space), device=device)
+
+        # Add leading dims to match your expected CollocationBatch format
+        t = t.unsqueeze(0).unsqueeze(0)
+        h = h.unsqueeze(0).unsqueeze(0)
+        w = w.unsqueeze(0).unsqueeze(0)
+
         return CollocationBatch(t=t, h=h, w=w)
 
     def _data_loss(self, z_hat: torch.Tensor, bold: torch.Tensor) -> torch.Tensor:

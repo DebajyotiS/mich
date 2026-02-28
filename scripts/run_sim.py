@@ -9,10 +9,9 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-import rootutils
+
 import yaml
 
-root = rootutils.setup_root(__file__, pythonpath=True)
 
 from src.data.balloon import (
     AcquisitionConstants,

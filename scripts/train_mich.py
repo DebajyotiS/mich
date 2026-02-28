@@ -2,11 +2,10 @@ import logging
 
 import hydra
 import pytorch_lightning as pl
-import rootutils
+
 import torch
 from omegaconf import DictConfig, ListConfig
 
-root = rootutils.setup_root(__file__, dotenv=True, pythonpath=True, cwd=False)  # noqa: E402
 
 from src.utils.hydra_utils import (
     instantiate_collection,

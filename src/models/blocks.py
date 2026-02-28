@@ -1,13 +1,11 @@
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, overload
+from typing import Any, Literal, Mapping
 
-import rootutils
 import torch
 from torch import nn
 from torch.func import jacrev, vmap
 from torch.nn import functional as F
 
-root = rootutils.setup_root(__file__, pythonpath=True)
 from src.utils.torch_utils import get_activation
 
 HeinzleSignal = Literal["x", "s", "f", "v", "q", "vstar", "qstar"]
