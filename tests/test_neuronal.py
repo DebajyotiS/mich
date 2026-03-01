@@ -114,7 +114,8 @@ def test_params_frozen_and_defaults():
 
     with pytest.raises((FrozenInstanceError, AttributeError)):
         p.dt = 0.02  # type: ignore[misc]
-        
+
+
 # -------------------------
 # LayeredDiffusionSimulator.__init__
 # -------------------------

@@ -7,9 +7,9 @@ data:
   return_meta: true
 
 split:
-  train_frac: 0.7
-  val_frac: 0.2
-  test_frac: 0.1
+  train_frac: 0.2
+  val_frac: 0.1
+  test_frac: 0.7
   train_count: null
   val_count: null
   test_count: null
@@ -17,8 +17,8 @@ split:
   shuffle: true
 
 loader:
-  batch_size: 4
-  num_workers: 2
+  batch_size: 8
+  num_workers: 4
   pin_memory: false
   persistent_workers: true
   prefetch_factor: 2

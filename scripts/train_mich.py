@@ -2,10 +2,9 @@ import logging
 
 import hydra
 import pytorch_lightning as pl
-
+import rootutils
 import torch
-from omegaconf import DictConfig, ListConfig
-
+from omegaconf import DictConfig
 
 from src.utils.hydra_utils import (
     instantiate_collection,
@@ -14,7 +13,7 @@ from src.utils.hydra_utils import (
     reload_original_config,
     save_config,
 )
-import rootutils
+
 root = rootutils.setup_root(__file__, pythonpath=True, cwd=False)
 log = logging.getLogger(__name__)
 
@@ -87,6 +86,5 @@ if __name__ == "__main__":
 
     # Set environment variable to show full error tracebacks in Hydra
     os.environ["HYDRA_FULL_ERROR"] = "1"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     main()
     log.info("All done. Exiting gracefully.")

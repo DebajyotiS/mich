@@ -9,9 +9,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-
 import yaml
-
 
 from src.data.balloon import (
     AcquisitionConstants,
@@ -84,7 +82,10 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
     durations = rng.uniform(0, 10 * dt, size=num_pulses)
     amplitudes = rng.uniform(0.4, 1.0, size=num_pulses)
 
-    pulse_list = [[float(a), float(o), float(d)] for a, o, d in zip(amplitudes, onsets, durations)]
+    pulse_list = [
+        [float(a), float(o), float(d)]
+        for a, o, d in zip(amplitudes, onsets, durations, strict=True)
+    ]
     pulse = Pulse(
         pulse_type=sc.get("pulse_type", "rect"),
         peaks=pulse_list,

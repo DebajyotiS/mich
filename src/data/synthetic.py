@@ -114,9 +114,10 @@ class SyntheticH5Dataset(Dataset):
       neural: (L, T, H, W)
 
     Performance:
-    - each DataLoader worker opens its own file lazily
-    - caches dataset handles (avoids repeated HDF5 traversal)
-    - avoids np.stack allocations by preallocating and filling
+    - each DataLoader worker opens its own file handle lazily on first __getitem__
+    - dataset handles are cached to avoid repeated HDF5 tree traversal
+    - read_direct eliminates intermediate allocations on every sample read
+    - np_dtype resolved once at construction
     """
 
     def __init__(
@@ -132,176 +133,78 @@ class SyntheticH5Dataset(Dataset):
         self.path = str(path)
         self.layers = tuple(layers)
         self.dtype = dtype
+        self._np_dtype = _np_dtype(dtype)  # resolved once, reused every __getitem__
         self.return_meta = bool(return_meta)
         self.cache_cfg = dict(cache_cfg)
 
-        # worker-local handles (not pickled)
+        # worker-local handles — never pickled
         self._h5: Optional[h5py.File] = None
         self._bold_ds: Optional[list[h5py.Dataset]] = None
         self._x_ds: Optional[list[h5py.Dataset]] = None
-
-        # meta handles
         self._m_num_pulses: Optional[h5py.Dataset] = None
         self._m_source_layer: Optional[h5py.Dataset] = None
         self._m_source_position: Optional[h5py.Dataset] = None
 
-        # static shape info (read once in main process)
+        # read static shape info once in the main process
         with h5py.File(self.path, "r") as f:
             self.N = int(f[self.layers[0]]["bold"].shape[0])
-            # infer window shape from first layer
             t, h, w = f[self.layers[0]]["bold"].shape[1:]
             self._window_shape = (int(t), int(h), int(w))
 
     def __len__(self) -> int:
         return self.N
 
-    def __getstate__(self):
-        # do not pickle open file handles into workers
+    def __getstate__(self) -> dict:
+        # null all file handles so workers always start fresh
         d = dict(self.__dict__)
-        d["_h5"] = None
-        d["_bold_ds"] = None
-        d["_x_ds"] = None
-        d["_m_num_pulses"] = None
-        d["_m_source_layer"] = None
-        d["_m_source_position"] = None
+        for k in ("_h5", "_bold_ds", "_x_ds",
+                  "_m_num_pulses", "_m_source_layer", "_m_source_position"):
+            d[k] = None
         return d
 
-    def __del__(self):
+    def __del__(self) -> None:
         try:
             if self._h5 is not None:
                 self._h5.close()
-        except Exception:
-            pass
-        self._h5 = None
+                self._h5 = None
+        except ImportError:
+            pass  # interpreter shutting down, h5py already unloaded
 
     def _ensure_open(self) -> None:
-        if self._h5 is None:
-            self._h5 = _open_h5(self.path, self.cache_cfg)
-            self._bold_ds = [self._h5[lyr]["bold"] for lyr in self.layers]
-            self._x_ds = [self._h5[lyr]["x"] for lyr in self.layers]
-            if self.return_meta:
-                self._m_num_pulses = self._h5["meta"]["num_pulses"]
-                self._m_source_layer = self._h5["meta"]["source_layer"]
-                self._m_source_position = self._h5["meta"]["source_position"]
-
-class SyntheticH5Dataset(Dataset):
-    """
-    Reads:
-      /layer_k/bold : (N, T, H, W) ideally chunked (1,T,H,W)
-      /layer_k/x    : (N, T, H, W) ideally chunked (1,T,H,W)
-
-    Returns tensors:
-      bold  : (L, T, H, W)
-      neural: (L, T, H, W)
-
-    Performance:
-    - each DataLoader worker opens its own file lazily
-    - caches dataset handles (avoids repeated HDF5 traversal)
-    - avoids np.stack allocations by preallocating and filling
-    """
-
-    def __init__(
-        self,
-        path: str,
-        *,
-        cache_cfg: Mapping[str, Any],
-        layers: Sequence[str] = ("layer_0", "layer_1", "layer_2"),
-        dtype: torch.dtype = torch.float32,
-        return_meta: bool = False,
-    ):
-        super().__init__()
-        self.path = str(path)
-        self.layers = tuple(layers)
-        self.dtype = dtype
-        self.return_meta = bool(return_meta)
-        self.cache_cfg = dict(cache_cfg)
-
-        # worker-local handles (not pickled)
-        self._h5: Optional[h5py.File] = None
-        self._bold_ds: Optional[list[h5py.Dataset]] = None
-        self._x_ds: Optional[list[h5py.Dataset]] = None
-
-        # meta handles
-        self._m_num_pulses: Optional[h5py.Dataset] = None
-        self._m_source_layer: Optional[h5py.Dataset] = None
-        self._m_source_position: Optional[h5py.Dataset] = None
-
-        # static shape info (read once in main process)
-        with h5py.File(self.path, "r") as f:
-            self.N = int(f[self.layers[0]]["bold"].shape[0])
-            # infer window shape from first layer
-            t, h, w = f[self.layers[0]]["bold"].shape[1:]
-            self._window_shape = (int(t), int(h), int(w))
-
-    def __len__(self) -> int:
-        return self.N
-
-    def __getstate__(self):
-        # do not pickle open file handles into workers
-        d = dict(self.__dict__)
-        d["_h5"] = None
-        d["_bold_ds"] = None
-        d["_x_ds"] = None
-        d["_m_num_pulses"] = None
-        d["_m_source_layer"] = None
-        d["_m_source_position"] = None
-        return d
-
-    def __del__(self):
-        try:
-            if self._h5 is not None:
-                self._h5.close()
-        except Exception:
-            pass
-        self._h5 = None
-
-    def _ensure_open(self) -> None:
-        if self._h5 is None:
-            self._h5 = _open_h5(self.path, self.cache_cfg)
-            self._bold_ds = [self._h5[lyr]["bold"] for lyr in self.layers]
-            self._x_ds = [self._h5[lyr]["x"] for lyr in self.layers]
-            if self.return_meta:
-                self._m_num_pulses = self._h5["meta"]["num_pulses"]
-                self._m_source_layer = self._h5["meta"]["source_layer"]
-                self._m_source_position = self._h5["meta"]["source_position"]
+        if self._h5 is not None:
+            return
+        self._h5 = _open_h5(self.path, self.cache_cfg)
+        self._bold_ds = [self._h5[lyr]["bold"] for lyr in self.layers]
+        self._x_ds = [self._h5[lyr]["x"] for lyr in self.layers]
+        if self.return_meta:
+            self._m_num_pulses = self._h5["meta"]["num_pulses"]
+            self._m_source_layer = self._h5["meta"]["source_layer"]
+            self._m_source_position = self._h5["meta"]["source_position"]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         self._ensure_open()
-        assert self._bold_ds is not None and self._x_ds is not None
 
         L = len(self.layers)
         T, H, W = self._window_shape
-        np_dtype = _np_dtype(self.dtype)
 
-        # Preallocate once per sample; fill layer-by-layer without stack copies.
-        bold = np.empty((L, T, H, W), dtype=np_dtype)
-        x = np.empty((L, T, H, W), dtype=np_dtype)
+        bold = np.empty((L, T, H, W), dtype=self._np_dtype)
+        x = np.empty((L, T, H, W), dtype=self._np_dtype)
 
         for l in range(L):
-            # Read (T,H,W) then cast without extra copy when possible.
-            b = self._bold_ds[l][idx]
-            n = self._x_ds[l][idx]
-            bold[l] = b.astype(np_dtype, copy=False)
-            x[l] = n.astype(np_dtype, copy=False)
+            self._bold_ds[l].read_direct(bold, source_sel=np.s_[idx], dest_sel=np.s_[l])
+            self._x_ds[l].read_direct(x, source_sel=np.s_[idx], dest_sel=np.s_[l])
 
-        out: Dict[str, Any] = {
-            "bold": bold,
-            "neural": x
-        }
+        out: Dict[str, Any] = {"bold": bold, "neural": x}
 
         if self.return_meta:
-            assert self._m_num_pulses is not None
-            assert self._m_source_layer is not None
-            assert self._m_source_position is not None
-            out.update(
-                {
-                    "num_pulses": int(self._m_num_pulses[idx]),
-                    "source_layer": int(self._m_source_layer[idx]),
-                    "source_position": self._m_source_position[idx],
-                }
-            )
+            out.update({
+                "num_pulses": int(self._m_num_pulses[idx]),
+                "source_layer": int(self._m_source_layer[idx]),
+                "source_position": self._m_source_position[idx],
+            })
 
         return out
+    
 
 class SyntheticDataModule(pl.LightningDataModule):
     def __init__(

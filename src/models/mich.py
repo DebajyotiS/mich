@@ -407,18 +407,18 @@ class MICH(LightningModule):
         )  # [subset, L, T]
         pred_neural = subset_z_hat[:, neural_index]  # [subset, L, T]
 
-        self._plot_and_log_preds(
+        self._plot_and_log_predictions(
             pred_bold=pred_bold,
             true_bold=subset_bold,
             pred_neural=pred_neural,
             true_neural=subset_neural,
         )
-        del self.pred_buffer
-        del self.bold_buffer
-        del self.neural_buffer
-        del self.source_position_buffer
+        self.pred_buffer.clear()
+        self.bold_buffer.clear()
+        self.neural_buffer.clear()
+        self.source_position_buffer.clear()
 
-    def _plot_and_log_preds(
+    def _plot_and_log_predictions(
         self,
         pred_bold: torch.Tensor,
         true_bold: torch.Tensor,
