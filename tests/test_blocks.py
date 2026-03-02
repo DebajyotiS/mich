@@ -414,21 +414,20 @@ def test_spatiotemporal_decoder_reshape_output_requires_out_channels_multiple_of
     c_dec = 4
     bad_out_channels = 7 * L + 1
 
-    dec = SpatioTemporalDecoder(
-        cin=cin,
-        c_dec=c_dec,
-        out_channels=bad_out_channels,
-        activation="silu",
-        L=L,
-        temporal_embedding_config=dict(num_freqs=2, max_freq=2.0),
-        temporal_film_config=dict(embed_dim=4, hidden_dim=8, activation="silu", c_dec=c_dec),
-        upsample=False,
-    )
+    with pytest.raises(AssertionError):
+        dec = SpatioTemporalDecoder(
+            cin=cin,
+            c_dec=c_dec,
+            out_channels=bad_out_channels,
+            activation="silu",
+            L=L,
+            temporal_embedding_config=dict(num_freqs=2, max_freq=2.0),
+            temporal_film_config=dict(embed_dim=4, hidden_dim=8, activation="silu", c_dec=c_dec),
+            upsample=False,
+        )
 
-    x = torch.randn(B, T, cin, H, W)
-    t = torch.linspace(0, 1, T).unsqueeze(0).expand(B, -1)
-
-    with pytest.raises(RuntimeError):
+        x = torch.randn(B, T, cin, H, W)
+        t = torch.linspace(0, 1, T).unsqueeze(0).expand(B, -1)
         _ = dec(x, t, return_gradients=False)
 
 

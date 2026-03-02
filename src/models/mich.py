@@ -309,15 +309,15 @@ class MICH(LightningModule):
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
         bold, neural = batch["bold"], batch["neural"]
 
-        manifest = self(
+        sd_manifest = self(
             bold,
             self._make_time_grid(
                 B=bold.shape[0], T=bold.shape[2], device=bold.device, dtype=bold.dtype
             ),
             return_gradients=True,
         )
-        z_hat = manifest.z_hat
-        dz_hat_dt = manifest.dz_hat_dt
+        z_hat = sd_manifest.z_hat
+        dz_hat_dt = sd_manifest.grads
         data_loss = self._data_loss(z_hat, bold)
         physics_loss = self._physics_loss(z_hat, dz_hat_dt)
         total_loss = (

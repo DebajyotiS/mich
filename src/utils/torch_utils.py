@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 def get_activation(activation: str) -> nn.Module:
@@ -59,3 +60,33 @@ def get_normalisation(normalisation: str, input_dims: int, **kwargs):
             return torch.nn.Identity()
         case _:
             raise ValueError(f"Unsupported normalisation: {normalisation}")
+
+
+def _sigmoid_deriv(x: torch.Tensor) -> torch.Tensor:
+    s = torch.sigmoid(x)
+    return s * (1.0 - s)
+
+
+def _softplus_deriv(x: torch.Tensor) -> torch.Tensor:
+    """d/dx softplus(x) = sigmoid(x)"""
+    return torch.sigmoid(x)
+
+
+def _one_plus_softplus(x: torch.Tensor) -> torch.Tensor:
+    return 1.0 + F.softplus(x)
+
+
+def _neg_softplus_neg(x: torch.Tensor) -> torch.Tensor:
+    """-softplus(-x)  — non-positive, smooth"""
+    return -F.softplus(-x)
+
+
+def _neg_softplus_neg_deriv(x: torch.Tensor) -> torch.Tensor:
+    """d/dx [-softplus(-x)] = sigmoid(x) - 1"""
+    return torch.sigmoid(x) - 1.0
+
+
+def _tanh_deriv(x: torch.Tensor) -> torch.Tensor:
+    """d/dx tanh(x) = 1 - tanh^2(x)"""
+    t = torch.tanh(x)
+    return 1.0 - t * t
