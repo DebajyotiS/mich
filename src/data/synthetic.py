@@ -11,7 +11,7 @@ import pytorch_lightning as pl
 
 try:
     from omegaconf import DictConfig
-except Exception:  # pragma: no cover
+except Exception:
     DictConfig = Any
 
 
@@ -128,6 +128,7 @@ class SyntheticH5Dataset(Dataset):
         layers: Sequence[str] = ("layer_0", "layer_1", "layer_2"),
         dtype: torch.dtype = torch.float32,
         return_meta: bool = False,
+        return_latents: bool = False,
     ):
         super().__init__()
         self.path = str(path)
@@ -135,6 +136,7 @@ class SyntheticH5Dataset(Dataset):
         self.dtype = dtype
         self._np_dtype = _np_dtype(dtype)  # resolved once, reused every __getitem__
         self.return_meta = bool(return_meta)
+        self.return_latents = bool(return_latents)
         self.cache_cfg = dict(cache_cfg)
 
         # worker-local handles — never pickled
@@ -144,6 +146,12 @@ class SyntheticH5Dataset(Dataset):
         self._m_num_pulses: Optional[h5py.Dataset] = None
         self._m_source_layer: Optional[h5py.Dataset] = None
         self._m_source_position: Optional[h5py.Dataset] = None
+        self._m_latent_s: Optional[list[h5py.Dataset]] = None
+        self._m_latent_f: Optional[list[h5py.Dataset]] = None
+        self._m_latent_v: Optional[list[h5py.Dataset]] = None
+        self._m_latent_q: Optional[list[h5py.Dataset]] = None
+        self._m_latent_v_star: Optional[list[h5py.Dataset]] = None
+        self._m_latent_q_star: Optional[list[h5py.Dataset]] = None
 
         # read static shape info once in the main process
         with h5py.File(self.path, "r") as f:
@@ -158,7 +166,8 @@ class SyntheticH5Dataset(Dataset):
         # null all file handles so workers always start fresh
         d = dict(self.__dict__)
         for k in ("_h5", "_bold_ds", "_x_ds",
-                  "_m_num_pulses", "_m_source_layer", "_m_source_position"):
+                  "_m_num_pulses", "_m_source_layer", "_m_source_position",
+                  "_m_latent_s", "_m_latent_f", "_m_latent_v", "_m_latent_q", "_m_latent_v_star", "_m_latent_q_star"):
             d[k] = None
         return d
 
@@ -180,7 +189,14 @@ class SyntheticH5Dataset(Dataset):
             self._m_num_pulses = self._h5["meta"]["num_pulses"]
             self._m_source_layer = self._h5["meta"]["source_layer"]
             self._m_source_position = self._h5["meta"]["source_position"]
-
+        if self.return_latents:
+            self._m_latent_s = [self._h5[lyr]["s"] for lyr in self.layers]
+            self._m_latent_f = [self._h5[lyr]["f"] for lyr in self.layers]
+            self._m_latent_v = [self._h5[lyr]["v"] for lyr in self.layers]
+            self._m_latent_q = [self._h5[lyr]["q"] for lyr in self.layers]
+            self._m_latent_v_star = [self._h5[lyr]["v_star"] for lyr in self.layers]
+            self._m_latent_q_star = [self._h5[lyr]["q_star"] for lyr in self.layers]
+            
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         self._ensure_open()
 
@@ -202,7 +218,32 @@ class SyntheticH5Dataset(Dataset):
                 "source_layer": int(self._m_source_layer[idx]),
                 "source_position": self._m_source_position[idx],
             })
+        
+        if self.return_latents:
+            s = np.empty((L, T, H, W), dtype=self._np_dtype)
+            f = np.empty((L, T, H, W), dtype=self._np_dtype)
+            v = np.empty((L, T, H, W), dtype=self._np_dtype)
+            q = np.empty((L, T, H, W), dtype=self._np_dtype)
+            v_star = np.empty((L, T, H, W), dtype=self._np_dtype)
+            q_star = np.empty((L, T, H, W), dtype=self._np_dtype)
+            
+            for l in range(L):
+                self._m_latent_s[l].read_direct(s, source_sel=np.s_[idx], dest_sel=np.s_[l])
+                self._m_latent_f[l].read_direct(f, source_sel=np.s_[idx], dest_sel=np.s_[l])
+                self._m_latent_v[l].read_direct(v, source_sel=np.s_[idx], dest_sel=np.s_[l])
+                self._m_latent_q[l].read_direct(q, source_sel=np.s_[idx], dest_sel=np.s_[l])
+                self._m_latent_v_star[l].read_direct(v_star, source_sel=np.s_[idx], dest_sel=np.s_[l])
+                self._m_latent_q_star[l].read_direct(q_star, source_sel=np.s_[idx], dest_sel=np.s_[l])
 
+            out.update({
+                "s": s,
+                "f": f,
+                "v": v,
+                "q": q,
+                "v_star": v_star,
+                "q_star": q_star
+            })
+    
         return out
     
 

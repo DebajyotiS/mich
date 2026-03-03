@@ -7,12 +7,7 @@ from torch.func import jacrev, vmap
 from torch.nn import functional as F
 
 from src.utils.torch_utils import (
-    _neg_softplus_neg,
-    _neg_softplus_neg_deriv,
-    _one_plus_softplus,
-    _sigmoid_deriv,
     _softplus_deriv,
-    _tanh_deriv,
     get_activation,
 )
 
@@ -69,18 +64,43 @@ _IDENTITY = ChannelActivation(
 
 HEINZLE_ACTIVATIONS: dict[HeinzleSignal, ChannelActivation] = {
     "x": ChannelActivation(fn=F.softplus, dfn_dx=_softplus_deriv),
-    "s": ChannelActivation(fn=F.tanh, dfn_dx=_tanh_deriv),
-    "f": ChannelActivation(fn=_one_plus_softplus, dfn_dx=_softplus_deriv),
-    "v": ChannelActivation(fn=_one_plus_softplus, dfn_dx=_softplus_deriv),
-    "q": ChannelActivation(fn=torch.sigmoid, dfn_dx=_sigmoid_deriv),
-    "vstar": ChannelActivation(fn=F.softplus, dfn_dx=_softplus_deriv),
-    "qstar": ChannelActivation(fn=_neg_softplus_neg, dfn_dx=_neg_softplus_neg_deriv),
+    "s": _IDENTITY,
+    "f": ChannelActivation(fn=F.softplus, dfn_dx=_softplus_deriv),
+    "v": ChannelActivation(fn=F.softplus, dfn_dx=_softplus_deriv),
+    "q": ChannelActivation(fn=F.softplus, dfn_dx=_softplus_deriv),
+    "vstar": _IDENTITY,
+    "qstar": _IDENTITY,
 }
 
-# Ordered list matching HEINZLE_SIGNALS index
+
 HEINZLE_ACTIVATIONS_ORDERED: list[ChannelActivation] = [
     HEINZLE_ACTIVATIONS[s] for s in HEINZLE_SIGNALS
 ]
+
+
+def _init_heinzle_output_bias(out_conv: nn.Conv2d, L: int) -> None:
+    if out_conv.bias is None:
+        raise ValueError("Expected out_conv to have a bias for Heinzle output initialization.")
+    if out_conv.out_channels != 7 * L:
+        raise ValueError(
+            f"Expected out_conv to have out_channels={7 * L} for Heinzle output initialization, "
+            f"got {out_conv.out_channels}."
+        )
+
+    softplus_inv_1 = 0.5413  # softplus(0.5413)
+    softplus_inv_0 = -3.0  # softplus(-3.0)
+
+    x_idx = HEINZLE_SIGNAL_IDX["x"]
+    f_idx = HEINZLE_SIGNAL_IDX["f"]
+    v_idx = HEINZLE_SIGNAL_IDX["v"]
+    q_idx = HEINZLE_SIGNAL_IDX["q"]
+
+    with torch.no_grad():
+        out_conv.bias.zero_()
+        for layer_idx in range(L):
+            out_conv.bias[x_idx * L + layer_idx] = softplus_inv_0
+            for sidx in (f_idx, v_idx, q_idx):
+                out_conv.bias[sidx * L + layer_idx] = softplus_inv_1
 
 
 class MaskedLayerMixing(nn.Module):
@@ -190,13 +210,14 @@ class TemporalDepthWiseTCNLayer(nn.Module):
         activation: str = "silu",
     ):
         super().__init__()
-        pad = (kernel_size - 1) * dilation // 2
+        # This pad is no longer used. We do explicit left-padding in forward() to ensure causality.
+        _pad = (kernel_size - 1) * dilation // 2
 
         self.depthwise = nn.Conv1d(
             cin,
             cin,
             kernel_size=kernel_size,
-            padding=pad,
+            padding=0,
             groups=cin,
             dilation=dilation,
             bias=False,
@@ -211,6 +232,8 @@ class TemporalDepthWiseTCNLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
+        pad = (self.depthwise.kernel_size[0] - 1) * self.depthwise.dilation[0]
+        x = F.pad(x, (pad, 0))  # left-pad for causality
         x = self.depthwise(x)
         x = self.pointwise(x)
         x = self.norm(x)
@@ -322,18 +345,9 @@ class SpatioTemporalDecoder(nn.Module):
     Outputs (via SpatialDecoderManifest):
         z_hat     : [B, 7, L, T, H, W]  post-activation states
         dz_hat_dt : [B, 7, L, T, H, W]  d/dt of post-activation states
-                                          (only if return_gradients=True)
+                    (only if return_gradients=True)
 
-    Channel ordering (dim 1) matches HEINZLE_SIGNALS:
-        0=x  1=s  2=f  3=v  4=q  5=vstar  6=qstar
-
-    Assumptions:
-        - du/dt = 0: spatial conv features are treated as constant in t.
-          The time derivative of each output is therefore:
-              d/dt act(z) = act'(z) * dz_film/dt
-          where dz_film/dt is computed by differentiating only the FiLM
-          parameters (gamma, beta) w.r.t. t via vmap + jacrev.
-        - out_channels must equal 7 * L.
+    Channel ordering: 0=x  1=s  2=f  3=v  4=q  5=v*  6=q*
     """
 
     def __init__(
@@ -347,7 +361,7 @@ class SpatioTemporalDecoder(nn.Module):
         temporal_embedding_config: Mapping[str, Any],
         *,
         upsample: bool = False,
-        channel_activations: list[ChannelActivation] | None = None,
+        channel_activations: list[ChannelActivation] | None = HEINZLE_ACTIVATIONS_ORDERED,
     ):
         super().__init__()
 
@@ -361,7 +375,7 @@ class SpatioTemporalDecoder(nn.Module):
 
         self.L = L
         self.upsample = upsample
-        self.channel_activations = channel_activations  # None → identity everywhere
+        self.channel_activations = channel_activations  # None means identity everywhere
 
         self.conv = DepthWiseSeparableConvLayer(
             cin=cin, cout=c_dec, activation=activation, stride=1
@@ -369,6 +383,9 @@ class SpatioTemporalDecoder(nn.Module):
         self.out = nn.Conv2d(c_dec, out_channels, kernel_size=1)
         self.time_embedding = FourierTimeEmbedding(**temporal_embedding_config)
         self.time_film = TimeFiLM(**temporal_film_config)
+
+        if self.channel_activations is not None:
+            _init_heinzle_output_bias(self.out, self.L)
 
     def forward(
         self,
@@ -389,7 +406,7 @@ class SpatioTemporalDecoder(nn.Module):
         dgamma_dt, dbeta_dt = self._gamma_beta_time_grads(t)
         dz_pre_dt = self._decode_dt_from_film(u, dgamma_dt, dbeta_dt, B, T, H, W)
 
-        # Chain rule: d/dt act(z) = act'(z) * dz/dt  (elementwise)
+        # Chain rule: d/dt act(z) = act'(z) * dz/dt
         dz_hat_dt = self._apply_activation_derivatives(z_pre, dz_pre_dt)
 
         return SpatialDecoderManifest(z_hat=z_hat, grads=dz_hat_dt)
@@ -452,23 +469,18 @@ class SpatioTemporalDecoder(nn.Module):
         out_bt = self.out(y_bt)  # [BT, 7*L, H, W]
         return self._reshape_output(out_bt, B, T, H, W)
 
-    def _decode_dt_from_film(
-        self,
-        u: torch.Tensor,
-        dgamma_dt: torch.Tensor,
-        dbeta_dt: torch.Tensor,
-        B: int,
-        T: int,
-        H: int,
-        W: int,
-    ) -> torch.Tensor:
-        """
-        Pre-activation time derivative under du/dt = 0:
-            d/dt (gamma*u + beta) = (dgamma/dt)*u + dbeta/dt
-        """
+    def _decode_dt_from_film(self, u, dgamma_dt, dbeta_dt, B, T, H, W):
         dy_dt = dgamma_dt[..., None, None] * u + dbeta_dt[..., None, None]
         dy_bt = dy_dt.reshape(B * T, dy_dt.shape[2], H, W)
-        dout_bt = self.out(dy_bt)
+
+        # Apply conv weights only — no bias for derivative
+        dout_bt = F.conv2d(
+            dy_bt,
+            self.out.weight,
+            bias=None,
+            stride=self.out.stride,
+            padding=self.out.padding,
+        )
         return self._reshape_output(dout_bt, B, T, H, W)
 
     def _reshape_output(self, out_bt: torch.Tensor, B: int, T: int, H: int, W: int) -> torch.Tensor:

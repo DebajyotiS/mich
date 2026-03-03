@@ -57,7 +57,7 @@ heinzle_net:
 
   time_embedding_config:
     num_freqs: 16       #  num_freqs
-    max_freq: 10.0
+    max_freq: 2.0
 
   time_film_config:
     embed_dim: 32       # = 2 * num_freqs
@@ -74,9 +74,15 @@ heinzle_net:
 
 loss_config:
   lambda_data: 1.0
-  lambda_physics: 1e-3
+  lambda_physics: 1e-1
   n_time: 2000
   n_space: 400
+  dense_time_frac: 0.5
+  dense_time_lo: 0.05
+  dense_time_hi: 0.55
+  uniform_time_lo: 0.05
+  dense_spatial_frac: 0.5
+  dense_spatial_radius: 5
 
 haemo:
   kappa: 0.65       # Vasodilatory signal decay rate
