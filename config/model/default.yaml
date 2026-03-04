@@ -72,6 +72,12 @@ heinzle_net:
     activation: silu
     L: 3                # = L
 
+normaliser:
+  _target_: src.models.normaliser.LayerwiseBOLDNormalizer
+  H: 32 # This needs to change if  the number of grid points change
+  W: 32 # This needs to change if  the number of grid points change
+  eps: 1.0e-6
+  freeze_after_steps: 1000
 loss_config:
   lambda_data: 1.0
   lambda_physics: 1e-1

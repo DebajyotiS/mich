@@ -40,11 +40,10 @@ class MICHManifest:
 
 
 class MICH(LightningModule):
-    """LightningModule interface for the BOLD Inversion network."""
-
     def __init__(
         self,
         heinzle_net: partial,
+        normaliser: partial,
         optimizer: partial,
         scheduler: Mapping,
         loss_config: Mapping,
@@ -52,8 +51,9 @@ class MICH(LightningModule):
         **kwargs: Any,
     ):
         super().__init__()
-        self.save_hyperparameters(logger=False, ignore=["heinzle_net"])
+        self.save_hyperparameters(logger=False, ignore=["heinzle_net", "normaliser"])
         self.heinzle_net = heinzle_net
+        self.normaliser = normaliser
         self.pred_buffer = []
         self.neural_buffer = []
         self.bold_buffer = []
@@ -61,13 +61,19 @@ class MICH(LightningModule):
         self.source_position_buffer = []
 
     def forward(
-        self, bold: torch.Tensor, time: torch.Tensor, *, return_gradients: bool = False
+        self,
+        bold: torch.Tensor,
+        time: torch.Tensor,
+        *,
+        return_gradients: bool = False,
+        normalise: bool = False,
     ) -> SpatialDecoderManifest:
+        if self.normaliser is not None and normalise:
+            bold = self.normaliser(bold)
         return self.heinzle_net(bold, time, return_gradients=return_gradients)
 
     @staticmethod
     def _make_time_grid(B: int, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Returns t: [B, T] in [0, 1]."""
         return torch.linspace(0.0, 1.0, T, device=device, dtype=dtype).view(1, T).expand(B, T)
 
     @staticmethod
@@ -83,26 +89,15 @@ class MICH(LightningModule):
     def _gather_z_hat_at(
         z_hat: torch.Tensor, idx: CollocationBatch, *, signal: HeinzleSignal | int
     ) -> torch.Tensor:
-        """
-        z_hat: [B, 7, L, T, H, W]
-        returns: [B, L, n_times, n_space]
-
-        All index tensors are 4-D to broadcast with idx.t/h/w.
-        Signal dim uses a tensor (not a scalar int) to stay in advanced-indexing mode.
-        """
         s = torch.tensor(MICH._signal_index(signal), device=z_hat.device)
         B, _, L = z_hat.shape[:3]
-        b_idx = torch.arange(B, device=z_hat.device)[:, None, None, None]  # [B, 1, 1, 1]
-        s_idx = s[None, None, None, None]  # [1, 1, 1, 1]
-        l_idx = torch.arange(L, device=z_hat.device)[None, :, None, None]  # [1, L, 1, 1]
-        return z_hat[b_idx, s_idx, l_idx, idx.t, idx.h, idx.w]  # [B, L, n_t, n_s]
+        b_idx = torch.arange(B, device=z_hat.device)[:, None, None, None]
+        s_idx = s[None, None, None, None]
+        l_idx = torch.arange(L, device=z_hat.device)[None, :, None, None]
+        return z_hat[b_idx, s_idx, l_idx, idx.t, idx.h, idx.w]
 
     @staticmethod
     def _gather_neural_at(neural: torch.Tensor, idx: CollocationBatch) -> torch.Tensor:
-        """
-        neural: [B, L, T, H, W]
-        returns: [B, L, n_times, n_space]
-        """
         B, L = neural.shape[:2]
         b_idx = torch.arange(B, device=neural.device)[:, None, None, None]
         l_idx = torch.arange(L, device=neural.device)[None, :, None, None]
@@ -110,10 +105,6 @@ class MICH(LightningModule):
 
     @staticmethod
     def _gather_bold_at(bold: torch.Tensor, idx: CollocationBatch) -> torch.Tensor:
-        """
-        bold: [B, L, T, H, W]
-        returns: [B, L, n_times, n_space]
-        """
         B, L = bold.shape[:2]
         b_idx = torch.arange(B, device=bold.device)[:, None, None, None]
         l_idx = torch.arange(L, device=bold.device)[None, :, None, None]
@@ -123,23 +114,15 @@ class MICH(LightningModule):
     def _gather_grad_at(
         dz_hat_dt: torch.Tensor, layer: int, idx: CollocationBatch, *, signal: HeinzleSignal | int
     ) -> torch.Tensor:
-        """
-        dz_hat_dt: [B, 7, L, T, H, W]
-        returns: [B, n_times, n_space]
-
-        Layer is a fixed scalar so we index it out first, leaving [B, 7, T, H, W].
-        Remaining index tensors are 3-D to broadcast with idx.t/h/w squeezed to
-        [1/B, n_times, n_space].
-        """
         s = torch.tensor(MICH._signal_index(signal), device=dz_hat_dt.device)
         B = dz_hat_dt.shape[0]
-        b_idx = torch.arange(B, device=dz_hat_dt.device)[:, None, None]  # [B, 1, 1]
-        s_idx = s[None, None, None]  # [1, 1, 1]
-        l_idx = torch.tensor(layer, device=dz_hat_dt.device)[None, None, None]  # [1, 1, 1]
-        t = idx.t.squeeze(1)  # [1, n_times, n_space]
-        h = idx.h.squeeze(1)  # [B, n_times, n_space]
-        w = idx.w.squeeze(1)  # [B, n_times, n_space]
-        return dz_hat_dt[b_idx, s_idx, l_idx, t, h, w]  # [B, n_t, n_s]
+        b_idx = torch.arange(B, device=dz_hat_dt.device)[:, None, None]
+        s_idx = s[None, None, None]
+        l_idx = torch.tensor(layer, device=dz_hat_dt.device)[None, None, None]
+        t = idx.t.squeeze(1)
+        h = idx.h.squeeze(1)
+        w = idx.w.squeeze(1)
+        return dz_hat_dt[b_idx, s_idx, l_idx, t, h, w]
 
     @staticmethod
     def _sample_collocation_indices(
@@ -150,7 +133,7 @@ class MICH(LightningModule):
         n_times: int,
         n_space: int,
         device: torch.device,
-        source_position: torch.Tensor | None = None,  # [B, 2]
+        source_position: torch.Tensor | None = None,
         dense_spatial_radius: int = 3,
         dense_spatial_frac: float = 0.5,
         dense_time_frac: float = 0.5,
@@ -158,18 +141,6 @@ class MICH(LightningModule):
         dense_time_hi: float = 0.55,
         uniform_time_lo: float = 0.05,
     ) -> CollocationBatch:
-        """
-        Sample collocation points with spatial and temporal density bias.
-
-        Temporal: dense_time_frac of n_times from [dense_time_lo, dense_time_hi]*T;
-                  remainder uniform from [uniform_time_lo, 1.0]*T.
-                  t: [1, 1, n_times, n_space] — shared across batch.
-
-        Spatial:  dense_spatial_frac of n_space drawn within dense_spatial_radius
-                  of each sample's own source_position; remainder uniform over HxW.
-                  h, w: [B, 1, n_times, n_space] when source_position is given,
-                        [1, 1, n_times, n_space] otherwise.
-        """
         n_dense_t = int(n_times * dense_time_frac)
         n_uniform_t = n_times - n_dense_t
 
@@ -179,16 +150,15 @@ class MICH(LightningModule):
 
         t_dense = torch.randint(t_lo_dense, t_hi_dense, (n_dense_t, n_space), device=device)
         t_uniform = torch.randint(t_lo_uniform, T, (n_uniform_t, n_space), device=device)
-        t = torch.cat([t_dense, t_uniform], dim=0)  # [n_times, n_space]
-        t = t.unsqueeze(0).unsqueeze(0)  # [1, 1, n_times, n_space]
+        t = torch.cat([t_dense, t_uniform], dim=0).unsqueeze(0).unsqueeze(0)
 
         n_dense_s = int(n_space * dense_spatial_frac) if source_position is not None else 0
         n_uniform_s = n_space - n_dense_s
 
         if n_dense_s > 0:
             B = source_position.shape[0]
-            src_h = source_position[:, 0].long()  # [B]
-            src_w = source_position[:, 1].long()  # [B]
+            src_h = source_position[:, 0].long()
+            src_w = source_position[:, 1].long()
 
             off_h = torch.randint(
                 -dense_spatial_radius,
@@ -203,13 +173,13 @@ class MICH(LightningModule):
                 device=device,
             )
 
-            h_dense = (src_h[:, None, None] + off_h).clamp(0, H - 1)  # [B, n_times, n_dense_s]
+            h_dense = (src_h[:, None, None] + off_h).clamp(0, H - 1)
             w_dense = (src_w[:, None, None] + off_w).clamp(0, W - 1)
 
             h_uniform = torch.randint(0, H, (B, n_times, n_uniform_s), device=device)
             w_uniform = torch.randint(0, W, (B, n_times, n_uniform_s), device=device)
 
-            h = torch.cat([h_dense, h_uniform], dim=2).unsqueeze(1)  # [B, 1, n_times, n_space]
+            h = torch.cat([h_dense, h_uniform], dim=2).unsqueeze(1)
             w = torch.cat([w_dense, w_uniform], dim=2).unsqueeze(1)
         else:
             h = torch.randint(0, H, (1, 1, n_times, n_space), device=device)
@@ -249,7 +219,6 @@ class MICH(LightningModule):
         idx: CollocationBatch,
         layer: int,
     ) -> torch.Tensor:
-        # gather states at collocation points for this layer — [B, n_times, n_space]
         x = MICH._gather_z_hat_at(z_hat, idx, signal="x")[:, layer]
         s = MICH._gather_z_hat_at(z_hat, idx, signal="s")[:, layer]
         f = MICH._gather_z_hat_at(z_hat, idx, signal="f")[:, layer]
@@ -271,10 +240,10 @@ class MICH(LightningModule):
             states["qstar"],
         )
 
-        # _gather_grad_at returns [B, n_times, n_space] — no squeeze needed
         ds_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="s")
-        target_sdot = x - self.hparams.haemo.kappa * s - self.hparams.haemo.gamma * (f - 1)
-        s_loss = F.mse_loss(ds_dt, target_sdot)
+        s_loss = F.mse_loss(
+            ds_dt, x - self.hparams.haemo.kappa * s - self.hparams.haemo.gamma * (f - 1)
+        )
 
         df_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="f")
         f_loss = F.mse_loss(df_dt, s)
@@ -286,8 +255,7 @@ class MICH(LightningModule):
                 self.hparams.haemo.lambda_d
                 * MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer + 1]
             )
-        target_vdot = target_vdot / self.hparams.haemo.tau
-        v_loss = F.mse_loss(dv_dt, target_vdot)
+        v_loss = F.mse_loss(dv_dt, target_vdot / self.hparams.haemo.tau)
 
         dq_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="q")
         target_qdot = f * (
@@ -298,8 +266,7 @@ class MICH(LightningModule):
                 self.hparams.haemo.lambda_d
                 * MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer + 1]
             )
-        target_qdot = target_qdot / self.hparams.haemo.tau
-        q_loss = F.mse_loss(dq_dt, target_qdot)
+        q_loss = F.mse_loss(dq_dt, target_qdot / self.hparams.haemo.tau)
 
         dv_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
         v_star_loss = F.mse_loss(dv_star_dt, (-v_star + v - 1) / self.hparams.haemo.tau)
@@ -312,13 +279,13 @@ class MICH(LightningModule):
     def _data_loss(
         self,
         z_hat: torch.Tensor,
-        bold: torch.Tensor,
+        bold_norm: torch.Tensor,
         source_position: torch.Tensor | None = None,
     ) -> torch.Tensor:
         collocation = MICH._sample_collocation_indices(
-            T=bold.shape[2],
-            H=bold.shape[3],
-            W=bold.shape[4],
+            T=bold_norm.shape[2],
+            H=bold_norm.shape[3],
+            W=bold_norm.shape[4],
             n_times=self.hparams.loss_config.n_time,
             n_space=self.hparams.loss_config.n_space,
             device=z_hat.device,
@@ -330,11 +297,17 @@ class MICH(LightningModule):
             dense_time_hi=self.hparams.loss_config.dense_time_hi,
             uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
         )
-        pred_bold = MICH._compute_bold_at(
+        pred_bold_physical = MICH._compute_bold_at(
             z_hat, collocation, acquisition=self.hparams.acquisition, V0=self.hparams.V0
         )
-        true_bold = MICH._gather_bold_at(bold, collocation)
-        return F.mse_loss(pred_bold, true_bold)
+        pred_bold_physical = torch.clamp(pred_bold_physical, min=-10.0, max=10.0)
+        pred_bold_norm = (
+            self.normaliser.normalize(pred_bold_physical)
+            if self.normaliser is not None
+            else pred_bold_physical
+        )
+        true_bold_norm = MICH._gather_bold_at(bold_norm, collocation)
+        return F.mse_loss(pred_bold_norm, true_bold_norm)
 
     def _physics_loss(
         self,
@@ -367,19 +340,22 @@ class MICH(LightningModule):
 
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
         bold, neural = batch["bold"], batch["neural"]
-        source_position = batch["source_position"]  # [B, 2]
+        source_position = batch["source_position"]
+
+        bold_norm = self.normaliser(bold) if self.normaliser is not None else bold
 
         sd_manifest = self(
-            bold,
+            bold_norm,
             self._make_time_grid(
                 B=bold.shape[0], T=bold.shape[2], device=bold.device, dtype=bold.dtype
             ),
             return_gradients=True,
+            normalise=False,
         )
         z_hat = sd_manifest.z_hat
         dz_hat_dt = sd_manifest.grads
 
-        data_loss = self._data_loss(z_hat, bold, source_position=source_position)
+        data_loss = self._data_loss(z_hat, bold_norm, source_position=source_position)
         physics_loss = self._physics_loss(z_hat, dz_hat_dt, source_position=source_position)
         total_loss = (
             self.hparams.loss_config.lambda_data * data_loss
@@ -430,7 +406,7 @@ class MICH(LightningModule):
         z_hat = torch.cat(self.pred_buffer, dim=0)
         source_position = torch.cat(self.source_position_buffer, dim=0)
 
-        subset = max(10, bold.shape[0] // 10)
+        subset = min(10, bold.shape[0])
         random_indices = torch.randperm(bold.shape[0])[:subset]
         subset_bold = bold[random_indices]
         subset_neural = neural[random_indices]
@@ -441,21 +417,17 @@ class MICH(LightningModule):
         subset_w = subset_src_pos[..., 1]
         batch_idx = torch.arange(subset_bold.shape[0])
 
-        subset_bold = subset_bold[batch_idx, :, :, subset_h, subset_w]  # [S, L, T]
-        subset_neural = subset_neural[batch_idx, :, :, subset_h, subset_w]  # [S, L, T]
-        subset_z_hat = subset_z_hat[batch_idx, :, :, :, subset_h, subset_w]  # [S, 7, L, T]
-
-        v_idx = MICH._signal_index("v")
-        q_idx = MICH._signal_index("q")
-        neural_idx = MICH._signal_index("x")
+        subset_bold = subset_bold[batch_idx, :, :, subset_h, subset_w]
+        subset_neural = subset_neural[batch_idx, :, :, subset_h, subset_w]
+        subset_z_hat = subset_z_hat[batch_idx, :, :, :, subset_h, subset_w]
 
         pred_bold = MICH._compute_bold(
-            subset_z_hat[:, v_idx],
-            subset_z_hat[:, q_idx],
+            subset_z_hat[:, MICH._signal_index("v")],
+            subset_z_hat[:, MICH._signal_index("q")],
             acquisition=self.hparams.acquisition,
             V0=self.hparams.V0,
-        )  # [S, L, T]
-        pred_neural = subset_z_hat[:, neural_idx]  # [S, L, T]
+        )
+        pred_neural = subset_z_hat[:, MICH._signal_index("x")]
 
         self._plot_and_log_predictions(
             pred_bold=pred_bold,

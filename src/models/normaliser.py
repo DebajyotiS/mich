@@ -1,0 +1,79 @@
+import torch
+from torch import nn
+
+
+class LayerwiseBOLDNormalizer(nn.Module):
+    """
+    Welford online algorithm for running mean/variance.
+    Reduces over (B, L, T) to preserve inter-layer amplitude
+    and phase relationships at each (H, W) voxel.
+    """
+
+    def __init__(
+        self,
+        H: int,
+        W: int,
+        eps: float = 1e-6,
+        freeze_after_steps: int = 500,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.freeze_after_steps = freeze_after_steps
+
+        self.register_buffer("running_mean", torch.zeros(1, 1, 1, H, W))
+        self.register_buffer("running_M2", torch.zeros(1, 1, 1, H, W))
+        self.register_buffer("running_count", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("step", torch.tensor(0, dtype=torch.long))
+
+    @property
+    def frozen(self) -> bool:
+        return self.step.item() >= self.freeze_after_steps
+
+    @property
+    def running_var(self) -> torch.Tensor:
+        if self.running_count < 2:
+            return torch.ones_like(self.running_M2)
+        return self.running_M2 / (self.running_count - 1)
+
+    def _welford_update(self, bold: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        B, L, T, _H, _W = bold.shape
+        n_new = B * L * T
+
+        batch_mean = bold.detach().mean(dim=(0, 1, 2), keepdim=True)
+        batch_var = bold.detach().var(dim=(0, 1, 2), keepdim=True, unbiased=False)
+        batch_M2 = batch_var * n_new
+
+        n_old = self.running_count.item()
+        n_combined = n_old + n_new
+
+        delta = batch_mean - self.running_mean
+        new_mean = self.running_mean + delta * n_new / n_combined
+        new_M2 = self.running_M2 + batch_M2 + delta**2 * n_old * n_new / n_combined
+
+        self.running_mean.copy_(new_mean)
+        self.running_M2.copy_(new_M2)
+        self.running_count.add_(n_new)
+        self.step.add_(1)
+
+        return batch_mean, batch_var
+
+    def forward(self, bold: torch.Tensor) -> torch.Tensor:
+        if self.training and not self.frozen:
+            batch_mean, batch_var = self._welford_update(bold)
+            mean = batch_mean
+            std = batch_var.sqrt().clamp(min=1e-3)
+        else:
+            mean = self.running_mean
+            std = self.running_var.sqrt().clamp(min=1e-3)
+
+        return ((bold - mean) / (std + self.eps)).clamp(-10.0, 10.0)
+
+    def normalize(self, bold: torch.Tensor) -> torch.Tensor:
+        mean = self.running_mean.mean()
+        std = self.running_var.sqrt().mean().clamp(min=1e-3)
+        return ((bold - mean) / (std + self.eps)).clamp(-10.0, 10.0)
+
+    def denormalize(self, bold_norm: torch.Tensor) -> torch.Tensor:
+        mean = self.running_mean.mean()
+        std = self.running_var.sqrt().mean().clamp(min=1e-3)
+        return bold_norm * (std + self.eps) + mean
