@@ -6,7 +6,7 @@
 
 This project aims to solve the inverse problem: inferring latent neural signals from observed BOLD (Blood Oxygen Level Dependent) signals measured across cortical layers. We use physics-informed neural networks (PINNs) and the Balloon hemodynamic model to address the challenge, focusing on:
 
-- **Identifiability and limits** of BOLD → neural inference
+- **Identifiability and limits** of BOLD $\rightarrow$ neural inference
 - **Robustness and diagnostics** beyond mere reconstruction
 - **Reproducible experiments** via Hydra configuration
 
@@ -21,7 +21,7 @@ cd mich
 ```
 
 ### 2. Prerequisites
-- **Python ≥3.13**
+- **Python >=3.13**
 - **uv** (Python package manager): [uv installation guide](https://github.com/astral-sh/uv)
 
 Install dependencies:

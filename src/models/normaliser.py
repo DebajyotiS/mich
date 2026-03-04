@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 from torch import nn
 
 
@@ -42,6 +43,21 @@ class LayerwiseBOLDNormalizer(nn.Module):
         batch_mean = bold.detach().mean(dim=(0, 1, 2), keepdim=True)
         batch_var = bold.detach().var(dim=(0, 1, 2), keepdim=True, unbiased=False)
         batch_M2 = batch_var * n_new
+
+        # Sync stats across DDP ranks via parallel Welford combination.
+        # Requires drop_last=True so all ranks have the same n_new.
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            n_global = n_new * world_size
+            # Pack weighted_sum and sum_of_squares into one all-reduce.
+            packed = torch.cat([batch_mean * n_new, batch_M2 + n_new * batch_mean**2], dim=0)
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+            mean_global = packed[:1] / n_global
+            M2_global = (packed[1:] - n_global * mean_global**2).clamp(min=0)
+            n_new = n_global
+            batch_mean = mean_global
+            batch_M2 = M2_global
+            batch_var = M2_global / n_new
 
         n_old = self.running_count.item()
         n_combined = n_old + n_new

@@ -112,6 +112,7 @@ def print_config(
     rich.print(tree)
 
 
+@rank_zero_only
 def save_config(cfg: DictConfig) -> None:
     """Saves the config to the output directory.
 

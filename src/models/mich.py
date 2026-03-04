@@ -362,9 +362,31 @@ class MICH(LightningModule):
             + self.hparams.loss_config.lambda_physics * physics_loss
         )
 
-        self.log(f"{stage}/data_loss", data_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log(f"{stage}/physics_loss", physics_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log(f"{stage}/total_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        sync = stage == "val"
+        self.log(
+            f"{stage}/data_loss",
+            data_loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=sync,
+        )
+        self.log(
+            f"{stage}/physics_loss",
+            physics_loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=sync,
+        )
+        self.log(
+            f"{stage}/total_loss",
+            total_loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=sync,
+        )
 
         if stage == "train":
             return MICHManifest(
@@ -406,6 +428,15 @@ class MICH(LightningModule):
         z_hat = torch.cat(self.pred_buffer, dim=0)
         source_position = torch.cat(self.source_position_buffer, dim=0)
 
+        self.pred_buffer.clear()
+        self.bold_buffer.clear()
+        self.neural_buffer.clear()
+        self.source_position_buffer.clear()
+
+        # Only log plots from rank 0 to avoid duplicate wandb entries in DDP
+        if not self.trainer.is_global_zero:
+            return
+
         subset = min(10, bold.shape[0])
         random_indices = torch.randperm(bold.shape[0])[:subset]
         subset_bold = bold[random_indices]
@@ -444,19 +475,14 @@ class MICH(LightningModule):
             pred_q_star=subset_z_hat[:, MICH._signal_index("qstar")],
         )
 
-        self.pred_buffer.clear()
-        self.bold_buffer.clear()
-        self.neural_buffer.clear()
-        self.source_position_buffer.clear()
-
     def _plot_and_log_predictions(self, pred_bold, true_bold, pred_neural, true_neural):
         for i in range(pred_bold.shape[0]):
             image = plot_neural_bold_layers(
                 pred_bold[i], true_bold[i], pred_neural[i], true_neural[i]
             )
-            if wandb is not None:
+            if wandb.run is not None:
                 wandb.log({"predictions": wandb.Image(image)})
-                plt.close(image)
+            plt.close(image)
 
     def _plot_and_log_latents(self, pred_s, pred_f, pred_v, pred_q, pred_v_star, pred_q_star):
         for i in range(pred_s.shape[0]):
@@ -469,9 +495,9 @@ class MICH(LightningModule):
                 pred_q_star=pred_q_star[i],
                 title="Latent States",
             )
-            if wandb is not None:
+            if wandb.run is not None:
                 wandb.log({"latents": wandb.Image(image)})
-                plt.close(image)
+            plt.close(image)
 
     def configure_optimizers(self):
         optim = self.hparams.optimizer(self.parameters())
