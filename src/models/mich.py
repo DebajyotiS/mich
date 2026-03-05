@@ -292,10 +292,10 @@ class MICH(LightningModule):
 
         dv_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="v")
         target_vdot = f - v ** (1 / self.hparams.haemo.alpha)
-        if layer < z_hat.shape[2] - 1:
+        if layer > 0:
             target_vdot += (
                 self.hparams.haemo.lambda_d
-                * MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer + 1]
+                * MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             )
         v_loss = F.mse_loss(dv_dt, target_vdot / self.hparams.haemo.tau)
 
@@ -303,10 +303,10 @@ class MICH(LightningModule):
         target_qdot = f * (
             1 - (1 - self.hparams.acquisition.E0) ** (1 / f)
         ) / self.hparams.acquisition.E0 - q * v ** (1 / self.hparams.haemo.alpha - 1)
-        if layer < z_hat.shape[2] - 1:
+        if layer > 0:
             target_qdot += (
                 self.hparams.haemo.lambda_d
-                * MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer + 1]
+                * MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
             )
         q_loss = F.mse_loss(dq_dt, target_qdot / self.hparams.haemo.tau)
 
