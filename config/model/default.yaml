@@ -21,14 +21,14 @@ heinzle_net:
   # First cin = C; last cout = c_enc.
   spatial_encoder_config:
     - cin: 32           # = C
-      cout: 64          # = c_enc (single-stage: set to c_enc directly)
+      cout: 32          # = c_enc (single-stage: set to c_enc directly)
       stride: 1
       dw_kernel: 3
       pw_kernel: 1
       num_groups: 4     # must divide cout
       activation: silu
-    - cin: 64           # = previous cout
-      cout: 64          # = c_enc
+    - cin: 32           # = previous cout
+      cout: 32          # = c_enc
       stride: 1
       dw_kernel: 3
       pw_kernel: 1
@@ -38,19 +38,19 @@ heinzle_net:
   # Dilations are auto-set to 2^i by TemporalMixingEncoder so do not add dilation.
   # All layers must share the same cin (residual skip connection x + residual).
   temporal_mixing_config:
-    - cin: 64           # = c_enc
+    - cin: 32           # = c_enc
       kernel_size: 3
       num_groups: 4     # must divide cin
       activation: silu
-    - cin: 64           # = c_enc
+    - cin: 32           # = c_enc
       kernel_size: 3
       num_groups: 4
       activation: silu
-    - cin: 64           # = c_enc
+    - cin: 32           # = c_enc
       kernel_size: 3
       num_groups: 4
       activation: silu
-    - cin: 64           # = c_enc
+    - cin: 32           # = c_enc
       kernel_size: 3
       num_groups: 4
       activation: silu
@@ -61,12 +61,12 @@ heinzle_net:
 
   time_film_config:
     embed_dim: 32       # = 2 * num_freqs
-    hidden_dim: 64
+    hidden_dim: 32
     activation: silu
     c_dec: 32           #  c_dec; must equal spatial_decoder_config.c_dec
 
   spatial_decoder_config:
-    cin: 64             # = c_enc
+    cin: 32             # = c_enc
     c_dec: 32           # c_dec; must equal time_film_config.c_dec
     out_channels: 21    # = 7 * L  (hardcoded reshape in SpatialDecoder.forward:255)
     activation: silu

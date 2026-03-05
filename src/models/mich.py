@@ -424,10 +424,10 @@ class MICH(LightningModule):
         )
         manifest = self._shared_step(batch, stage="val")
 
-        self.pred_buffer.append(manifest.z_hat)
-        self.bold_buffer.append(manifest.bold)
-        self.neural_buffer.append(manifest.neural)
-        self.source_position_buffer.append(source_position)
+        self.pred_buffer.append(manifest.z_hat.detach().cpu())
+        self.bold_buffer.append(manifest.bold.detach().cpu())
+        self.neural_buffer.append(manifest.neural.detach().cpu())
+        self.source_position_buffer.append(source_position.detach().cpu())
 
         return manifest.total_loss
 
