@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader, Subset
 import pytorch_lightning as pl
+import torch
+from torch.utils.data import DataLoader, Dataset, Subset
 
 try:
     from omegaconf import DictConfig
@@ -96,7 +95,7 @@ def _compute_split_counts(n: int, split: Mapping[str, Any]) -> Tuple[int, int, i
         raise ValueError("train_frac must be in [0,1]")
     if abs((trf + vf + tf) - 1.0) > 1e-6:
         # Don’t silently renormalize; make it explicit.
-        raise ValueError(f"train_frac+val_frac+test_frac must sum to 1. Got {trf+vf+tf}")
+        raise ValueError(f"train_frac+val_frac+test_frac must sum to 1. Got {trf + vf + tf}")
     tr = int(round(n * trf))
     va = int(round(n * vf))
     te = n - tr - va  # remainder to test to keep sum exact
@@ -165,9 +164,20 @@ class SyntheticH5Dataset(Dataset):
     def __getstate__(self) -> dict:
         # null all file handles so workers always start fresh
         d = dict(self.__dict__)
-        for k in ("_h5", "_bold_ds", "_x_ds",
-                  "_m_num_pulses", "_m_source_layer", "_m_source_position",
-                  "_m_latent_s", "_m_latent_f", "_m_latent_v", "_m_latent_q", "_m_latent_v_star", "_m_latent_q_star"):
+        for k in (
+            "_h5",
+            "_bold_ds",
+            "_x_ds",
+            "_m_num_pulses",
+            "_m_source_layer",
+            "_m_source_position",
+            "_m_latent_s",
+            "_m_latent_f",
+            "_m_latent_v",
+            "_m_latent_q",
+            "_m_latent_v_star",
+            "_m_latent_q_star",
+        ):
             d[k] = None
         return d
 
@@ -196,7 +206,7 @@ class SyntheticH5Dataset(Dataset):
             self._m_latent_q = [self._h5[lyr]["q"] for lyr in self.layers]
             self._m_latent_v_star = [self._h5[lyr]["v_star"] for lyr in self.layers]
             self._m_latent_q_star = [self._h5[lyr]["q_star"] for lyr in self.layers]
-            
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         self._ensure_open()
 
@@ -206,19 +216,21 @@ class SyntheticH5Dataset(Dataset):
         bold = np.empty((L, T, H, W), dtype=self._np_dtype)
         x = np.empty((L, T, H, W), dtype=self._np_dtype)
 
-        for l in range(L):
-            self._bold_ds[l].read_direct(bold, source_sel=np.s_[idx], dest_sel=np.s_[l])
-            self._x_ds[l].read_direct(x, source_sel=np.s_[idx], dest_sel=np.s_[l])
+        for layer_index in range(L):
+            self._bold_ds[layer_index].read_direct(bold, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+            self._x_ds[layer_index].read_direct(x, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
 
         out: Dict[str, Any] = {"bold": bold, "neural": x}
 
         if self.return_meta:
-            out.update({
-                "num_pulses": int(self._m_num_pulses[idx]),
-                "source_layer": int(self._m_source_layer[idx]),
-                "source_position": self._m_source_position[idx],
-            })
-        
+            out.update(
+                {
+                    "num_pulses": int(self._m_num_pulses[idx]),
+                    "source_layer": int(self._m_source_layer[idx]),
+                    "source_position": self._m_source_position[idx],
+                }
+            )
+
         if self.return_latents:
             s = np.empty((L, T, H, W), dtype=self._np_dtype)
             f = np.empty((L, T, H, W), dtype=self._np_dtype)
@@ -226,26 +238,23 @@ class SyntheticH5Dataset(Dataset):
             q = np.empty((L, T, H, W), dtype=self._np_dtype)
             v_star = np.empty((L, T, H, W), dtype=self._np_dtype)
             q_star = np.empty((L, T, H, W), dtype=self._np_dtype)
-            
-            for l in range(L):
-                self._m_latent_s[l].read_direct(s, source_sel=np.s_[idx], dest_sel=np.s_[l])
-                self._m_latent_f[l].read_direct(f, source_sel=np.s_[idx], dest_sel=np.s_[l])
-                self._m_latent_v[l].read_direct(v, source_sel=np.s_[idx], dest_sel=np.s_[l])
-                self._m_latent_q[l].read_direct(q, source_sel=np.s_[idx], dest_sel=np.s_[l])
-                self._m_latent_v_star[l].read_direct(v_star, source_sel=np.s_[idx], dest_sel=np.s_[l])
-                self._m_latent_q_star[l].read_direct(q_star, source_sel=np.s_[idx], dest_sel=np.s_[l])
 
-            out.update({
-                "s": s,
-                "f": f,
-                "v": v,
-                "q": q,
-                "v_star": v_star,
-                "q_star": q_star
-            })
-    
+            for layer_index in range(L):
+                self._m_latent_s[layer_index].read_direct(s, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_f[layer_index].read_direct(f, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_v[layer_index].read_direct(v, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_q[layer_index].read_direct(q, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_v_star[layer_index].read_direct(
+                    v_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
+                self._m_latent_q_star[layer_index].read_direct(
+                    q_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
+
+            out.update({"s": s, "f": f, "v": v, "q": q, "v_star": v_star, "q_star": q_star})
+
         return out
-    
+
 
 class SyntheticDataModule(pl.LightningDataModule):
     def __init__(
@@ -309,11 +318,15 @@ class SyntheticDataModule(pl.LightningDataModule):
         num_workers = int(self.loader_config.get("num_workers", 0))
 
         pin_memory = bool(self.loader_config.get("pin_memory", False))
-        persistent_workers = bool(self.loader_config.get("persistent_workers", False)) and num_workers > 0
+        persistent_workers = (
+            bool(self.loader_config.get("persistent_workers", False)) and num_workers > 0
+        )
 
         # Only valid when num_workers > 0
         prefetch_factor = self.loader_config.get("prefetch_factor", 2)
-        prefetch_factor = int(prefetch_factor) if (num_workers > 0 and prefetch_factor is not None) else None
+        prefetch_factor = (
+            int(prefetch_factor) if (num_workers > 0 and prefetch_factor is not None) else None
+        )
 
         return DataLoader(
             ds,
@@ -336,11 +349,11 @@ class SyntheticDataModule(pl.LightningDataModule):
 
     def val_dataloader(self) -> DataLoader:
         assert self.ds_val is not None, "val dataset not initialized"
-        return self._make_loader(self.ds_val, shuffle=False, drop_last=False)
+        return self._make_loader(self.ds_val, shuffle=False, drop_last=True)
 
     def test_dataloader(self) -> DataLoader:
         assert self.ds_test is not None, "test dataset not initialized"
-        return self._make_loader(self.ds_test, shuffle=False, drop_last=False)
+        return self._make_loader(self.ds_test, shuffle=False, drop_last=True)
 
     def predict_dataloader(self) -> DataLoader:
         return self.test_dataloader()

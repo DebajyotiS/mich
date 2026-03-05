@@ -37,11 +37,16 @@ class LayerwiseBOLDNormalizer(nn.Module):
         return self.running_M2 / (self.running_count - 1)
 
     def _welford_update(self, bold: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Cast to fp32 before accumulation — bold may arrive as fp16 from the
+        # dataloader, and computing mean/var in fp16 before writing into fp32
+        # buffers loses precision in the variance estimate.
+        bold = bold.detach().float()
+
         B, L, T, _H, _W = bold.shape
         n_new = B * L * T
 
-        batch_mean = bold.detach().mean(dim=(0, 1, 2), keepdim=True)
-        batch_var = bold.detach().var(dim=(0, 1, 2), keepdim=True, unbiased=False)
+        batch_mean = bold.mean(dim=(0, 1, 2), keepdim=True)
+        batch_var = bold.var(dim=(0, 1, 2), keepdim=True, unbiased=False)
         batch_M2 = batch_var * n_new
 
         # Sync stats across DDP ranks via parallel Welford combination.
@@ -74,6 +79,8 @@ class LayerwiseBOLDNormalizer(nn.Module):
         return batch_mean, batch_var
 
     def forward(self, bold: torch.Tensor) -> torch.Tensor:
+        input_dtype = bold.dtype
+        bold_f32 = bold.float()
         if self.training and not self.frozen:
             batch_mean, batch_var = self._welford_update(bold)
             mean = batch_mean
@@ -82,14 +89,17 @@ class LayerwiseBOLDNormalizer(nn.Module):
             mean = self.running_mean
             std = self.running_var.sqrt().clamp(min=1e-3)
 
-        return ((bold - mean) / (std + self.eps)).clamp(-10.0, 10.0)
+        return ((bold_f32 - mean) / (std + self.eps)).clamp(-10.0, 10.0).to(input_dtype)
 
     def normalize(self, bold: torch.Tensor) -> torch.Tensor:
-        mean = self.running_mean.mean()
-        std = self.running_var.sqrt().mean().clamp(min=1e-3)
-        return ((bold - mean) / (std + self.eps)).clamp(-10.0, 10.0)
+        input_dtype = bold.dtype
+        std = self.running_var.sqrt().clamp(min=1e-3)
+        return (
+            ((bold.float() - self.running_mean) / (std + self.eps))
+            .clamp(-10.0, 10.0)
+            .to(input_dtype)
+        )
 
     def denormalize(self, bold_norm: torch.Tensor) -> torch.Tensor:
-        mean = self.running_mean.mean()
-        std = self.running_var.sqrt().mean().clamp(min=1e-3)
-        return bold_norm * (std + self.eps) + mean
+        std = self.running_var.sqrt().clamp(min=1e-3)
+        return (bold_norm.float() * (std + self.eps) + self.running_mean).to(bold_norm.dtype)

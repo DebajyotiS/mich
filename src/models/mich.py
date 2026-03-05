@@ -202,6 +202,48 @@ class MICH(LightningModule):
         q = MICH._gather_z_hat_at(z_hat, idx, signal="q")
         return MICH._compute_bold(v, q, acquisition, V0)
 
+    def _data_loss(
+        self,
+        z_hat: torch.Tensor,
+        bold_norm: torch.Tensor,
+        source_position: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        collocation = MICH._sample_collocation_indices(
+            T=bold_norm.shape[2],
+            H=bold_norm.shape[3],
+            W=bold_norm.shape[4],
+            n_times=self.hparams.loss_config.n_time,
+            n_space=self.hparams.loss_config.n_space,
+            device=z_hat.device,
+            source_position=source_position,
+            dense_spatial_frac=self.hparams.loss_config.dense_spatial_frac,
+            dense_spatial_radius=self.hparams.loss_config.dense_spatial_radius,
+            dense_time_frac=self.hparams.loss_config.dense_time_frac,
+            dense_time_lo=self.hparams.loss_config.dense_time_lo,
+            dense_time_hi=self.hparams.loss_config.dense_time_hi,
+            uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
+        )
+
+        v_idx, q_idx = MICH._signal_index("v"), MICH._signal_index("q")
+        pred_v = z_hat[:, v_idx]
+        pred_q = z_hat[:, q_idx]
+        pred_bold = MICH._compute_bold(
+            pred_v, pred_q, acquisition=self.hparams.acquisition, V0=self.hparams.V0
+        )
+        # post process the predicted bold
+        pred_bold = torch.clamp(pred_bold, min=-10.0, max=10.0)
+        pred_bold_norm = self.normaliser(pred_bold) if self.normaliser is not None else pred_bold
+
+        # Sample the collocation points
+        pred_bold_norm = self._gather_bold_at(pred_bold_norm, collocation)
+        true_bold_norm = self._gather_bold_at(bold_norm, collocation)
+
+        L = pred_bold_norm.shape[1]
+        per_layer = torch.stack(
+            [F.mse_loss(pred_bold_norm[:, layer], true_bold_norm[:, layer]) for layer in range(L)]
+        )
+        return per_layer.mean()
+
     def _sanitise_states(self, states: dict[str, Any]) -> dict[str, Any]:
         for key, value in states.items():
             value = torch.nan_to_num(value, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -276,39 +318,6 @@ class MICH(LightningModule):
 
         return (s_loss + f_loss + v_loss + q_loss + v_star_loss + q_star_loss) / 6.0
 
-    def _data_loss(
-        self,
-        z_hat: torch.Tensor,
-        bold_norm: torch.Tensor,
-        source_position: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        collocation = MICH._sample_collocation_indices(
-            T=bold_norm.shape[2],
-            H=bold_norm.shape[3],
-            W=bold_norm.shape[4],
-            n_times=self.hparams.loss_config.n_time,
-            n_space=self.hparams.loss_config.n_space,
-            device=z_hat.device,
-            source_position=source_position,
-            dense_spatial_frac=self.hparams.loss_config.dense_spatial_frac,
-            dense_spatial_radius=self.hparams.loss_config.dense_spatial_radius,
-            dense_time_frac=self.hparams.loss_config.dense_time_frac,
-            dense_time_lo=self.hparams.loss_config.dense_time_lo,
-            dense_time_hi=self.hparams.loss_config.dense_time_hi,
-            uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
-        )
-        pred_bold_physical = MICH._compute_bold_at(
-            z_hat, collocation, acquisition=self.hparams.acquisition, V0=self.hparams.V0
-        )
-        pred_bold_physical = torch.clamp(pred_bold_physical, min=-10.0, max=10.0)
-        pred_bold_norm = (
-            self.normaliser.normalize(pred_bold_physical)
-            if self.normaliser is not None
-            else pred_bold_physical
-        )
-        true_bold_norm = MICH._gather_bold_at(bold_norm, collocation)
-        return F.mse_loss(pred_bold_norm, true_bold_norm)
-
     def _physics_loss(
         self,
         z_hat: torch.Tensor,
@@ -330,7 +339,7 @@ class MICH(LightningModule):
             dense_time_hi=self.hparams.loss_config.dense_time_hi,
             uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
         )
-        tot_physics_loss = torch.tensor(0.0, device=z_hat.device)
+        tot_physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=z_hat.dtype)
         for layer in range(z_hat.shape[2]):
             tot_physics_loss += (
                 self._compute_physics_layer_loss(z_hat, dz_hat_dt, idx, layer=layer)

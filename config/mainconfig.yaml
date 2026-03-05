@@ -20,7 +20,7 @@ train: True # Set False to skip model training
 ckpt_path: null # Checkpoint path to resume training
 print_config: False # Print the final config to the console
 # Extra tweaks available with the new pytorch version
-precision: full # Should use medium if on ampere gpus
+precision: medium # Should use medium if on ampere gpus
 compile: False # Can set to default for faster compiles
 
 resume:

@@ -8,6 +8,6 @@ accelerator: gpu
 devices: auto
 strategy: auto
 gradient_clip_val: 5.0
-precision: 32
+precision: 16
 enable_model_summary: False
 default_root_dir: ${paths.full_path}

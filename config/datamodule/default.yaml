@@ -3,7 +3,7 @@ _target_: src.data.synthetic.SyntheticDataModule
 data:
   path: ${paths.data_dir}
   layers: [layer_0, layer_1, layer_2]
-  dtype: float32
+  dtype: float16
   return_meta: true
 
 split:
@@ -17,7 +17,7 @@ split:
   shuffle: true
 
 loader:
-  batch_size: 8
+  batch_size: 1
   num_workers: 4
   pin_memory: true
   persistent_workers: true

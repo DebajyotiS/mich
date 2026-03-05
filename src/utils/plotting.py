@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from matplotlib.figure import Figure
 
-LAYER_NAMES = ["Superficial", "Middle", "Deep"]
+LAYER_NAMES = ["Deep", "Middle", "Superficial"]
 
 
 def plot_neural_bold_layers(
@@ -95,7 +95,7 @@ def plot_latent_layers(
     Plot all 7 Heinzle latent signals across 3 cortical layers for a single sample.
 
     Each input tensor is [L, T].
-    Layout: rows = layers (Superficial → Deep), cols = signals (x, s, f, v, q, v*, q*).
+    Layout: rows = layers (Deep → Superficial), cols = signals (x, s, f, v, q, v*, q*).
     """
     signals = [
         pred_s.detach().cpu().numpy(),

@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from torch.func import jacrev, vmap
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from src.utils.torch_utils import (
     _softplus_deriv,
@@ -194,7 +195,7 @@ class SpatialEncoder(nn.Module):
         B, T, C, H, W = x.shape
         x = x.reshape(B * T, C, H, W)  # [B*T, C, H, W]
         for layer in self.module:
-            x = layer(x)
+            x = checkpoint(layer, x, use_reentrant=False)
         _, C_out, H_out, W_out = x.shape
         x = x.view(B, T, C_out, H_out, W_out)  # [B, T, C', H, W]
         return x
@@ -548,9 +549,11 @@ class HeinzleNet(nn.Module):
         self, x: torch.Tensor, t: torch.Tensor, return_gradients: bool = False
     ) -> SpatialDecoderManifest:
         xmix = self.layer_mixing(x)  # [B, T, C, H, W]
-        xenc = self.spatial_encoder(xmix)  # [B, T, C', H, W]
-        xmix = self.temporal_mixing(xenc)  # [B, T, C', H, W]
 
+        # checkpoint the two following encoders to save on memory.
+
+        xenc = self.spatial_encoder(xmix)  # [B, T, C', H, W]
+        xmix = checkpoint(self.temporal_mixing, xenc, use_reentrant=False)  # [B, T, C', H, W]
         z_hat = self.spatial_decoder(
             xmix, t, return_gradients=return_gradients
         )  # [B, 7, L, T, H, W]
