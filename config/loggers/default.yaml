@@ -4,8 +4,8 @@ wandb:
   offline: True
   id: null
   log_model: False
-  group: null
+  group: ${network_name}
   project: ${project_name}
-  name: ${network_name}
+  name: "${network_name}: rank 0"
   save_dir: ${paths.full_path}
   resume: ${resume.state}

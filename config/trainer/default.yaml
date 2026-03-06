@@ -6,7 +6,7 @@ num_sanity_val_steps: 2
 log_every_n_steps: 25
 accelerator: gpu
 devices: auto
-strategy: auto
+strategy: ddp
 gradient_clip_val: 5.0
 precision: 16
 enable_model_summary: False

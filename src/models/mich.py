@@ -375,14 +375,13 @@ class MICH(LightningModule):
             + self.hparams.loss_config.lambda_physics * physics_loss
         )
 
-        sync = stage == "val"
         self.log(
             f"{stage}/data_loss",
             data_loss,
             on_step=True,
             on_epoch=True,
             prog_bar=True,
-            sync_dist=sync,
+            sync_dist=True,
         )
         self.log(
             f"{stage}/physics_loss",
@@ -390,7 +389,7 @@ class MICH(LightningModule):
             on_step=True,
             on_epoch=True,
             prog_bar=True,
-            sync_dist=sync,
+            sync_dist=True,
         )
         self.log(
             f"{stage}/total_loss",
@@ -398,8 +397,19 @@ class MICH(LightningModule):
             on_step=True,
             on_epoch=True,
             prog_bar=True,
-            sync_dist=sync,
+            sync_dist=True,
         )
+
+        # Log unsynced per-rank metrics to each rank's own wandb run
+        if not self.trainer.is_global_zero and getattr(self, "_rank_run", None) is not None:
+            self._rank_run.log(
+                {
+                    f"{stage}/data_loss": data_loss.item(),
+                    f"{stage}/physics_loss": physics_loss.item(),
+                    f"{stage}/total_loss": total_loss.item(),
+                    "trainer/global_step": self.global_step,
+                }
+            )
 
         if stage == "train":
             return MICHManifest(
@@ -450,10 +460,7 @@ class MICH(LightningModule):
         self.source_position_buffer.clear()
         self.source_layer_buffer.clear()
 
-        # Only log plots from rank 0 to avoid duplicate wandb entries in DDP
-        if not self.trainer.is_global_zero:
-            return
-
+        # Each rank logs its own plots to its own W&B run — no gather needed.
         subset = min(10, bold.shape[0])
         random_indices = torch.randperm(bold.shape[0])[:subset]
         subset_bold = bold[random_indices]
@@ -507,7 +514,9 @@ class MICH(LightningModule):
                 source_pos=source_pos[i],
             )
             if wandb.run is not None:
-                wandb.log({"predictions": wandb.Image(image)})
+                wandb.run.log(
+                    {"predictions": wandb.Image(image), "trainer/global_step": self.global_step}
+                )
             plt.close(image)
 
     def _plot_and_log_latents(self, pred_s, pred_f, pred_v, pred_q, pred_v_star, pred_q_star):
@@ -522,8 +531,30 @@ class MICH(LightningModule):
                 title="Latent States",
             )
             if wandb.run is not None:
-                wandb.log({"latents": wandb.Image(image)})
+                wandb.run.log(
+                    {"latents": wandb.Image(image), "trainer/global_step": self.global_step}
+                )
             plt.close(image)
+
+    def on_fit_start(self) -> None:
+        # Rank 0's wandb run is owned by WandbLogger — nothing to do here.
+        # Non-zero ranks initialize their own run so per-rank metrics are tracked.
+        if self.trainer.is_global_zero:
+            return
+        logger = self.trainer.logger
+        base_name = logger._wandb_init.get("name", logger.name).rsplit(": rank", 1)[0]
+        init_kwargs = {
+            **logger._wandb_init,
+            "name": f"{base_name}: rank {self.global_rank}",
+            "reinit": True,
+        }
+        self._rank_run = wandb.init(**init_kwargs)
+
+    def on_fit_end(self) -> None:
+        rank_run = getattr(self, "_rank_run", None)
+        if not self.trainer.is_global_zero and rank_run is not None:
+            rank_run.finish()
+            self._rank_run = None
 
     def configure_optimizers(self):
         optim = self.hparams.optimizer(self.parameters())

@@ -33,12 +33,12 @@ def plot_neural_bold_layers(
     n_layers = pred_bold.shape[0]
     times = np.arange(pred_bold.shape[-1]) * tr
 
-    pred_bold_np = pred_bold.numpy()
-    true_bold_np = true_bold.numpy()
-    pred_neural_np = pred_neural.numpy()
-    true_neural_np = true_neural.numpy()
-    source_layer = source_layer.numpy()
-    source_pos = source_pos.numpy()
+    pred_bold_np = pred_bold.cpu().numpy()
+    true_bold_np = true_bold.cpu().numpy()
+    pred_neural_np = pred_neural.cpu().numpy()
+    true_neural_np = true_neural.cpu().numpy()
+    source_layer = source_layer.cpu().numpy()
+    source_pos = source_pos.cpu().numpy()
 
     fig, axes = plt.subplots(nrows=n_layers, figsize=(10, 4 * n_layers), constrained_layout=True)
     if n_layers == 1:
@@ -50,27 +50,36 @@ def plot_neural_bold_layers(
 
         # BOLD on left axis
         ax_bold.plot(
-            times, true_bold_np[n_layers - i - 1], color="orange", alpha=0.9, label="True BOLD"
+            times,
+            true_bold_np[n_layers - i - 1],
+            color=COLOR_HEX[SIGNALS_LIST.index("bold")],
+            label="True BOLD",
+            ls="-",
         )
         ax_bold.plot(
             times,
             pred_bold_np[n_layers - i - 1],
             color=COLOR_HEX[SIGNALS_LIST.index("bold")],
             label="Predicted BOLD",
-            linestyle="--",
+            ls="-.",
+            alpha=0.8,
         )
 
         # Neural on right axis
         ax_neural.plot(
-            times, true_neural_np[n_layers - i - 1], color="blue", alpha=0.9, label="True Neural"
+            times,
+            true_neural_np[n_layers - i - 1],
+            color=COLOR_HEX[SIGNALS_LIST.index("x")],
+            label="True Neural",
+            ls="-",
         )
         ax_neural.plot(
             times,
             pred_neural_np[n_layers - i - 1],
             color=COLOR_HEX[SIGNALS_LIST.index("x")],
-            alpha=0.7,
             label="Predicted Neural",
-            linestyle="--",
+            ls="-.",
+            alpha=0.8,
         )
 
         ax_bold.set_title(LAYER_NAMES[i], fontfamily="monospace")
@@ -108,12 +117,12 @@ def plot_latent_layers(
     Layout: rows = layers (Deep → Superficial), cols = signals (x, s, f, v, q, v*, q*).
     """
     signals = [
-        pred_s.numpy(),
-        pred_f.numpy(),
-        pred_v.numpy(),
-        pred_q.numpy(),
-        pred_v_star.numpy(),
-        pred_q_star.numpy(),
+        pred_s.cpu().numpy(),
+        pred_f.cpu().numpy(),
+        pred_v.cpu().numpy(),
+        pred_q.cpu().numpy(),
+        pred_v_star.cpu().numpy(),
+        pred_q_star.cpu().numpy(),
     ]
 
     n_layers = signals[0].shape[0]
