@@ -3,7 +3,10 @@ import numpy as np
 import torch
 from matplotlib.figure import Figure
 
-LAYER_NAMES = ["Deep", "Middle", "Superficial"]
+LAYER_NAMES = ["Superficial", "Middle", "Deep"]
+COLOR_HEX = ["#9750a1", "#bb4d3e", "#b94a73", "#6777cf", "#af7f3b", "#67a54f", "#bca73a", "#46c19a"]
+SIGNALS_LIST = ["bold", "x", "s", "f", "v", "q", "vstar", "qstar"]
+LATENT_NAMES = ["s", "f", "v", "q", "vstar", "qstar"]
 
 
 def plot_neural_bold_layers(
@@ -11,6 +14,8 @@ def plot_neural_bold_layers(
     true_bold: torch.Tensor,
     pred_neural: torch.Tensor,
     true_neural: torch.Tensor,
+    source_layer: torch.Tensor,
+    source_pos: torch.Tensor,
     tr: float = 0.1,
 ) -> Figure:
     """
@@ -21,15 +26,19 @@ def plot_neural_bold_layers(
         true_bold:    [L, T]
         pred_neural:  [L, T]
         true_neural:  [L, T]
+        source_layer: [L]
+        source_pos:   [L, 2]
         tr:           repetition time in seconds (default 0.1s)
     """
     n_layers = pred_bold.shape[0]
     times = np.arange(pred_bold.shape[-1]) * tr
 
-    pred_bold_np = pred_bold.detach().cpu().numpy()
-    true_bold_np = true_bold.detach().cpu().numpy()
-    pred_neural_np = pred_neural.detach().cpu().numpy()
-    true_neural_np = true_neural.detach().cpu().numpy()
+    pred_bold_np = pred_bold.numpy()
+    true_bold_np = true_bold.numpy()
+    pred_neural_np = pred_neural.numpy()
+    true_neural_np = true_neural.numpy()
+    source_layer = source_layer.numpy()
+    source_pos = source_pos.numpy()
 
     fig, axes = plt.subplots(nrows=n_layers, figsize=(10, 4 * n_layers), constrained_layout=True)
     if n_layers == 1:
@@ -40,22 +49,25 @@ def plot_neural_bold_layers(
         ax_neural = ax_bold.twinx()
 
         # BOLD on left axis
-        ax_bold.plot(times, true_bold_np[i], color="orange", alpha=0.9, label="True BOLD")
+        ax_bold.plot(
+            times, true_bold_np[n_layers - i - 1], color="orange", alpha=0.9, label="True BOLD"
+        )
         ax_bold.plot(
             times,
-            pred_bold_np[i],
-            color="orange",
-            alpha=0.7,
+            pred_bold_np[n_layers - i - 1],
+            color=COLOR_HEX[SIGNALS_LIST.index("bold")],
             label="Predicted BOLD",
             linestyle="--",
         )
 
         # Neural on right axis
-        ax_neural.plot(times, true_neural_np[i], color="blue", alpha=0.9, label="True Neural")
+        ax_neural.plot(
+            times, true_neural_np[n_layers - i - 1], color="blue", alpha=0.9, label="True Neural"
+        )
         ax_neural.plot(
             times,
-            pred_neural_np[i],
-            color="blue",
+            pred_neural_np[n_layers - i - 1],
+            color=COLOR_HEX[SIGNALS_LIST.index("x")],
             alpha=0.7,
             label="Predicted Neural",
             linestyle="--",
@@ -65,20 +77,18 @@ def plot_neural_bold_layers(
         ax_bold.set_xlabel("Time (s)", fontfamily="monospace")
         ax_bold.set_ylabel("BOLD Signal", fontfamily="monospace")
         ax_neural.set_ylabel("Neural Activity", fontfamily="monospace")
+        ax_neural.set_ylim(
+            -0.001,
+        )
 
-        ax_bold.legend(loc="upper left")
-        ax_neural.legend(loc="upper right")
+        ax_bold.legend(loc="upper left", frameon=False)
+        ax_neural.legend(loc="upper right", frameon=False)
 
-        # Set monospace font on tick labels without overriding tick positions.
-        # ax_neural manages its own ticks independently from ax_bold.
         for ax in (ax_bold, ax_neural):
             for label in ax.get_xticklabels() + ax.get_yticklabels():
                 label.set_fontfamily("monospace")
 
     return fig
-
-
-SIGNAL_NAMES = ["s", "f", "v", "q", "v*", "q*"]
 
 
 def plot_latent_layers(
@@ -98,12 +108,12 @@ def plot_latent_layers(
     Layout: rows = layers (Deep → Superficial), cols = signals (x, s, f, v, q, v*, q*).
     """
     signals = [
-        pred_s.detach().cpu().numpy(),
-        pred_f.detach().cpu().numpy(),
-        pred_v.detach().cpu().numpy(),
-        pred_q.detach().cpu().numpy(),
-        pred_v_star.detach().cpu().numpy(),
-        pred_q_star.detach().cpu().numpy(),
+        pred_s.numpy(),
+        pred_f.numpy(),
+        pred_v.numpy(),
+        pred_q.numpy(),
+        pred_v_star.numpy(),
+        pred_q_star.numpy(),
     ]
 
     n_layers = signals[0].shape[0]
@@ -119,9 +129,11 @@ def plot_latent_layers(
     fig.suptitle(title, fontfamily="monospace", fontsize=13)
 
     for row, layer_name in enumerate(LAYER_NAMES):
-        for col, (sig_array, sig_name) in enumerate(zip(signals, SIGNAL_NAMES, strict=True)):
+        for col, (sig_array, sig_name) in enumerate(zip(signals, LATENT_NAMES, strict=True)):
             ax = axes[row, col]
-            ax.plot(times, sig_array[row], color="steelblue", linewidth=0.9)
+            ax.plot(
+                times, sig_array[row], color=COLOR_HEX[SIGNALS_LIST.index(sig_name)], linewidth=0.9
+            )
 
             # column header on top row only
             if row == 0:

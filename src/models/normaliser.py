@@ -21,8 +21,8 @@ class LayerwiseBOLDNormalizer(nn.Module):
         self.eps = eps
         self.freeze_after_steps = freeze_after_steps
 
-        self.register_buffer("running_mean", torch.zeros(1, 1, 1, H, W))
-        self.register_buffer("running_M2", torch.zeros(1, 1, 1, H, W))
+        self.register_buffer("running_mean", torch.zeros(1, 1, 1, 1, 1))
+        self.register_buffer("running_M2", torch.zeros(1, 1, 1, 1, 1))
         self.register_buffer("running_count", torch.tensor(0, dtype=torch.long))
         self.register_buffer("step", torch.tensor(0, dtype=torch.long))
 
@@ -37,16 +37,16 @@ class LayerwiseBOLDNormalizer(nn.Module):
         return self.running_M2 / (self.running_count - 1)
 
     def _welford_update(self, bold: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Cast to fp32 before accumulation — bold may arrive as fp16 from the
+        # Cast to fp32 before accumulation as bold may arrive as fp16 from the
         # dataloader, and computing mean/var in fp16 before writing into fp32
         # buffers loses precision in the variance estimate.
         bold = bold.detach().float()
 
-        B, L, T, _H, _W = bold.shape
-        n_new = B * L * T
+        B, L, T, H, W = bold.shape
+        n_new = B * L * T * H * W
 
-        batch_mean = bold.mean(dim=(0, 1, 2), keepdim=True)
-        batch_var = bold.var(dim=(0, 1, 2), keepdim=True, unbiased=False)
+        batch_mean = bold.mean(dim=(0, 1, 2, 3, 4), keepdim=True)
+        batch_var = bold.var(dim=(0, 1, 2, 3, 4), keepdim=True, unbiased=False)
         batch_M2 = batch_var * n_new
 
         # Sync stats across DDP ranks via parallel Welford combination.

@@ -51,6 +51,7 @@ class MICH(LightningModule):
         **kwargs: Any,
     ):
         super().__init__()
+        torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
         self.save_hyperparameters(logger=False, ignore=["heinzle_net", "normaliser"])
         self.heinzle_net = heinzle_net
         self.normaliser = normaliser
@@ -69,8 +70,10 @@ class MICH(LightningModule):
         normalise: bool = False,
     ) -> SpatialDecoderManifest:
         if self.normaliser is not None and normalise:
-            bold = self.normaliser(bold)
-        return self.heinzle_net(bold, time, return_gradients=return_gradients)
+            bold_norm = self.normaliser(bold)
+        else:
+            bold_norm = bold
+        return self.heinzle_net(bold_norm, time, return_gradients=return_gradients)
 
     @staticmethod
     def _make_time_grid(B: int, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -84,6 +87,10 @@ class MICH(LightningModule):
                 return signal
             raise IndexError(f"signal index must be in [0,6], got {signal}")
         return mapping[signal]
+
+    @staticmethod
+    def _layer_index(layer: str) -> int:
+        return {"deep": 0, "middle": 1, "superficial": 2}[layer]
 
     @staticmethod
     def _gather_z_hat_at(
@@ -134,9 +141,9 @@ class MICH(LightningModule):
         n_space: int,
         device: torch.device,
         source_position: torch.Tensor | None = None,
-        dense_spatial_radius: int = 3,
-        dense_spatial_frac: float = 0.5,
-        dense_time_frac: float = 0.5,
+        dense_spatial_radius: int = 5,
+        dense_spatial_frac: float = 0.8,
+        dense_time_frac: float = 0.8,
         dense_time_lo: float = 0.05,
         dense_time_hi: float = 0.55,
         uniform_time_lo: float = 0.05,
@@ -231,7 +238,7 @@ class MICH(LightningModule):
             pred_v, pred_q, acquisition=self.hparams.acquisition, V0=self.hparams.V0
         )
         # post process the predicted bold
-        pred_bold = torch.clamp(pred_bold, min=-10.0, max=10.0)
+        pred_bold = torch.clamp(pred_bold, min=-1.0, max=1.0)
         pred_bold_norm = self.normaliser(pred_bold) if self.normaliser is not None else pred_bold
 
         # Sample the collocation points
@@ -293,10 +300,8 @@ class MICH(LightningModule):
         dv_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="v")
         target_vdot = f - v ** (1 / self.hparams.haemo.alpha)
         if layer > 0:
-            target_vdot += (
-                self.hparams.haemo.lambda_d
-                * MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
-            )
+            vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
+            target_vdot += self.hparams.haemo.lambda_d * vstar_deeper
         v_loss = F.mse_loss(dv_dt, target_vdot / self.hparams.haemo.tau)
 
         dq_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="q")
@@ -304,10 +309,9 @@ class MICH(LightningModule):
             1 - (1 - self.hparams.acquisition.E0) ** (1 / f)
         ) / self.hparams.acquisition.E0 - q * v ** (1 / self.hparams.haemo.alpha - 1)
         if layer > 0:
-            target_qdot += (
-                self.hparams.haemo.lambda_d
-                * MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
-            )
+            qstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
+            target_qdot += self.hparams.haemo.lambda_d * qstar_deeper
+
         q_loss = F.mse_loss(dq_dt, target_qdot / self.hparams.haemo.tau)
 
         dv_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
@@ -424,10 +428,12 @@ class MICH(LightningModule):
         )
         manifest = self._shared_step(batch, stage="val")
 
-        self.pred_buffer.append(manifest.z_hat.detach().cpu())
-        self.bold_buffer.append(manifest.bold.detach().cpu())
-        self.neural_buffer.append(manifest.neural.detach().cpu())
-        self.source_position_buffer.append(source_position.detach().cpu())
+        if len(self.pred_buffer) < 100:
+            self.pred_buffer.append(manifest.z_hat.detach().cpu())
+            self.bold_buffer.append(manifest.bold.detach().cpu())
+            self.neural_buffer.append(manifest.neural.detach().cpu())
+            self.source_position_buffer.append(source_position.detach().cpu())
+            self.source_layer_buffer.append(_source_layer.detach().cpu())
 
         return manifest.total_loss
 
@@ -436,11 +442,13 @@ class MICH(LightningModule):
         neural = torch.cat(self.neural_buffer, dim=0)
         z_hat = torch.cat(self.pred_buffer, dim=0)
         source_position = torch.cat(self.source_position_buffer, dim=0)
+        source_layer = torch.cat(self.source_layer_buffer, dim=0)
 
         self.pred_buffer.clear()
         self.bold_buffer.clear()
         self.neural_buffer.clear()
         self.source_position_buffer.clear()
+        self.source_layer_buffer.clear()
 
         # Only log plots from rank 0 to avoid duplicate wandb entries in DDP
         if not self.trainer.is_global_zero:
@@ -452,7 +460,7 @@ class MICH(LightningModule):
         subset_neural = neural[random_indices]
         subset_z_hat = z_hat[random_indices]
         subset_src_pos = source_position[random_indices]
-
+        subset_src_layer = source_layer[random_indices]
         subset_h = subset_src_pos[..., 0]
         subset_w = subset_src_pos[..., 1]
         batch_idx = torch.arange(subset_bold.shape[0])
@@ -474,6 +482,8 @@ class MICH(LightningModule):
             true_bold=subset_bold,
             pred_neural=pred_neural,
             true_neural=subset_neural,
+            source_layer=subset_src_layer,
+            source_pos=subset_src_pos,
         )
         self._plot_and_log_latents(
             pred_s=subset_z_hat[:, MICH._signal_index("s")],
@@ -484,10 +494,17 @@ class MICH(LightningModule):
             pred_q_star=subset_z_hat[:, MICH._signal_index("qstar")],
         )
 
-    def _plot_and_log_predictions(self, pred_bold, true_bold, pred_neural, true_neural):
+    def _plot_and_log_predictions(
+        self, pred_bold, true_bold, pred_neural, true_neural, source_layer, source_pos
+    ):
         for i in range(pred_bold.shape[0]):
             image = plot_neural_bold_layers(
-                pred_bold[i], true_bold[i], pred_neural[i], true_neural[i]
+                pred_bold=pred_bold[i],
+                true_bold=true_bold[i],
+                pred_neural=pred_neural[i],
+                true_neural=true_neural[i],
+                source_layer=source_layer[i],
+                source_pos=source_pos[i],
             )
             if wandb.run is not None:
                 wandb.log({"predictions": wandb.Image(image)})

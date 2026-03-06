@@ -239,18 +239,24 @@ class LayeredDiffusionSimulator:
                 new_grid = self.grid.copy()
 
                 for layer_index in range(self.n_layers):
-                    lap = convolve(self.grid[layer_index], laplacian_kernel, mode="constant", cval=0.0)
+                    lap = convolve(
+                        self.grid[layer_index], laplacian_kernel, mode="constant", cval=0.0
+                    )
                     new_grid[layer_index] += (self.diff_intra * lap) * dt_sub
 
                     # inter-layer coupling (second difference across layers)
                     if layer_index > 0:
                         flux_below = (
-                            self.diff_inter * (self.grid[layer_index - 1] - self.grid[layer_index]) / (self.dx**2)
+                            self.diff_inter
+                            * (self.grid[layer_index - 1] - self.grid[layer_index])
+                            / (self.dx**2)
                         )
                         new_grid[layer_index] += flux_below * dt_sub
                     if layer_index < self.n_layers - 1:
                         flux_above = (
-                            self.diff_inter * (self.grid[layer_index + 1] - self.grid[layer_index]) / (self.dx**2)
+                            self.diff_inter
+                            * (self.grid[layer_index + 1] - self.grid[layer_index])
+                            / (self.dx**2)
                         )
                         new_grid[layer_index] += flux_above * dt_sub
 

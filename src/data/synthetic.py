@@ -217,8 +217,12 @@ class SyntheticH5Dataset(Dataset):
         x = np.empty((L, T, H, W), dtype=self._np_dtype)
 
         for layer_index in range(L):
-            self._bold_ds[layer_index].read_direct(bold, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
-            self._x_ds[layer_index].read_direct(x, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+            self._bold_ds[layer_index].read_direct(
+                bold, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+            )
+            self._x_ds[layer_index].read_direct(
+                x, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+            )
 
         out: Dict[str, Any] = {"bold": bold, "neural": x}
 
@@ -240,10 +244,18 @@ class SyntheticH5Dataset(Dataset):
             q_star = np.empty((L, T, H, W), dtype=self._np_dtype)
 
             for layer_index in range(L):
-                self._m_latent_s[layer_index].read_direct(s, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
-                self._m_latent_f[layer_index].read_direct(f, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
-                self._m_latent_v[layer_index].read_direct(v, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
-                self._m_latent_q[layer_index].read_direct(q, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_s[layer_index].read_direct(
+                    s, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
+                self._m_latent_f[layer_index].read_direct(
+                    f, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
+                self._m_latent_v[layer_index].read_direct(
+                    v, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
+                self._m_latent_q[layer_index].read_direct(
+                    q, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
                 self._m_latent_v_star[layer_index].read_direct(
                     v_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
                 )
