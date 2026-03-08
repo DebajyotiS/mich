@@ -239,7 +239,11 @@ class MICH(LightningModule):
         )
         # post process the predicted bold
         pred_bold = torch.clamp(pred_bold, min=-1.0, max=1.0)
-        pred_bold_norm = self.normaliser(pred_bold) if self.normaliser is not None else pred_bold
+        pred_bold_norm = (
+            self.normaliser(pred_bold, source_position)
+            if self.normaliser is not None
+            else pred_bold
+        )
 
         # Sample the collocation points
         pred_bold_norm = self._gather_bold_at(pred_bold_norm, collocation)
@@ -267,6 +271,7 @@ class MICH(LightningModule):
         dz_hat_dt: torch.Tensor,
         idx: CollocationBatch,
         layer: int,
+        burn_in: int,
     ) -> torch.Tensor:
         x = MICH._gather_z_hat_at(z_hat, idx, signal="x")[:, layer]
         s = MICH._gather_z_hat_at(z_hat, idx, signal="s")[:, layer]
@@ -290,19 +295,18 @@ class MICH(LightningModule):
         )
 
         ds_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="s")
-        s_loss = F.mse_loss(
-            ds_dt, x - self.hparams.haemo.kappa * s - self.hparams.haemo.gamma * (f - 1)
-        )
+        s_target = x - self.hparams.haemo.kappa * s - self.hparams.haemo.gamma * (f - 1)
+        s_loss = F.mse_loss(ds_dt[:, burn_in:], s_target[:, burn_in:])
 
         df_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="f")
-        f_loss = F.mse_loss(df_dt, s)
+        f_loss = F.mse_loss(df_dt[:, burn_in:], s[:, burn_in:])
 
         dv_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="v")
         target_vdot = f - v ** (1 / self.hparams.haemo.alpha)
         if layer > 0:
             vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             target_vdot += self.hparams.haemo.lambda_d * vstar_deeper
-        v_loss = F.mse_loss(dv_dt, target_vdot / self.hparams.haemo.tau)
+        v_loss = F.mse_loss(dv_dt[:, burn_in:], target_vdot[:, burn_in:] / self.hparams.haemo.tau)
 
         dq_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="q")
         target_qdot = f * (
@@ -312,13 +316,15 @@ class MICH(LightningModule):
             qstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
             target_qdot += self.hparams.haemo.lambda_d * qstar_deeper
 
-        q_loss = F.mse_loss(dq_dt, target_qdot / self.hparams.haemo.tau)
+        q_loss = F.mse_loss(dq_dt[:, burn_in:], target_qdot[:, burn_in:] / self.hparams.haemo.tau)
 
         dv_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
-        v_star_loss = F.mse_loss(dv_star_dt, (-v_star + v - 1) / self.hparams.haemo.tau)
+        v_star_target = (-v_star + v - 1) / self.hparams.haemo.tau
+        v_star_loss = F.mse_loss(dv_star_dt[:, burn_in:], v_star_target[:, burn_in:])
 
         dq_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar")
-        q_star_loss = F.mse_loss(dq_star_dt, (-q_star + q - 1) / self.hparams.haemo.tau)
+        q_star_target = (-q_star + q - 1) / self.hparams.haemo.tau
+        q_star_loss = F.mse_loss(dq_star_dt[:, burn_in:], q_star_target[:, burn_in:])
 
         return (s_loss + f_loss + v_loss + q_loss + v_star_loss + q_star_loss) / 6.0
 
@@ -343,10 +349,12 @@ class MICH(LightningModule):
             dense_time_hi=self.hparams.loss_config.dense_time_hi,
             uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
         )
-        tot_physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=z_hat.dtype)
+        tot_physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=torch.float32)
         for layer in range(z_hat.shape[2]):
             tot_physics_loss += (
-                self._compute_physics_layer_loss(z_hat, dz_hat_dt, idx, layer=layer)
+                self._compute_physics_layer_loss(
+                    z_hat, dz_hat_dt, idx, layer=layer, burn_in=self.hparams.loss_config.burn_in
+                ).float()
                 / z_hat.shape[2]
             )
         return tot_physics_loss
@@ -355,7 +363,7 @@ class MICH(LightningModule):
         bold, neural = batch["bold"], batch["neural"]
         source_position = batch["source_position"]
 
-        bold_norm = self.normaliser(bold) if self.normaliser is not None else bold
+        bold_norm = self.normaliser(bold, source_position) if self.normaliser is not None else bold
 
         sd_manifest = self(
             bold_norm,
@@ -375,39 +383,47 @@ class MICH(LightningModule):
             + self.hparams.loss_config.lambda_physics * physics_loss
         )
 
+        on_step = stage == "train"
+        on_epoch = stage == "val"
         self.log(
             f"{stage}/data_loss",
             data_loss,
-            on_step=True,
-            on_epoch=True,
+            on_step=on_step,
+            on_epoch=on_epoch,
             prog_bar=True,
             sync_dist=True,
         )
         self.log(
             f"{stage}/physics_loss",
             physics_loss,
-            on_step=True,
-            on_epoch=True,
+            on_step=on_step,
+            on_epoch=on_epoch,
             prog_bar=True,
             sync_dist=True,
         )
         self.log(
             f"{stage}/total_loss",
             total_loss,
-            on_step=True,
-            on_epoch=True,
+            on_step=on_step,
+            on_epoch=on_epoch,
             prog_bar=True,
             sync_dist=True,
         )
 
-        # Log unsynced per-rank metrics to each rank's own wandb run
-        if not self.trainer.is_global_zero and getattr(self, "_rank_run", None) is not None:
+        # Log unsynced per-rank metrics to each rank's own wandb run.
+        # Only log during training and throttle to match log_every_n_steps so
+        # the W&B step axis on rank 1 stays in sync with rank 0's WandbLogger.
+        if (
+            stage == "train"
+            and not self.trainer.is_global_zero
+            and getattr(self, "_rank_run", None) is not None
+            and self.global_step % self.trainer.log_every_n_steps == 0
+        ):
             self._rank_run.log(
                 {
-                    f"{stage}/data_loss": data_loss.item(),
-                    f"{stage}/physics_loss": physics_loss.item(),
-                    f"{stage}/total_loss": total_loss.item(),
-                    "trainer/global_step": self.global_step,
+                    f"{stage}/data_loss_step": data_loss.item(),
+                    f"{stage}/physics_loss_step": physics_loss.item(),
+                    f"{stage}/total_loss_step": total_loss.item(),
                 }
             )
 
@@ -504,6 +520,7 @@ class MICH(LightningModule):
     def _plot_and_log_predictions(
         self, pred_bold, true_bold, pred_neural, true_neural, source_layer, source_pos
     ):
+        run = getattr(self, "_rank_run", None) or wandb.run
         for i in range(pred_bold.shape[0]):
             image = plot_neural_bold_layers(
                 pred_bold=pred_bold[i],
@@ -513,13 +530,12 @@ class MICH(LightningModule):
                 source_layer=source_layer[i],
                 source_pos=source_pos[i],
             )
-            if wandb.run is not None:
-                wandb.run.log(
-                    {"predictions": wandb.Image(image), "trainer/global_step": self.global_step}
-                )
+            if run is not None:
+                run.log({"predictions": wandb.Image(image)})
             plt.close(image)
 
     def _plot_and_log_latents(self, pred_s, pred_f, pred_v, pred_q, pred_v_star, pred_q_star):
+        run = getattr(self, "_rank_run", None) or wandb.run
         for i in range(pred_s.shape[0]):
             image = plot_latent_layers(
                 pred_f=pred_f[i],
@@ -530,10 +546,8 @@ class MICH(LightningModule):
                 pred_q_star=pred_q_star[i],
                 title="Latent States",
             )
-            if wandb.run is not None:
-                wandb.run.log(
-                    {"latents": wandb.Image(image), "trainer/global_step": self.global_step}
-                )
+            if run is not None:
+                run.log({"latents": wandb.Image(image)})
             plt.close(image)
 
     def on_fit_start(self) -> None:
