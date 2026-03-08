@@ -8,6 +8,6 @@ accelerator: gpu
 devices: auto
 strategy: ddp
 gradient_clip_val: 5.0
-precision: 16
+precision: bf16-mixed
 enable_model_summary: False
 default_root_dir: ${paths.full_path}
