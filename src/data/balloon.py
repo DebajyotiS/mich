@@ -472,7 +472,7 @@ def simulate_cortex(
                 "q*": layer.state.q_star,
             }
 
-            def delay_dy_fn(ycand: dict[str, Timecourse]) -> dict[str, Timecourse]:
+            def delay_dy_fn(ycand: dict[str, Timecourse], layer=layer) -> dict[str, Timecourse]:
                 layer.state.v = ycand["v"]
                 layer.state.q = ycand["q"]
                 layer.state.v_star = ycand["v*"]
@@ -499,7 +499,7 @@ def simulate_cortex(
                 "q": layer.state.q,
             }
 
-            def balloon_dy_fn(ycand: dict[str, Timecourse]) -> dict[str, Timecourse]:
+            def balloon_dy_fn(ycand: dict[str, Timecourse], layer=layer) -> dict[str, Timecourse]:
                 layer.state.x = ycand["x"]
                 layer.state.s = ycand["s"]
                 layer.state.f = ycand["f"]
