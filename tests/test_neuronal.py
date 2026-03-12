@@ -79,6 +79,7 @@ def _make_sim(
     diff_inter=0.0,
     safety=0.9,
     max_substeps=128,
+    decay_rate=0.5,
 ):
     params = NeuralSimulatorParams(
         num_layers=num_layers,
@@ -89,6 +90,7 @@ def _make_sim(
         diffusion_coefficient_intra=diff_intra,
         safety=safety,
         max_substeps=max_substeps,
+        decay_rate=decay_rate,
     )
     return LayeredDiffusionSimulator(params)
 
@@ -422,11 +424,12 @@ def test_simulate_runs_with_substepping_when_required_within_cap():
 # -------------------------
 
 
-def test_simulate_injection_accumulates_with_dt_without_diffusion_or_noise():
-    # With diff=0 and snr=inf, only injection contributes:
-    # grid[layer,i,j] += sig[step] * dt
-    dt = 0.2
-    sim = _make_sim(num_layers=1, grid_size=(4, 4), dt=dt, dx=1.0, diff_intra=0.0, diff_inter=0.0)
+def test_simulate_injection_sets_value_without_diffusion_or_noise():
+    # With diff=0, decay=0, and snr=inf, injection assigns sig[step] to the grid point.
+    # No accumulation -- the value at (layer, i, j) is exactly sig[step] after each step.
+    sim = _make_sim(
+        num_layers=1, grid_size=(4, 4), dt=0.2, dx=1.0, diff_intra=0.0, diff_inter=0.0, decay_rate=0.0
+    )
     sig = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
     src = _source(layer=0, position=(1, 1), signal=sig)
     noise = SpyNoise(domain="spatial")
@@ -434,10 +437,9 @@ def test_simulate_injection_accumulates_with_dt_without_diffusion_or_noise():
     hist = sim.simulate([src], steps=4, snr_db=np.inf, noise=noise)
     assert hist.shape == (4, 1, 4, 4)
 
-    # Check cumulative at injection site
-    expected = np.cumsum(sig) * dt
+    # Injection point tracks signal exactly
     got = hist[:, 0, 1, 1]
-    assert np.allclose(got, expected)
+    assert np.allclose(got, sig)
 
     # Everything else stays zero
     mask = np.ones((4, 1, 4, 4), dtype=bool)

@@ -76,6 +76,29 @@ jobs:
             --cov-report=xml:coverage.xml \
             --cov-report=html:htmlcov
 
+      - name: Extract coverage percentage
+        id: coverage
+        run: |
+          PCT=$(python -c "
+          import xml.etree.ElementTree as ET
+          root = ET.parse('coverage.xml').getroot()
+          print(round(float(root.attrib['line-rate']) * 100))
+          ")
+          echo "pct=$PCT" >> $GITHUB_OUTPUT
+
+      - name: Update coverage badge
+        if: github.ref == 'refs/heads/main'
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        with:
+          auth: ${{ secrets.GIST_SECRET }}
+          gistID: YOUR_GIST_ID_HERE
+          filename: mich-coverage.json
+          label: coverage
+          message: ${{ steps.coverage.outputs.pct }}%
+          valColorRange: ${{ steps.coverage.outputs.pct }}
+          maxColorRange: 100
+          minColorRange: 0
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4

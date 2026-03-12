@@ -1,6 +1,7 @@
 # MICH: Machine Inference for Cortical Haemodynamics
 
 [![CI](https://github.com/DebajyotiS/mich/actions/workflows/ci.yml/badge.svg)](https://github.com/DebajyotiS/mich/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/DebajyotiS/YOUR_GIST_ID_HERE/raw/mich-coverage.json)](https://github.com/DebajyotiS/mich/actions/workflows/ci.yml)
 
 ---
 
