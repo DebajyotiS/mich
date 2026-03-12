@@ -248,7 +248,7 @@ class MICH(LightningModule):
         true_bold_at = self._gather_bold_at(true_bold, collocation)
         L = pred_bold_at.shape[1]
         colloc_loss = torch.stack(
-            [F.mse_loss(pred_bold_at[:, l], true_bold_at[:, l]) for l in range(L)]
+            [F.mse_loss(pred_bold_at[:, layer], true_bold_at[:, layer]) for layer in range(L)]
         ).mean()
 
         # Source voxel loss -- full T, all layers, per sample
@@ -259,7 +259,7 @@ class MICH(LightningModule):
         pred_bold_src = pred_bold[b_idx, :, :, src_h, src_w]  # [B, L, T]
         true_bold_src = true_bold[b_idx, :, :, src_h, src_w]  # [B, L, T]
         src_loss = torch.stack(
-            [F.mse_loss(pred_bold_src[:, l], true_bold_src[:, l]) for l in range(L)]
+            [F.mse_loss(pred_bold_src[:, layer], true_bold_src[:, layer]) for layer in range(L)]
         ).mean()
 
         return colloc_loss + self.hparams.loss_config.lambda_src * src_loss

@@ -103,7 +103,7 @@ loss_config:
   uniform_time_lo: 0.1
   dense_spatial_frac: 0.8
   dense_spatial_radius: ${model.spatial_radius}
-  burn_in: 5
+  burn_in: 0
 
 haemo:
   kappa: 0.65
