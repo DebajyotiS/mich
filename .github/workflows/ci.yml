@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -U uv
-          uv venv .venv
+          uv venv --clear .venv
           . .venv/bin/activate
           uv pip install -e ".[dev]"
 
@@ -62,7 +62,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -U uv
-          uv venv .venv
+          uv venv --clear .venv
           . .venv/bin/activate
           uv pip install -e ".[dev]"
 
