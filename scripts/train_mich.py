@@ -86,5 +86,6 @@ if __name__ == "__main__":
 
     # Set environment variable to show full error tracebacks in Hydra
     os.environ["HYDRA_FULL_ERROR"] = "1"
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     main()
     log.info("All done. Exiting gracefully.")

@@ -195,7 +195,7 @@ class SpatialEncoder(nn.Module):
         B, T, C, H, W = x.shape
         x = x.reshape(B * T, C, H, W)  # [B*T, C, H, W]
         for layer in self.module:
-            x = checkpoint(layer, x, use_reentrant=False)
+            x = checkpoint(layer, x, use_reentrant=False).to(x.dtype)
         _, C_out, H_out, W_out = x.shape
         x = x.view(B, T, C_out, H_out, W_out)  # [B, T, C', H, W]
         return x
@@ -257,8 +257,7 @@ class TemporalMixingEncoder(nn.Module):
         B, T, C, H, W = x.shape
         x = x.permute(0, 3, 4, 2, 1).reshape(B * H * W, C, T)  # [B*H*W, C, T]
         for layer in self.module:
-            x = layer(x)
-
+            x = checkpoint(layer, x, use_reentrant=False).to(x.dtype)
         x = x.reshape(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
         return x
 
@@ -553,7 +552,14 @@ class HeinzleNet(nn.Module):
         # checkpoint the two following encoders to save on memory.
 
         xenc = self.spatial_encoder(xmix)  # [B, T, C', H, W]
-        xmix = checkpoint(self.temporal_mixing, xenc, use_reentrant=False)  # [B, T, C', H, W]
+        xmix = self.temporal_mixing(xenc)  # [B, T, C', H, W]
+        # print(torch.cuda.memory_summary(device=xmix.device, abbreviated=True))
+        # for obj in gc.get_objects():
+        #     try:
+        #         if torch.is_tensor(obj) and obj.is_cuda and obj.numel() * obj.element_size() > 100 * 1024 * 1024:
+        #             print(f"Large tensor: {obj.shape} {obj.dtype} {obj.numel() * obj.element_size() / 1024**2:.1f} MB")
+        #     except:
+        #         pass
         z_hat = self.spatial_decoder(
             xmix, t, return_gradients=return_gradients
         )  # [B, 7, L, T, H, W]

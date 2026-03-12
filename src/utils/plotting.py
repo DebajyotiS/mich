@@ -102,11 +102,17 @@ def plot_neural_bold_layers(
 
 def plot_latent_layers(
     pred_s: torch.Tensor,
+    true_s: torch.Tensor,
     pred_f: torch.Tensor,
+    true_f: torch.Tensor,
     pred_v: torch.Tensor,
+    true_v: torch.Tensor,
     pred_q: torch.Tensor,
+    true_q: torch.Tensor,
     pred_v_star: torch.Tensor,
+    true_v_star: torch.Tensor,
     pred_q_star: torch.Tensor,
+    true_q_star: torch.Tensor,
     tr: float = 0.1,
     title: str = "Latent States",
 ) -> Figure:
@@ -116,7 +122,7 @@ def plot_latent_layers(
     Each input tensor is [L, T].
     Layout: rows = layers (Deep → Superficial), cols = signals (x, s, f, v, q, v*, q*).
     """
-    signals = [
+    pred_signals = [
         pred_s.cpu().numpy(),
         pred_f.cpu().numpy(),
         pred_v.cpu().numpy(),
@@ -124,10 +130,20 @@ def plot_latent_layers(
         pred_v_star.cpu().numpy(),
         pred_q_star.cpu().numpy(),
     ]
+    true_signals = [
+        true_s.cpu().numpy(),
+        true_f.cpu().numpy(),
+        true_v.cpu().numpy(),
+        true_q.cpu().numpy(),
+        true_v_star.cpu().numpy(),
+        true_q_star.cpu().numpy(),
+    ]
 
-    n_layers = signals[0].shape[0]
-    n_signals = len(signals)
-    times = np.arange(signals[0].shape[-1]) * tr
+    n_layers = pred_signals[0].shape[0]
+    n_signals = len(pred_signals)
+    total_duration = pred_signals[0].shape[-1] * tr
+    pred_times = np.linspace(0, total_duration, pred_signals[0].shape[-1])
+    true_times = np.linspace(0, total_duration, true_signals[0].shape[-1])
 
     fig, axes = plt.subplots(
         nrows=n_layers,
@@ -138,11 +154,23 @@ def plot_latent_layers(
     fig.suptitle(title, fontfamily="monospace", fontsize=13)
 
     for row, layer_name in enumerate(LAYER_NAMES):
-        for col, (sig_array, sig_name) in enumerate(zip(signals, LATENT_NAMES, strict=True)):
+        for col, (pred_arr, true_arr, sig_name) in enumerate(
+            zip(pred_signals, true_signals, LATENT_NAMES, strict=True)
+        ):
             ax = axes[row, col]
+            color = COLOR_HEX[SIGNALS_LIST.index(sig_name)]
+            layer_idx = n_layers - row - 1
+            ax.plot(true_times, true_arr[layer_idx], color=color, ls="-", label="True")
             ax.plot(
-                times, sig_array[row], color=COLOR_HEX[SIGNALS_LIST.index(sig_name)], linewidth=0.9
+                pred_times,
+                pred_arr[layer_idx],
+                color=color,
+                linewidth=0.9,
+                ls="-.",
+                alpha=0.6,
+                label="Pred",
             )
+            ax.legend(loc="upper right", frameon=False, fontsize=7)
 
             # column header on top row only
             if row == 0:

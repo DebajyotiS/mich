@@ -105,18 +105,12 @@ def _compute_split_counts(n: int, split: Mapping[str, Any]) -> Tuple[int, int, i
 class SyntheticH5Dataset(Dataset):
     """
     Reads:
-      /layer_k/bold : (N, T, H, W) ideally chunked (1,T,H,W)
-      /layer_k/x    : (N, T, H, W) ideally chunked (1,T,H,W)
+    /layer_k/bold : (N, T, H, W) ideally chunked (1,T,H,W)
+    /layer_k/x    : (N, T, H, W) ideally chunked (1,T,H,W)
 
     Returns tensors:
-      bold  : (L, T, H, W)
-      neural: (L, T, H, W)
-
-    Performance:
-    - each DataLoader worker opens its own file handle lazily on first __getitem__
-    - dataset handles are cached to avoid repeated HDF5 tree traversal
-    - read_direct eliminates intermediate allocations on every sample read
-    - np_dtype resolved once at construction
+    bold  : (L, T, H, W)
+    neural: (L, T, H, W)
     """
 
     def __init__(
@@ -156,6 +150,7 @@ class SyntheticH5Dataset(Dataset):
         with h5py.File(self.path, "r") as f:
             self.N = int(f[self.layers[0]]["bold"].shape[0])
             t, h, w = f[self.layers[0]]["bold"].shape[1:]
+            self.lt = f[self.layers[0]]["s"].shape[1] if self.return_latents else t
             self._window_shape = (int(t), int(h), int(w))
 
     def __len__(self) -> int:
@@ -236,12 +231,12 @@ class SyntheticH5Dataset(Dataset):
             )
 
         if self.return_latents:
-            s = np.empty((L, T, H, W), dtype=self._np_dtype)
-            f = np.empty((L, T, H, W), dtype=self._np_dtype)
-            v = np.empty((L, T, H, W), dtype=self._np_dtype)
-            q = np.empty((L, T, H, W), dtype=self._np_dtype)
-            v_star = np.empty((L, T, H, W), dtype=self._np_dtype)
-            q_star = np.empty((L, T, H, W), dtype=self._np_dtype)
+            s = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
+            f = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
+            v = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
+            q = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
+            v_star = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
+            q_star = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
 
             for layer_index in range(L):
                 self._m_latent_s[layer_index].read_direct(
@@ -287,26 +282,38 @@ class SyntheticDataModule(pl.LightningDataModule):
         self.ds_val: Optional[Subset] = None
         self.ds_test: Optional[Subset] = None
 
-    def setup(self, stage: str | None = None) -> None:
-        data_path = self.data_config.get("path")
+    def _resolve_split_cfg(self, split_name: str) -> dict:
+        """Merge base data_config with any per-split overrides under data_config[split_name]."""
+        cfg = dict(self.data_config)
+        overrides = cfg.pop(split_name, None)
+        if overrides:
+            cfg.update(overrides)
+        # also strip the other split override keys so they don't pollute downstream
+        for key in ("train", "val", "test"):
+            cfg.pop(key, None)
+        return cfg
+
+    def _make_dataset(self, cfg: dict) -> SyntheticH5Dataset:
+        data_path = cfg.get("path")
         if data_path is None:
             raise ValueError("data.path must be set")
-
-        layers_val = self.data_config.get("layers", ("layer_0", "layer_1", "layer_2"))
+        layers_val = cfg.get("layers", ("layer_0", "layer_1", "layer_2"))
         layers = tuple(layers_val) if layers_val is not None else ("layer_0", "layer_1", "layer_2")
-
-        dtype = _torch_dtype(self.data_config.get("dtype", "float32"))
-        return_meta = bool(self.data_config.get("return_meta", False))
-
-        self.dataset_full = SyntheticH5Dataset(
+        return SyntheticH5Dataset(
             path=str(data_path),
             layers=layers,
-            dtype=dtype,
-            return_meta=return_meta,
+            dtype=_torch_dtype(cfg.get("dtype", "float32")),
+            return_meta=bool(cfg.get("return_meta", False)),
+            return_latents=bool(cfg.get("return_latents", False)),
             cache_cfg=self.h5_cache_config,
         )
 
-        n = len(self.dataset_full)
+    def setup(self, stage: str | None = None) -> None:
+        # Use a temporary dataset to get N and compute split indices
+        base_cfg = self._resolve_split_cfg("__none__")
+        _tmp = self._make_dataset(base_cfg)
+        n = len(_tmp)
+
         n_train, n_val, n_test = _compute_split_counts(n, self.split_config)
 
         seed = int(self.split_config.get("seed", 42))
@@ -321,9 +328,9 @@ class SyntheticDataModule(pl.LightningDataModule):
         val_idx = indices[n_train : n_train + n_val].tolist()
         test_idx = indices[n_train + n_val : n_train + n_val + n_test].tolist()
 
-        self.ds_train = Subset(self.dataset_full, train_idx)
-        self.ds_val = Subset(self.dataset_full, val_idx)
-        self.ds_test = Subset(self.dataset_full, test_idx)
+        self.ds_train = Subset(self._make_dataset(self._resolve_split_cfg("train")), train_idx)
+        self.ds_val = Subset(self._make_dataset(self._resolve_split_cfg("val")), val_idx)
+        self.ds_test = Subset(self._make_dataset(self._resolve_split_cfg("test")), test_idx)
 
     def _make_loader(self, ds: Subset, *, shuffle: bool, drop_last: bool) -> DataLoader:
         bs = int(self.loader_config.get("batch_size", 2))

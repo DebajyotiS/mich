@@ -116,12 +116,15 @@ class LayerwiseBOLDNormalizer(nn.Module):
         return batch_mean, batch_var
 
     def forward(
-        self, bold: torch.Tensor, source_position: torch.Tensor | None = None
+        self,
+        bold: torch.Tensor,
+        source_position: torch.Tensor | None = None,
+        pause_update: bool = False,
     ) -> torch.Tensor:
         input_dtype = bold.dtype
         bold_f32 = bold.float()
 
-        if self.training and not self.frozen:
+        if self.training and (not self.frozen) and (not pause_update):
             if source_position is None:
                 raise ValueError(
                     "source_position required during training for neighbourhood normalisation"
@@ -133,17 +136,13 @@ class LayerwiseBOLDNormalizer(nn.Module):
             mean = self.running_mean
             std = self.running_var.sqrt().clamp(min=1e-3)
 
-        return ((bold_f32 - mean) / (std + self.eps)).clamp(-10.0, 10.0).to(input_dtype)
+        return ((bold_f32 - mean) / std).clamp(-10.0, 10.0).to(input_dtype)
 
     def normalize(self, bold: torch.Tensor) -> torch.Tensor:
         input_dtype = bold.dtype
         std = self.running_var.sqrt().clamp(min=1e-3)
-        return (
-            ((bold.float() - self.running_mean) / (std + self.eps))
-            .clamp(-10.0, 10.0)
-            .to(input_dtype)
-        )
+        return ((bold.float() - self.running_mean) / std).clamp(-10.0, 10.0).to(input_dtype)
 
     def denormalize(self, bold_norm: torch.Tensor) -> torch.Tensor:
         std = self.running_var.sqrt().clamp(min=1e-3)
-        return (bold_norm.float() * (std + self.eps) + self.running_mean).to(bold_norm.dtype)
+        return (bold_norm.float() * std + self.running_mean).to(bold_norm.dtype)
