@@ -77,7 +77,7 @@ def _one_plus_softplus(x: torch.Tensor) -> torch.Tensor:
 
 
 def _neg_softplus_neg(x: torch.Tensor) -> torch.Tensor:
-    """-softplus(-x)  — non-positive, smooth"""
+    """-softplus(-x)  -- non-positive, smooth"""
     return -F.softplus(-x)
 
 

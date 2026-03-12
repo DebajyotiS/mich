@@ -6,7 +6,7 @@ Everything starts with a spatio-temporal BOLD signal:
 
 $$s \in \mathbb{R}^{B \times L \times T \times H \times W}$$
 
-$B$ is the batch size, $L = 3$ is the number of cortical layers, $T = 3000$ is the number of timepoints, and $H = W = 32$ are the spatial dimensions. So each sample in the batch is a 3-layer stack of 32×32 spatial grids evolving over 3000 timepoints.
+$B$ is the batch size, $L = 3$ is the number of cortical layers, $T = 100$ is the number of timepoints, and $H = W = 32$ are the spatial dimensions. So each sample in the batch is a 3-layer stack of 32×32 spatial grids evolving over 100 timepoints.
 
 This signal passes sequentially through four modules inside `HeinzleNet`: `MaskedLayerMixing`, `SpatialEncoder`, `TemporalMixingEncoder`, and `SpatioTemporalDecoder`. Each module is designed to handle one specific aspect of the signal's structure : layer, space, and time : in isolation before they are brought together in the decoder. This separation is intentional and worth keeping in mind as you read through.
 
@@ -131,13 +131,13 @@ Each of the $B \cdot H \cdot W$ entries is now an independent $C'$-channel time 
 **Step 2 : Stack of dilated depthwise TCN layers.**
 A sequence of $N$ temporal convolutional blocks is applied. Each block is a `TemporalDepthWiseTCNLayer` with an exponentially increasing dilation following the pattern $1, 2, 4, 8, \ldots, 2^{N-1}$.
 
-Why dilation? With a kernel size of 3 and no dilation, each output timepoint can only see its immediate neighbours. Doubling the dilation at each layer exponentially expands the receptive field : after $N$ layers, the network can relate timepoints that are $2^N$ steps apart. For $T = 3000$ this matters: hemodynamic responses are slow and the relevant temporal context spans hundreds of timepoints.
+Why dilation? With a kernel size of 3 and no dilation, each output timepoint can only see its immediate neighbours. Doubling the dilation at each layer exponentially expands the receptive field : after $N$ layers, the network can relate timepoints that are $2^N$ steps apart. For $T = 100$ and 6 TCN layers, the receptive field reaches $2^6 = 64$ steps, comfortably spanning the full hemodynamic response window.
 
 Each block applies the following operations. First, a depthwise 1D convolution with dilation $d$ filters each channel independently along time:
 
 $$x^{(dw)}_{n,c} = k^{(c)} *_d\, x_{n,c}$$
 
-where $*_d$ denotes convolution with dilation $d$. The padding is set to $(k-1) \cdot d \;/\; 2$ to preserve the sequence length, so $T$ does not change.
+where $*_d$ denotes convolution with dilation $d$. The padding is $(k-1) \cdot d$ samples applied **only on the left** (i.e. only to the past), so $T$ does not change and the convolution is **causal**: each output timepoint can only attend to present and past inputs, never future ones.
 
 Second, a pointwise ($1{\times}1$) convolution mixes information across channels without touching the time axis:
 
@@ -225,7 +225,13 @@ If `return_gradients=True`, the decoder additionally computes $\partial \hat{z} 
 
 $$\frac{\partial y}{\partial t} = \frac{\partial \gamma}{\partial t} \odot u + \frac{\partial \beta}{\partial t}$$
 
-$\partial \gamma / \partial t$ and $\partial \beta / \partial t$ are computed using `jacrev` via `vmap` over individual scalar timepoints, which is exact and avoids differentiating through the entire encoder. This derivative is then pushed through the same $1{\times}1$ output convolution (which is linear, so it commutes with differentiation) to produce $\partial \hat{z} / \partial t \in \mathbb{R}^{B \times 7 \times L \times T \times H \times W}$.
+$\partial \gamma / \partial t$ and $\partial \beta / \partial t$ are computed using `jacrev` via `vmap` over individual scalar timepoints, which is exact and avoids differentiating through the entire encoder. This derivative is then pushed through the same $1{\times}1$ output convolution (which is linear, so it commutes with differentiation) to give the pre-activation time derivative $\partial z_\text{pre} / \partial t$.
+
+Because the output channels go through per-channel activations — $\text{softplus}$ for $x, f, v, q$ and identity for $s, v^*, q^*$ — the full chain rule gives:
+
+$$\frac{\partial \hat{z}_i}{\partial t} = \sigma\!\left(z_{\text{pre},i}\right) \cdot \frac{\partial z_{\text{pre},i}}{\partial t}$$
+
+where $\sigma$ is the pointwise derivative of the channel's activation (sigmoid for softplus channels, $1$ for identity channels). This is applied elementwise per channel to produce $\partial \hat{z} / \partial t \in \mathbb{R}^{B \times 7 \times L \times T \times H \times W}$.
 
 These gradients are used in the PINN loss to enforce that the predicted state variables satisfy the hemodynamic differential equations at every timepoint.
 
@@ -248,7 +254,7 @@ This section addresses some natural questions about the design choices in `Heinz
 
 **Why not a transformer?**
 
-Transformers are a reasonable first thought for a problem with long temporal sequences, but they come with a significant practical problem: the self-attention mechanism scales quadratically with sequence length. With $T = 3000$ timepoints and $H \times W = 1024$ spatial locations, a naive spatiotemporal transformer would be completely intractable. Even restricting attention to the temporal axis alone , as in a standard sequence transformer , would require computing a $3000 \times 3000$ attention matrix for each spatial location in each batch, which is expensive at training time and even more so at the scale of full datasets.
+Transformers are a reasonable first thought for a problem with temporal sequences, but they come with a significant practical problem: the self-attention mechanism scales quadratically with sequence length. With $T = 100$ timepoints and $H \times W = 1024$ spatial locations, a naive spatiotemporal transformer would require computing a $100 \times 100$ attention matrix per spatial location per batch item — tractable in isolation, but multiplied across the full spatial grid this becomes expensive. More importantly, the architecture is designed to scale to longer sequences as data collection improves, and quadratic attention cost would immediately become a bottleneck.
 
 The dilated TCN achieves a similar goal (relating distant timepoints) at linear cost in $T$, and the exponentially growing receptive field means you get global temporal context with far fewer parameters.
 
@@ -284,10 +290,10 @@ Concatenating $t$ as a scalar channel to the spatial feature map is simple but w
 
 You could in principle call `torch.autograd.grad` on the full network output with respect to $t$ and get $\partial \hat{z} / \partial t$ that way. The problem is cost. This would require differentiating through all four modules , including the temporal encoder , which involves unrolling gradients through many convolutional layers and the entire sequence of TCN blocks. For a PINN training loop where these gradients are needed at every step, this is prohibitively expensive.
 
-The analytic approach works because $t$ only enters the network through `FourierTimeEmbedding` → `TimeFiLM`. The spatial features $u$ are fixed given $x$, so the chain rule collapses to just differentiating $\gamma(t)$ and $\beta(t)$, which is a small MLP applied to a Fourier embedding. `jacrev` via `vmap` computes this efficiently per-timepoint without touching the rest of the network.
+The analytic approach works because $t$ only enters the network through `FourierTimeEmbedding` -> `TimeFiLM`. The spatial features $u$ are fixed given $x$, so the chain rule collapses to just differentiating $\gamma(t)$ and $\beta(t)$, which is a small MLP applied to a Fourier embedding. `jacrev` via `vmap` computes this efficiently per-timepoint without touching the rest of the network.
 
 ---
 
 **What were the main alternatives considered for the overall architecture?**
 
-A few natural alternatives come up in the literature for this kind of spatiotemporal inverse problem. A U-Net with 3D convolutions is a common baseline for volumetric biomedical data, but as noted above, the space-time symmetry assumption is wrong for fMRI. A purely recurrent architecture (LSTM or GRU) along the temporal axis is another option, but RNNs are slow to train on sequences of length 3000 due to their sequential nature, and they tend to struggle with very long-range dependencies compared to dilated convolutions. Purely spatial models that process each timepoint independently and ignore temporal structure entirely would fail to capture the slow dynamics of the hemodynamic response. The current design tries to take the best of each approach: structured spatial processing, efficient long-range temporal modelling, and physics-informed output conditioning.
+A few natural alternatives come up in the literature for this kind of spatiotemporal inverse problem. A U-Net with 3D convolutions is a common baseline for volumetric biomedical data, but as noted above, the space-time symmetry assumption is wrong for fMRI. A purely recurrent architecture (LSTM or GRU) along the temporal axis is another option, but RNNs are slow to train due to their sequential nature and tend to struggle with long-range dependencies compared to dilated convolutions. Purely spatial models that process each timepoint independently and ignore temporal structure entirely would fail to capture the slow dynamics of the hemodynamic response. The current design tries to take the best of each approach: structured spatial processing, efficient long-range temporal modelling, and physics-informed output conditioning.

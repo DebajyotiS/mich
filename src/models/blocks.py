@@ -21,8 +21,8 @@ HEINZLE_SIGNAL_IDX: dict[HeinzleSignal, int] = {s: i for i, s in enumerate(HEINZ
 @dataclass
 class SpatialDecoderManifest:
     """
-    z_hat:     [B, 7, L, T, H, W]  — post-activation Heinzle states
-    dz_hat_dt: [B, 7, L, T, H, W]  — d/dt of post-activation states (optional)
+    z_hat:     [B, 7, L, T, H, W]  -- post-activation Heinzle states
+    dz_hat_dt: [B, 7, L, T, H, W]  -- d/dt of post-activation states (optional)
 
     Channel dim 1 follows HEINZLE_SIGNALS ordering:
         0=x, 1=s, 2=f, 3=v, 4=q, 5=vstar, 6=qstar
@@ -263,14 +263,15 @@ class TemporalMixingEncoder(nn.Module):
 
 
 class FourierTimeEmbedding(nn.Module):
-    def __init__(self, num_freqs: int = 16, max_freq: float = 10.0):
+    def __init__(self, num_freqs: int = 16, min_freq: float = 0.1, max_freq: float = 10.0):
         super().__init__()
         self.num_freqs = int(num_freqs)
+        self.min_freq = float(min_freq)
         self.max_freq = float(max_freq)
 
         # Precompute freqs in float32 on CPU; it'll move with the module to GPU.
         freqs = torch.logspace(
-            start=0.0,
+            start=torch.log10(torch.tensor(self.min_freq, dtype=torch.float32)),
             end=torch.log10(torch.tensor(self.max_freq, dtype=torch.float32)),
             steps=self.num_freqs,
             dtype=torch.float32,
@@ -433,7 +434,7 @@ class SpatioTemporalDecoder(nn.Module):
     def _gamma_beta_time_grads(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Analytic d(gamma)/dt and d(beta)/dt via vmap + jacrev over scalar t.
-        Returns: dgamma_dt, dbeta_dt — each [B, T, c_dec]
+        Returns: dgamma_dt, dbeta_dt -- each [B, T, c_dec]
         """
         B, T = t.shape
         t_flat = t.reshape(-1)  # [BT]
@@ -473,7 +474,7 @@ class SpatioTemporalDecoder(nn.Module):
         dy_dt = dgamma_dt[..., None, None] * u + dbeta_dt[..., None, None]
         dy_bt = dy_dt.reshape(B * T, dy_dt.shape[2], H, W)
 
-        # Apply conv weights only — no bias for derivative
+        # Apply conv weights only -- no bias for derivative
         dout_bt = F.conv2d(
             dy_bt,
             self.out.weight,

@@ -16,7 +16,7 @@ def plot_neural_bold_layers(
     true_neural: torch.Tensor,
     source_layer: torch.Tensor,
     source_pos: torch.Tensor,
-    tr: float = 0.1,
+    tr: float = 1.0,
 ) -> Figure:
     """
     Plot predicted and true BOLD and neural activity for a single sample.
@@ -113,14 +113,14 @@ def plot_latent_layers(
     true_v_star: torch.Tensor,
     pred_q_star: torch.Tensor,
     true_q_star: torch.Tensor,
-    tr: float = 0.1,
+    tr: float = 1.0,
     title: str = "Latent States",
 ) -> Figure:
     """
     Plot all 7 Heinzle latent signals across 3 cortical layers for a single sample.
 
     Each input tensor is [L, T].
-    Layout: rows = layers (Deep → Superficial), cols = signals (x, s, f, v, q, v*, q*).
+    Layout: rows = layers (Deep -> Superficial), cols = signals (x, s, f, v, q, v*, q*).
     """
     pred_signals = [
         pred_s.cpu().numpy(),

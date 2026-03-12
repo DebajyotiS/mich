@@ -178,8 +178,8 @@ class BoldPostProcessingConfig:
     Processing order: raw BOLD -> PSF convolution -> additive noise.
 
     Noise amplitude is determined by (in priority order):
-    1. ``snr_db`` — amplitude derived from signal power (highest priority)
-    2. ``noise_models`` — sum of ``noise_std * scale`` over each ``(NoiseModel, scale)`` pair
+    1. ``snr_db`` -- amplitude derived from signal power (highest priority)
+    2. ``noise_models`` -- sum of ``noise_std * scale`` over each ``(NoiseModel, scale)`` pair
     3. ``noise_amplitude`` as a direct override
     """
 

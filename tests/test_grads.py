@@ -86,7 +86,7 @@ class TestOnePlusSoftplus:
     """Tests for 1 + softplus function."""
 
     def test_one_plus_softplus_at_zero(self):
-        """At x=0, 1+softplus(0) = 1 + ln(2) ≈ 1.693."""
+        """At x=0, 1+softplus(0) = 1 + ln(2) ~= 1.693."""
         x = torch.tensor(0.0)
         result = _one_plus_softplus(x)
         expected = 1.0 + torch.nn.functional.softplus(torch.tensor(0.0))
@@ -108,7 +108,7 @@ class TestOnePlusSoftplus:
         """Should grow approximately linearly for large positive x."""
         x = torch.tensor([10.0, 20.0, 30.0])
         result = _one_plus_softplus(x)
-        # For large x, softplus(x) ≈ x, so 1 + softplus(x) ≈ 1 + x
+        # For large x, softplus(x) ~= x, so 1 + softplus(x) ~= 1 + x
         expected = 1.0 + x  # approximate
         assert torch.allclose(result, expected, atol=0.1)
 
@@ -117,14 +117,14 @@ class TestNegSoftplusNeg:
     """Tests for -softplus(-x) function."""
 
     def test_neg_softplus_neg_at_zero(self):
-        """At x=0, -softplus(-0) = -softplus(0) = -ln(2) ≈ -0.693."""
+        """At x=0, -softplus(-0) = -softplus(0) = -ln(2) ~= -0.693."""
         x = torch.tensor(0.0)
         result = _neg_softplus_neg(x)
         expected = -torch.nn.functional.softplus(torch.tensor(0.0))
         assert torch.allclose(result, expected)
 
     def test_neg_softplus_neg_non_positivity(self):
-        """-softplus(-x) should always be ≤ 0."""
+        """-softplus(-x) should always be <= 0."""
         x = torch.linspace(-10, 10, 100)
         result = _neg_softplus_neg(x)
         assert (result <= 0).all()
@@ -136,10 +136,10 @@ class TestNegSoftplusNeg:
         assert result.shape == x.shape
 
     def test_neg_softplus_neg_approx_for_negative_x(self):
-        """For large negative x, -softplus(-x) ≈ x (since softplus(-x) ≈ -x)."""
+        """For large negative x, -softplus(-x) ~= x (since softplus(-x) ~= -x)."""
         x = torch.tensor([-10.0, -20.0, -30.0])
         result = _neg_softplus_neg(x)
-        # For large negative x, softplus(-x) ≈ -x, so -softplus(-x) ≈ x
+        # For large negative x, softplus(-x) ~= -x, so -softplus(-x) ~= x
         expected = x
         assert torch.allclose(result, expected, atol=0.1)
 

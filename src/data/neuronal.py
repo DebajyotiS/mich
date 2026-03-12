@@ -14,6 +14,7 @@ class NeuralSimulatorParams:
     dx: float = 1.0
     diffusion_coefficient_inter: float = 1.0
     diffusion_coefficient_intra: float = 0.1
+    decay_rate: float = 0.5
 
     # stability / integration controls
     safety: float = 0.9  # CFL safety factor
@@ -42,6 +43,7 @@ class LayeredDiffusionSimulator:
         self.grid = np.zeros((params.num_layers, params.grid_size[0], params.grid_size[1]))
         self.safety = params.safety
         self.max_substeps = params.max_substeps
+        self.decay_rate = params.decay_rate
 
     def generate_pulse(self, pulses: list[Pulse]) -> list[tuple[np.ndarray, np.ndarray]]:
         signals = []
@@ -156,7 +158,7 @@ class LayeredDiffusionSimulator:
             if required > max_substeps:
                 raise ValueError(
                     f"Unstable explicit diffusion for dt={self.dt}. "
-                    f"Need ~{required} substeps (dt_max≈{dt_max:.3g}), "
+                    f"Need ~{required} substeps (dt_max~={dt_max:.3g}), "
                     f"but max_substeps={max_substeps}. Reduce dt, increase dx, or reduce diffusion."
                 )
             n_sub = required
@@ -224,7 +226,7 @@ class LayeredDiffusionSimulator:
                     inj = float(sig[step])
                     if temporal_noise is not None:
                         inj += float(temporal_noise[s_idx, step])
-                    self.grid[layer, i, j] += inj * self.dt
+                    self.grid[layer, i, j] = inj
 
             if not np.isfinite(self.grid).all():
                 where = np.argwhere(~np.isfinite(self.grid))[0]
@@ -243,6 +245,7 @@ class LayeredDiffusionSimulator:
                         self.grid[layer_index], laplacian_kernel, mode="constant", cval=0.0
                     )
                     new_grid[layer_index] += (self.diff_intra * lap) * dt_sub
+                    new_grid[layer_index] -= self.decay_rate * self.grid[layer_index] * dt_sub
 
                     # inter-layer coupling (second difference across layers)
                     if layer_index > 0:

@@ -4,13 +4,14 @@ L: 3
 C: 32
 c_enc: 32
 c_dec: 32
-num_freqs: 50
-max_freq: 500.0
+num_freqs: 12
+min_freq: 5.0
+max_freq: 32.0
 tcn_kernel: 3
 spatial_radius: 5
 grid_size: 32
 
-embed_dim: 100 # This needs to be manually set to be 2 * num_freqs for the time embedding to work correctly
+embed_dim: 24 # This needs to be manually set. 2 x num_freqs
 out_channels: 21
 
 heinzle_net:
@@ -62,21 +63,10 @@ heinzle_net:
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
-    - cin: ${model.c_enc}
-      kernel_size: ${model.tcn_kernel}
-      num_groups: 8
-      activation: silu
-    - cin: ${model.c_enc}
-      kernel_size: ${model.tcn_kernel}
-      num_groups: 8
-      activation: silu
-    - cin: ${model.c_enc}
-      kernel_size: ${model.tcn_kernel}
-      num_groups: 8
-      activation: silu
 
   time_embedding_config:
     num_freqs: ${model.num_freqs}
+    min_freq: ${model.min_freq}
     max_freq: ${model.max_freq}
 
   time_film_config:
@@ -104,8 +94,8 @@ loss_config:
   lambda_data: 10.0
   lambda_physics: 1.0
   lambda_src: 100.0
-  lambda_smooth: 1.
-  n_time: 2000
+  lambda_smooth: 1.0
+  n_time: 90
   n_space: 400
   dense_time_frac: 0.85
   dense_time_lo: 0.1
@@ -113,7 +103,7 @@ loss_config:
   uniform_time_lo: 0.1
   dense_spatial_frac: 0.8
   dense_spatial_radius: ${model.spatial_radius}
-  burn_in: 300
+  burn_in: 5
 
 haemo:
   kappa: 0.65

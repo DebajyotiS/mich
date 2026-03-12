@@ -75,12 +75,23 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
         diffusion_coefficient_intra=sc["diffusion_coefficient_intra"],
         diffusion_coefficient_inter=sc["diffusion_coefficient_inter"],
         dt=dt,
+        decay_rate=sc.get("decay_rate", 0.5),
     )
 
     num_pulses = int(rng.integers(1, max_pulses + 1))
-    onsets = np.sort(rng.integers(10, time_duration // 3, size=num_pulses))
-    durations = rng.uniform(0, 10 * dt, size=num_pulses)
-    amplitudes = rng.uniform(0.4, 1.0, size=num_pulses)
+    durations = rng.uniform(5.0, 10.0, size=num_pulses)
+    amplitudes = rng.uniform(0.3, 1.0, size=num_pulses)
+    isi_min: int = sc.get("isi_min", 20)  # jitter window (s) for random onset placement
+
+    # Build non-overlapping onsets sequentially: neural pulses never overlap,
+    # but BOLD responses may (haemodynamic overlap is fine).
+    onsets = []
+    t_min = 10
+    for k in range(num_pulses):
+        onset = t_min + int(rng.integers(0, isi_min))
+        onsets.append(onset)
+        t_min = onset + int(np.ceil(durations[k])) + 1  # +1 s gap: no neural overlap
+    onsets = np.array(onsets)
 
     pulse_list = [
         [float(a), float(o), float(d)]
@@ -111,10 +122,18 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
 
     x_inputs = [history[:, i, ...] for i in range(num_layers)]
 
+    # Upsample neural activity to haemodynamic integration resolution (zero-order hold)
+    haemo_dt: float = sc.get("haemo_dt", dt)
+    haemo_ratio = max(1, round(dt / haemo_dt))
+    if haemo_ratio > 1:
+        x_inputs_haemo = [np.repeat(xi, haemo_ratio, axis=0) for xi in x_inputs]
+    else:
+        x_inputs_haemo = x_inputs
+
     # Cortex layers (bottom-up)
     cortex_layers: list[CortexLayer] = []
     for i, lc in enumerate(layers_cfg):
-        x_i = x_inputs[i]
+        x_i = x_inputs_haemo[i]
         state = HaemodynamicState(
             x=x_i[0],
             s=np.zeros_like(x_i[0]),
@@ -138,10 +157,17 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
     out = simulate_cortex(
         cortex_layers,
         haemo,
-        x_inputs=x_inputs,  # type: ignore
-        dt=dt,
+        x_inputs=x_inputs_haemo,  # type: ignore
+        dt=haemo_dt,
         tau_d=sc["tau_d"],
     )
+
+    # Downsample haemodynamic outputs back to neural dt resolution for storage
+    if haemo_ratio > 1:
+        out = {
+            li: {k: (v[::haemo_ratio] if v is not None else None) for k, v in ld.items()}
+            for li, ld in out.items()
+        }
 
     # BOLD readout
     bold_cfg = cfg.get("bold", {})
@@ -199,9 +225,9 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
     return results
 
 
-# Keys needed for training — stored at full T resolution
+# Keys needed for training -- stored at full T resolution
 TRAIN_KEYS = ("x", "bold")
-# Intermediate latent states — stored at reduced resolution for inspection only
+# Intermediate latent states -- stored at reduced resolution for inspection only
 LATENT_KEYS = ("s", "f", "v", "q", "v_star", "q_star")
 
 
@@ -211,7 +237,7 @@ def init_h5(h5f: h5py.File, cfg: dict, num_sims: int, latent_downsample: int = 1
 
     Training keys (x, bold):
         Shape  : (N, T, H, W)  at full resolution
-        Chunks : (1, T, H, W)  — one sim per chunk, contiguous in time
+        Chunks : (1, T, H, W)  -- one sim per chunk, contiguous in time
 
     Latent keys (s, f, v, q, v_star, q_star):
         Shape  : (N, T//latent_downsample, H, W)  at reduced resolution
@@ -219,9 +245,9 @@ def init_h5(h5f: h5py.File, cfg: dict, num_sims: int, latent_downsample: int = 1
 
     Args:
         latent_downsample : int, store one latent frame every k timesteps.
-                            At dt=0.5s and k=10, that is one frame every 5s —
+                            At dt=0.5s and k=10, that is one frame every 5s --
                             sufficient to inspect haemodynamic dynamics whose
-                            timescale is 5–30s.
+                            timescale is 5-30s.
     """
     if not isinstance(latent_downsample, int) or latent_downsample < 1:
         raise ValueError(f"latent_downsample must be a positive int, got {latent_downsample!r}")
@@ -257,7 +283,7 @@ def init_h5(h5f: h5py.File, cfg: dict, num_sims: int, latent_downsample: int = 1
     meta.attrs["T_full"] = T
     meta.attrs["T_latent"] = T_lat
 
-    # pulses: keep float64 — onset times need sub-TR precision
+    # pulses: keep float64 -- onset times need sub-TR precision
     meta.create_dataset(
         "pulses", shape=(num_sims, max_pulses, 3), dtype=np.float64, fillvalue=np.nan
     )
@@ -364,7 +390,7 @@ def main() -> None:
                         f = pool.submit(_run_one, nxt)
                         pending[f] = nxt[0]
 
-    print(f"Saved {num_sims} simulation(s) → {output_path}")
+    print(f"Saved {num_sims} simulation(s) -> {output_path}")
 
 
 if __name__ == "__main__":

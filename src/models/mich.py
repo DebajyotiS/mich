@@ -19,8 +19,8 @@ from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 class CollocationBatch:
     """Index tensors describing collocation points.
 
-    t: [1, 1, n_times, n_space]   — shared across batch and layers
-    h: [B, 1, n_times, n_space]   — per-sample spatial points
+    t: [1, 1, n_times, n_space]   -- shared across batch and layers
+    h: [B, 1, n_times, n_space]   -- per-sample spatial points
     w: [B, 1, n_times, n_space]
     """
 
@@ -243,25 +243,6 @@ class MICH(LightningModule):
             self.normaliser.denormalize(bold_norm) if self.normaliser is not None else bold_norm
         )
 
-        # --- diagnostics ---
-        # if source_position is not None:
-        #     src_h = source_position[0, 0].long()
-        #     src_w = source_position[0, 1].long()
-        #     p_src = pred_bold[0, :, :, src_h, src_w]
-        #     t_src = true_bold[0, :, :, src_h, src_w]
-        #     print(f"pred_bold src | min: {p_src.min().item():.4f} max: {p_src.max().item():.4f} std: {p_src.std().item():.4f} mean: {p_src.mean().item():.4f}")
-        #     print(f"true_bold src | min: {t_src.min().item():.4f} max: {t_src.max().item():.4f} std: {t_src.std().item():.4f} mean: {t_src.mean().item():.4f}")
-        # print(
-        #     f"pred_v | min: {pred_v.min().item():.4f} max: {pred_v.max().item():.4f} mean: {pred_v.mean().item():.4f} std: {pred_v.std().item():.4f}"
-        # )
-        # print(
-        #     f"pred_q | min: {pred_q.min().item():.4f} max: {pred_q.max().item():.4f} mean: {pred_q.mean().item():.4f} std: {pred_q.std().item():.4f}"
-        # )
-        # print(
-        #     f"normaliser running_mean: {self.normaliser.running_mean.item():.6f} running_std: {self.normaliser.running_var.sqrt().item():.6f} count: {self.normaliser.running_count.item()} frozen: {self.normaliser.frozen}"
-        # )
-        # -------------------
-
         # Collocation loss
         pred_bold_at = self._gather_bold_at(pred_bold, collocation)
         true_bold_at = self._gather_bold_at(true_bold, collocation)
@@ -270,7 +251,7 @@ class MICH(LightningModule):
             [F.mse_loss(pred_bold_at[:, l], true_bold_at[:, l]) for l in range(L)]
         ).mean()
 
-        # Source voxel loss — full T, all layers, per sample
+        # Source voxel loss -- full T, all layers, per sample
         B = pred_bold.shape[0]
         b_idx = torch.arange(B, device=pred_bold.device)
         src_h = source_position[:, 0].long()
@@ -526,7 +507,7 @@ class MICH(LightningModule):
         self.source_layer_buffer.clear()
         self.true_z_hat_buffer.clear()
 
-        # Each rank logs its own plots to its own W&B run — no gather needed.
+        # Each rank logs its own plots to its own W&B run -- no gather needed.
         subset = min(10, bold.shape[0])
         random_indices = torch.randperm(bold.shape[0])[:subset]
         subset_bold = bold[random_indices]
@@ -629,7 +610,7 @@ class MICH(LightningModule):
             plt.close(image)
 
     def on_fit_start(self) -> None:
-        # Rank 0's wandb run is owned by WandbLogger — nothing to do here.
+        # Rank 0's wandb run is owned by WandbLogger -- nothing to do here.
         # Non-zero ranks initialize their own run so per-rank metrics are tracked.
         if self.trainer.is_global_zero:
             return

@@ -86,7 +86,7 @@ class LayerwiseBOLDNormalizer(nn.Module):
 
         neighbourhood = self._gather_neighbourhood(bold, source_position)  # [B, L, T, N]
 
-        # Reduce over all of (B, L, T, N) — shared scalar preserves inter-layer ratios
+        # Reduce over all of (B, L, T, N) -- shared scalar preserves inter-layer ratios
         n_new = neighbourhood.numel()
         batch_mean = neighbourhood.mean().reshape(1, 1, 1, 1, 1)
         batch_var = neighbourhood.var(unbiased=False).reshape(1, 1, 1, 1, 1)

@@ -10,9 +10,9 @@ data:
     return_latents: true
 
 split:
-  train_frac: 0.2
+  train_frac: 0.6
   val_frac: 0.1
-  test_frac: 0.7
+  test_frac: 0.3
   train_count: null
   val_count: null
   test_count: null

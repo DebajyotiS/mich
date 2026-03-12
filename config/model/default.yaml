@@ -1,14 +1,14 @@
 _target_: src.models.mich.MICH
 
-# ── Free scalars ──────────────────────────────────────────────────────────────
+# -- Free scalars --------------------------------------------------------------
 # Constraints on derived values are annotated inline with "# = <expression>".
 #
 #   L         number of cortical input layers
-#   C         MaskedLayerMixing output channels → first spatial encoder cin
-#   c_enc     final spatial encoder output channels → all temporal cin + decoder cin
+#   C         MaskedLayerMixing output channels -> first spatial encoder cin
+#   c_enc     final spatial encoder output channels -> all temporal cin + decoder cin
 #   c_dec     decoder feature channels -> time_film_config.c_dec must equal this
 #   num_freqs Fourier frequencies -> time_film_config.embed_dim = 2 * num_freqs
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 heinzle_net:
   _target_: src.models.blocks.HeinzleNet
