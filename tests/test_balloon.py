@@ -646,3 +646,83 @@ def test_get_bold_from_state_no_noise_when_amplitude_zero_or_noise_none():
     cfg_no_noise = BoldPostProcessingConfig(noise=None, noise_amplitude=1.0)
     b_no_noise = get_bold_from_state(st, acq, c, params=cfg_no_noise)
     assert np.allclose(b_no_noise, b_clean)
+
+
+# -----------------------------
+# simulate_cortex — regression / numerical stability
+# -----------------------------
+
+
+def test_simulate_cortex_nontrivial_input_stays_finite_and_physically_plausible():
+    """Non-zero neural input produces finite outputs with physically valid states.
+
+    Blood flow (f), volume (v), and deoxy-Hb content (q) must remain positive
+    throughout the simulation — a basic physical constraint of the Balloon model.
+    """
+    np.random.seed(42)
+    c = _mk_consts()
+    T, H, W = 30, 4, 4
+    dt = 0.01
+
+    x0 = (np.random.randn(T, H, W) * 0.1).astype(np.float64)
+    x1 = (np.random.randn(T, H, W) * 0.1).astype(np.float64)
+    layers = [_mk_layer(depth=0, tau=1.0), _mk_layer(depth=1, tau=1.5)]
+    out = simulate_cortex(layers, c, [x0, x1], dt=dt, tau_d=1.0)
+
+    for depth in (0, 1):
+        d = out[depth]
+        assert set(d.keys()) >= {"x", "s", "f", "v", "q"}, (
+            f"Missing keys in depth {depth}"
+        )
+        for key in ("x", "s", "f", "v", "q"):
+            assert d[key].shape == (T, H, W), f"Wrong shape for depth {depth} key {key}"
+            assert np.isfinite(d[key]).all(), f"Non-finite values in depth {depth} key {key}"
+        # Physical plausibility: f, v, q stay positive
+        assert (d["f"] > 0).all(), f"f must be positive at depth {depth}"
+        assert (d["v"] > 0).all(), f"v must be positive at depth {depth}"
+        assert (d["q"] > 0).all(), f"q must be positive at depth {depth}"
+
+
+def test_simulate_cortex_near_resting_state_for_small_input():
+    """With a small constant neural drive, v and q should stay near resting (1.0).
+
+    This is a numerical regression guard: a large deviation from 1.0 would indicate
+    a change in integration step size, constants, or ODE formulation.
+    """
+    c = _mk_consts()
+    T, H, W = 20, 3, 3
+    # Constant small input — physiology should stay near rest
+    x0 = np.full((T, H, W), 0.05, dtype=np.float64)
+    layer = _mk_layer(depth=0, tau=1.0)
+    out = simulate_cortex([layer], c, [x0], dt=0.01, tau_d=1.0)
+
+    v = out[0]["v"]
+    q = out[0]["q"]
+    # With a small, constant drive and short simulation, v and q should not
+    # deviate more than 15 % from their resting value of 1.0.
+    assert np.abs(v.mean() - 1.0) < 0.15, (
+        f"v mean {v.mean():.4f} deviated too far from resting state 1.0"
+    )
+    assert np.abs(q.mean() - 1.0) < 0.15, (
+        f"q mean {q.mean():.4f} deviated too far from resting state 1.0"
+    )
+
+
+def test_simulate_cortex_zero_input_stays_at_resting_state():
+    """With zero neural input the Balloon model stays at its initial (resting) state.
+
+    f, v, q are initialised to 1.0; s is 0.0.  Under zero forcing the RHS of every
+    ODE evaluates to zero at these values, so the state should remain constant to
+    within numerical noise from the RK4 integrator.
+    """
+    c = _mk_consts()
+    T, H, W = 10, 3, 3
+    x0 = np.zeros((T, H, W), dtype=np.float64)
+    layer = _mk_layer(depth=0, tau=1.0)  # f=1, v=1, q=1, s=0 at init
+    out = simulate_cortex([layer], c, [x0], dt=0.01, tau_d=1.0)
+
+    d = out[0]
+    assert np.allclose(d["f"], 1.0, atol=1e-6), "f drifted from resting 1.0 under zero input"
+    assert np.allclose(d["v"], 1.0, atol=1e-6), "v drifted from resting 1.0 under zero input"
+    assert np.allclose(d["q"], 1.0, atol=1e-6), "q drifted from resting 1.0 under zero input"
+    assert np.allclose(d["s"], 0.0, atol=1e-6), "s drifted from 0.0 under zero input"
