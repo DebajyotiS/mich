@@ -314,7 +314,9 @@ class TestMICHStaticHelpers:
         assert t.max().item() == pytest.approx(1.0)
 
     def test_signal_index_all_names(self):
-        for name, expected in zip(("x", "s", "f", "v", "q", "vstar", "qstar"), range(7), strict=True):
+        for name, expected in zip(
+            ("x", "s", "f", "v", "q", "vstar", "qstar"), range(7), strict=True
+        ):
             assert MICH._signal_index(name) == expected
 
     def test_signal_index_int_passthrough(self):
