@@ -79,7 +79,7 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
     )
 
     num_pulses = int(rng.integers(1, max_pulses + 1))
-    durations = rng.uniform(5.0, 10.0, size=num_pulses)
+    durations = rng.uniform(2.0, 10.0, size=num_pulses)
     amplitudes = rng.uniform(0.3, 1.0, size=num_pulses)
     isi_min: int = sc.get("isi_min", 20)  # jitter window (s) for random onset placement
 

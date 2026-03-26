@@ -146,8 +146,9 @@ class LayeredDiffusionSimulator:
             dtype=np.float64,
         ) / (self.dx**2)
 
-        # Conservative combined bound for 2D intra-layer + 1D inter-layer coupling.
-        den = 4.0 * self.diff_intra + 2.0 * self.diff_inter
+        # Conservative combined bound for 2D intra-layer + 1D inter-layer coupling + decay.
+        # For forward Euler stability: dt*(4*D/dx^2 + decay_rate) <= 1
+        den = 4.0 * self.diff_intra + 2.0 * self.diff_inter + self.decay_rate * (self.dx**2)
         dt_max = (self.dx**2) / den if den > 0 else np.inf
 
         safety = self.safety
@@ -170,15 +171,8 @@ class LayeredDiffusionSimulator:
         # Noise scaling: treat injected noise as SDE-like => sqrt(dt)
         noise_scale = np.sqrt(self.dt)
 
-        # -----------------------------
-        # NEW: optional temporal noise
-        # -----------------------------
         n_sources = len(sources)
         temporal_noise = None
-
-        # Backwards compatible:
-        # - If Noise has no attribute "domain", behave like old code (spatial only).
-        # - If domain is "temporal"/"both", require generate_temporal.
         domain = getattr(noise, "domain", "spatial")
 
         if domain in ("temporal", "both") and noise_amp_temporal > 0.0:
@@ -264,6 +258,17 @@ class LayeredDiffusionSimulator:
                         new_grid[layer_index] += flux_above * dt_sub
 
                 self.grid = new_grid
+
+                # Re-pin source voxels so decay during substeps doesn't erode the injected value.
+                for s_idx, src in enumerate(sources):
+                    s_layer = int(src["layer"])
+                    si, sj = map(int, src["position"])
+                    sig = src["signal"]
+                    if step < sig.shape[0]:
+                        s_inj = float(sig[step])
+                        if temporal_noise is not None:
+                            s_inj += float(temporal_noise[s_idx, step])
+                        self.grid[s_layer, si, sj] = s_inj
 
                 if not np.isfinite(self.grid).all():
                     where = np.argwhere(~np.isfinite(self.grid))[0]

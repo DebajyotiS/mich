@@ -28,14 +28,14 @@ simulation:
   dt: 1.0
   haemo_dt: 0.05
   time_duration: 100
-  max_pulses: 3
-  isi_min: 20  # jitter window (s) for random onset placement; neural pulses guaranteed non-overlapping
+  max_pulses: 10
+  isi_min: 5  # jitter window (s) for random onset placement; neural pulses guaranteed non-overlapping (integer)
   pulse_type: rect
   neural_SNR: .inf
   BOLD_SNR: 20.0
   diffusion_coefficient_intra: 1.0
   diffusion_coefficient_inter: 0.0
-  decay_rate: 0.5          # s-1, neural decay timescale 1/lambda nearly 2s
+  decay_rate: 5.0       # s-1, neural decay timescale
   tau_d: 1.0
 
   # One entry per layer, bottom (deep) to top (superficial).

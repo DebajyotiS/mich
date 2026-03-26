@@ -92,11 +92,11 @@ normaliser:
 
 loss_config:
   lambda_data: 10.0
-  lambda_physics: 1.0
-  lambda_src: 100.0
-  lambda_smooth: 1.0
-  n_time: 90
-  n_space: 400
+  lambda_physics: 0.1
+  lambda_src: 10.0
+  lambda_smooth: 10.0
+  n_time: 80
+  n_space: 900
   dense_time_frac: 0.85
   dense_time_lo: 0.1
   dense_time_hi: 0.70
