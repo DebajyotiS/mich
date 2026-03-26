@@ -428,7 +428,13 @@ def test_simulate_injection_sets_value_without_diffusion_or_noise():
     # With diff=0, decay=0, and snr=inf, injection assigns sig[step] to the grid point.
     # No accumulation -- the value at (layer, i, j) is exactly sig[step] after each step.
     sim = _make_sim(
-        num_layers=1, grid_size=(4, 4), dt=0.2, dx=1.0, diff_intra=0.0, diff_inter=0.0, decay_rate=0.0
+        num_layers=1,
+        grid_size=(4, 4),
+        dt=0.2,
+        dx=1.0,
+        diff_intra=0.0,
+        diff_inter=0.0,
+        decay_rate=0.0,
     )
     sig = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
     src = _source(layer=0, position=(1, 1), signal=sig)

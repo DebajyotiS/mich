@@ -352,6 +352,7 @@ def test_spatiotemporal_decoder_output_shape_no_grads():
     assert m.z_hat.shape == (B, 7, L, T, H, W)
 
 
+@pytest.mark.slow
 def test_spatiotemporal_decoder_output_shape_with_grads_and_central_difference_check():
     # Small shapes to keep jacrev/vmap fast.
     B, T, H, W = 1, 3, 4, 4
@@ -453,6 +454,7 @@ def test_heinzle_net_forward_shapes_and_gradients():
     assert torch.isfinite(x.grad).all()
 
 
+@pytest.mark.slow
 def test_heinzle_net_forward_with_gradients_produces_dz_hat_dt():
     cfg = _mk_heinzle_configs(L=2, Cmix=3, Cenc=4, c_dec=5)
     net = HeinzleNet(**cfg)
