@@ -1,4 +1,5 @@
 """Tests for get_activation and get_normalisation factory functions in torch_utils."""
+
 from __future__ import annotations
 
 import pytest
@@ -6,7 +7,6 @@ import torch
 from torch import nn
 
 from src.utils.torch_utils import get_activation, get_normalisation
-
 
 # -------------------------
 # get_activation
@@ -17,7 +17,7 @@ from src.utils.torch_utils import get_activation, get_normalisation
     "name, expected_type",
     [
         ("relu", nn.ReLU),
-        ("ReLU", nn.ReLU),       # case-insensitive
+        ("ReLU", nn.ReLU),  # case-insensitive
         ("sigmoid", nn.Sigmoid),
         ("silu", nn.SiLU),
         ("SiLU", nn.SiLU),
@@ -74,7 +74,7 @@ def test_get_activation_forward_pass_runs():
     "name, expected_type",
     [
         ("batchnorm", nn.BatchNorm1d),
-        ("BatchNorm", nn.BatchNorm1d),    # case-insensitive
+        ("BatchNorm", nn.BatchNorm1d),  # case-insensitive
         ("layernorm", nn.LayerNorm),
         ("LayerNorm", nn.LayerNorm),
         ("instancenorm", nn.InstanceNorm1d),

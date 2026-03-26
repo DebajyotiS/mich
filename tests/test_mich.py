@@ -7,6 +7,7 @@ Coverage:
   - backward propagation: all parameter gradients finite
   - full Trainer.fit() smoke test via fast_dev_run=True  (marked slow)
 """
+
 from __future__ import annotations
 
 import types
@@ -70,9 +71,7 @@ def _mk_heinzle_configs(*, L: int = 2, Cmix: int = 4, Cenc: int = 6, c_dec: int 
                 activation="silu",
             )
         ],
-        temporal_mixing_config=[
-            dict(cin=Cenc, kernel_size=3, num_groups=1, activation="silu")
-        ],
+        temporal_mixing_config=[dict(cin=Cenc, kernel_size=3, num_groups=1, activation="silu")],
         time_embedding_config=dict(num_freqs=num_freqs, max_freq=3.0),
         time_film_config=dict(
             embed_dim=2 * num_freqs,
@@ -135,9 +134,7 @@ def _make_mich(*, L: int = _L) -> MICH:
     )
 
 
-def _make_batch(
-    *, B: int = _B, L: int = _L, T: int = _T, H: int = _H, W: int = _W
-) -> dict:
+def _make_batch(*, B: int = _B, L: int = _L, T: int = _T, H: int = _H, W: int = _W) -> dict:
     """Minimal training batch (bold + neural + source_position)."""
     return {
         "bold": torch.randn(B, L, T, H, W),
@@ -146,9 +143,7 @@ def _make_batch(
     }
 
 
-def _make_full_batch(
-    *, B: int = _B, L: int = _L, T: int = _T, H: int = _H, W: int = _W
-) -> dict:
+def _make_full_batch(*, B: int = _B, L: int = _L, T: int = _T, H: int = _H, W: int = _W) -> dict:
     """Validation batch: training keys plus all meta and latent keys."""
     batch = _make_batch(B=B, L=L, T=T, H=H, W=W)
     batch["num_pulses"] = torch.randint(1, 4, (B,))
@@ -172,20 +167,12 @@ def _make_h5_fixture(
     with h5py.File(path, "w") as f:
         for lyr in layers:
             grp = f.require_group(lyr)
-            grp.create_dataset(
-                "bold", data=rng.standard_normal((n, t, h, w)).astype(np.float32)
-            )
-            grp.create_dataset(
-                "x", data=rng.standard_normal((n, t, h, w)).astype(np.float32)
-            )
+            grp.create_dataset("bold", data=rng.standard_normal((n, t, h, w)).astype(np.float32))
+            grp.create_dataset("x", data=rng.standard_normal((n, t, h, w)).astype(np.float32))
             for key in ("s", "f", "v", "q", "v_star", "q_star"):
-                grp.create_dataset(
-                    key, data=rng.standard_normal((n, t, h, w)).astype(np.float32)
-                )
+                grp.create_dataset(key, data=rng.standard_normal((n, t, h, w)).astype(np.float32))
         meta = f.require_group("meta")
-        meta.create_dataset(
-            "num_pulses", data=rng.integers(1, 4, size=n).astype(np.int32)
-        )
+        meta.create_dataset("num_pulses", data=rng.integers(1, 4, size=n).astype(np.int32))
         meta.create_dataset(
             "source_layer",
             data=rng.integers(0, len(layers), size=n).astype(np.int32),
@@ -280,9 +267,7 @@ class TestMICHLosses:
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
         manifest = model(bold, time, return_gradients=True)
         src_pos = torch.randint(0, min(_H, _W), (_B, 2))
-        loss = model._physics_loss(
-            manifest.z_hat, manifest.grads, source_position=src_pos
-        )
+        loss = model._physics_loss(manifest.z_hat, manifest.grads, source_position=src_pos)
         assert loss.ndim == 0
         assert torch.isfinite(loss)
 
@@ -305,15 +290,13 @@ class TestMICHLosses:
         src_pos = torch.randint(0, min(_H, _W), (_B, 2))
         manifest = model(bold, time, return_gradients=True)
         data_loss = model._data_loss(manifest.z_hat, bold, source_position=src_pos)
-        physics_loss = model._physics_loss(
-            manifest.z_hat, manifest.grads, source_position=src_pos
-        )
+        physics_loss = model._physics_loss(manifest.z_hat, manifest.grads, source_position=src_pos)
         (data_loss + physics_loss).backward()
         grads_with_value = [p.grad for p in model.parameters() if p.grad is not None]
         assert len(grads_with_value) > 0, "No parameter received a gradient"
-        assert all(
-            torch.isfinite(g).all() for g in grads_with_value
-        ), "At least one parameter gradient contains NaN or Inf"
+        assert all(torch.isfinite(g).all() for g in grads_with_value), (
+            "At least one parameter gradient contains NaN or Inf"
+        )
 
 
 # -------------------------
@@ -331,9 +314,7 @@ class TestMICHStaticHelpers:
         assert t.max().item() == pytest.approx(1.0)
 
     def test_signal_index_all_names(self):
-        for name, expected in zip(
-            ("x", "s", "f", "v", "q", "vstar", "qstar"), range(7)
-        ):
+        for name, expected in zip(("x", "s", "f", "v", "q", "vstar", "qstar"), range(7)):
             assert MICH._signal_index(name) == expected
 
     def test_signal_index_int_passthrough(self):
@@ -351,9 +332,7 @@ class TestMICHStaticHelpers:
         v = torch.tensor([[1.2]])
         q = torch.tensor([[0.9]])
         bold = MICH._compute_bold(v, q, acq, V0)
-        expected = V0 * (
-            acq.k1 * (1 - q) + acq.k2 * (1 - q / v) + acq.k3 * (1 - v)
-        )
+        expected = V0 * (acq.k1 * (1 - q) + acq.k2 * (1 - q / v) + acq.k3 * (1 - v))
         assert torch.allclose(bold, expected)
 
 

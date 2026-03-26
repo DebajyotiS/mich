@@ -1,11 +1,11 @@
 """Tests for src/models/normaliser.py — LayerwiseBOLDNormalizer."""
+
 from __future__ import annotations
 
 import pytest
 import torch
 
 from src.models.normaliser import LayerwiseBOLDNormalizer
-
 
 # -------------------------
 # Helpers

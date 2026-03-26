@@ -671,9 +671,7 @@ def test_simulate_cortex_nontrivial_input_stays_finite_and_physically_plausible(
 
     for depth in (0, 1):
         d = out[depth]
-        assert set(d.keys()) >= {"x", "s", "f", "v", "q"}, (
-            f"Missing keys in depth {depth}"
-        )
+        assert set(d.keys()) >= {"x", "s", "f", "v", "q"}, f"Missing keys in depth {depth}"
         for key in ("x", "s", "f", "v", "q"):
             assert d[key].shape == (T, H, W), f"Wrong shape for depth {depth} key {key}"
             assert np.isfinite(d[key]).all(), f"Non-finite values in depth {depth} key {key}"
