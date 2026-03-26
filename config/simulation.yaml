@@ -33,9 +33,9 @@ simulation:
   pulse_type: rect
   neural_SNR: .inf
   BOLD_SNR: 20.0
-  diffusion_coefficient_intra: 1.0
+  diffusion_coefficient_intra: 12.0
   diffusion_coefficient_inter: 0.0
-  decay_rate: 5.0       # s-1, neural decay timescale
+  decay_rate: 1.0      # s-1, neural decay timescale (L = sqrt(D/k) ~ 5 voxels)
   tau_d: 1.0
 
   # One entry per layer, bottom (deep) to top (superficial).

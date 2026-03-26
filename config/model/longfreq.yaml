@@ -94,7 +94,11 @@ loss_config:
   lambda_data: 10.0
   lambda_physics: 0.1
   lambda_src: 10.0
-  lambda_smooth: 10.0
+  lambda_smooth: 0.0
+  warmup_steps_physics: 10000
+  warmup_steps_smooth: 0
+  delay_steps_physics: 2000
+  delay_steps_smooth: 0
   n_time: 80
   n_space: 900
   dense_time_frac: 0.85
@@ -123,6 +127,8 @@ acquisition:
   k3: 1.0
 
 V0: 0.5
+
+psf_fwhm: [18.0, 27.675, 40.05]  # per-layer Gaussian PSF FWHM in grid units (deep, mid, superficial)
 
 optimizer:
   _target_: torch.optim.AdamW

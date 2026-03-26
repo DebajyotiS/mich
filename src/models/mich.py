@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import wandb
 from pytorch_lightning import LightningModule
 
-from src.data.balloon import AcquisitionConstants
+from src.data.balloon import AcquisitionConstants, PointSpreadFunction
 from src.models.blocks import HeinzleSignal, SpatialDecoderManifest
 from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
@@ -239,6 +239,19 @@ class MICH(LightningModule):
             pred_v, pred_q, acquisition=self.hparams.acquisition, V0=self.hparams.V0
         )
 
+        # Apply per-layer Gaussian PSF to pred_bold [B, L, T, H, W]
+        psf_fwhm = getattr(self.hparams, "psf_fwhm", None)
+        if psf_fwhm is not None:
+            B_size, L_size = pred_bold.shape[:2]
+            layers_blurred = []
+            for layer_idx in range(L_size):
+                psf = PointSpreadFunction(fwhm=psf_fwhm[layer_idx])
+                batch_blurred = torch.stack(
+                    [psf.apply(pred_bold[b, layer_idx]) for b in range(B_size)], dim=0
+                )
+                layers_blurred.append(batch_blurred)
+            pred_bold = torch.stack(layers_blurred, dim=1)  # [B, L, T, H, W]
+
         true_bold = (
             self.normaliser.denormalize(bold_norm) if self.normaliser is not None else bold_norm
         )
@@ -337,10 +350,23 @@ class MICH(LightningModule):
 
         return (s_loss + f_loss + v_loss + q_loss + v_star_loss + q_star_loss) / 6.0
 
+    def _get_scheduled_lambda(
+        self, lambda_target: float, warmup_steps: int, delay_steps: int = 0
+    ) -> float:
+        if warmup_steps <= 0 and delay_steps <= 0:
+            return lambda_target
+        if self.global_step < delay_steps:
+            return 0.0
+        ramp_step = self.global_step - delay_steps
+        if warmup_steps <= 0:
+            return lambda_target
+        return min(1.0, ramp_step / warmup_steps) * lambda_target
+
     def _physics_loss(
         self,
         z_hat: torch.Tensor,
         dz_hat_dt: torch.Tensor,
+        lambda_smooth: float = 0.0,
         source_position: torch.Tensor | None = None,
     ) -> torch.Tensor:
         idx = MICH._sample_collocation_indices(
@@ -370,7 +396,7 @@ class MICH(LightningModule):
         # Smoothness of gradients
         dz_dt_fd = z_hat[:, :, :, 1:] - z_hat[:, :, :, :-1]  # [B, S, L, T-1, H, W]
         smoothness_loss = dz_dt_fd.pow(2).mean()
-        return tot_physics_loss + self.hparams.loss_config.lambda_smooth * smoothness_loss
+        return tot_physics_loss + lambda_smooth * smoothness_loss
 
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
         bold, neural = batch["bold"], batch["neural"]
@@ -389,11 +415,24 @@ class MICH(LightningModule):
         z_hat = sd_manifest.z_hat
         dz_hat_dt = sd_manifest.grads
 
+        lc = self.hparams.loss_config
+        lambda_physics_eff = self._get_scheduled_lambda(
+            lc.lambda_physics,
+            getattr(lc, "warmup_steps_physics", 0),
+            getattr(lc, "delay_steps_physics", 0),
+        )
+        lambda_smooth_eff = self._get_scheduled_lambda(
+            lc.lambda_smooth,
+            getattr(lc, "warmup_steps_smooth", 0),
+            getattr(lc, "delay_steps_smooth", 0),
+        )
+
         data_loss = self._data_loss(z_hat, bold_norm, source_position=source_position)
-        physics_loss = self._physics_loss(z_hat, dz_hat_dt, source_position=source_position)
+        physics_loss = self._physics_loss(
+            z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position
+        )
         total_loss = (
-            self.hparams.loss_config.lambda_data * data_loss
-            + self.hparams.loss_config.lambda_physics * physics_loss
+            self.hparams.loss_config.lambda_data * data_loss + lambda_physics_eff * physics_loss
         )
 
         on_step = stage == "train"
@@ -422,6 +461,10 @@ class MICH(LightningModule):
             prog_bar=True,
             sync_dist=True,
         )
+
+        if stage == "train":
+            self.log("train/lambda_physics_eff", lambda_physics_eff, on_step=True, on_epoch=False)
+            self.log("train/lambda_smooth_eff", lambda_smooth_eff, on_step=True, on_epoch=False)
 
         # Log unsynced per-rank metrics to each rank's own wandb run.
         # Only log during training and throttle to match log_every_n_steps so

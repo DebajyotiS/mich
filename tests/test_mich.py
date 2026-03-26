@@ -114,6 +114,10 @@ def _make_mich(*, L: int = _L) -> MICH:
             lambda_data=1.0,
             lambda_physics=0.1,
             lambda_smooth=0.01,
+            warmup_steps_physics=0,
+            warmup_steps_smooth=0,
+            delay_steps_physics=0,
+            delay_steps_smooth=0,
             burn_in=1,
         ),
         haemo=types.SimpleNamespace(
@@ -294,9 +298,9 @@ class TestMICHLosses:
         (data_loss + physics_loss).backward()
         grads_with_value = [p.grad for p in model.parameters() if p.grad is not None]
         assert len(grads_with_value) > 0, "No parameter received a gradient"
-        assert all(torch.isfinite(g).all() for g in grads_with_value), (
-            "At least one parameter gradient contains NaN or Inf"
-        )
+        assert all(
+            torch.isfinite(g).all() for g in grads_with_value
+        ), "At least one parameter gradient contains NaN or Inf"
 
 
 # -------------------------
