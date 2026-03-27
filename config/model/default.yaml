@@ -96,6 +96,13 @@ loss_config:
   dense_spatial_frac: 0.8
   dense_spatial_radius: 5
   burn_in: 20
+  bold_loss:
+    type: "mse"
+    lambda_pearson: 1.0
+    huber_delta: 1.0
+  ode_loss:
+    type: "mse"
+    huber_delta: 1.0
 
 haemo:
   kappa: 0.65       # Vasodilatory signal decay rate

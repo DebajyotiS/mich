@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal, Mapping
@@ -10,7 +11,7 @@ import torch.nn.functional as F
 import wandb
 from pytorch_lightning import LightningModule
 
-from src.data.balloon import AcquisitionConstants, PointSpreadFunction
+from src.data.balloon import AcquisitionConstants
 from src.models.blocks import HeinzleSignal, SpatialDecoderManifest
 from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
@@ -55,12 +56,30 @@ class MICH(LightningModule):
         self.save_hyperparameters(logger=False, ignore=["heinzle_net", "normaliser"])
         self.heinzle_net = heinzle_net
         self.normaliser = normaliser
+        lc = self.hparams.loss_config
+        self._bold_loss_fn = MICH._make_loss_fn(getattr(lc, "bold_loss", None))
+        self._ode_loss_fn = MICH._make_loss_fn(getattr(lc, "ode_loss", None))
         self.pred_buffer = []
         self.neural_buffer = []
         self.bold_buffer = []
         self.source_layer_buffer = []
         self.source_position_buffer = []
         self.true_z_hat_buffer = []
+
+        # Precompute PSF kernels once and register as buffers so they move with the device.
+        psf_fwhm = getattr(self.hparams, "psf_fwhm", None)
+        if psf_fwhm is not None:
+            for i, fwhm in enumerate(psf_fwhm):
+                if fwhm > 0.0:
+                    sigma = fwhm / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+                    radius = int(4.0 * sigma + 0.5)
+                    x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+                    k1d = torch.exp(-0.5 * (x / sigma) ** 2)
+                    k1d = k1d / k1d.sum()
+                    kernel = (k1d[:, None] * k1d[None, :]).reshape(1, 1, len(k1d), len(k1d))
+                    self.register_buffer(f"_psf_kernel_{i}", kernel)
+                else:
+                    self.register_buffer(f"_psf_kernel_{i}", None)
 
     def forward(
         self,
@@ -75,6 +94,53 @@ class MICH(LightningModule):
         else:
             bold_norm = bold
         return self.heinzle_net(bold_norm, time, return_gradients=return_gradients)
+
+    @staticmethod
+    def _make_loss_fn(loss_cfg) -> callable:
+        """Build a loss callable `(pred, true) -> scalar` from a loss config mapping.
+
+        Supported types: mse, huber, pearson, mse+pearson, huber+pearson.
+        Pearson correlation is computed over dim=1 (the time/sequence dimension).
+        """
+        if loss_cfg is None:
+            return F.mse_loss
+
+        loss_type = getattr(loss_cfg, "type", "mse")
+        huber_delta = getattr(loss_cfg, "huber_delta", 1.0)
+        lambda_pearson = getattr(loss_cfg, "lambda_pearson", 1.0)
+
+        def _pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+            pred_c = pred - pred.mean(dim=1, keepdim=True)
+            true_c = true - true.mean(dim=1, keepdim=True)
+            num = (pred_c * true_c).sum(dim=1)
+            denom = (pred_c.norm(dim=1) * true_c.norm(dim=1)).clamp(min=1e-8)
+            return (1.0 - num / denom).mean()
+
+        if loss_type == "mse":
+            return F.mse_loss
+        elif loss_type == "huber":
+            return partial(F.huber_loss, delta=huber_delta)
+        elif loss_type == "pearson":
+            return _pearson
+        elif loss_type == "mse+pearson":
+
+            def _mse_pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+                return F.mse_loss(pred, true) + lambda_pearson * _pearson(pred, true)
+
+            return _mse_pearson
+        elif loss_type == "huber+pearson":
+
+            def _huber_pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+                return F.huber_loss(pred, true, delta=huber_delta) + lambda_pearson * _pearson(
+                    pred, true
+                )
+
+            return _huber_pearson
+        else:
+            raise ValueError(
+                f"Unrecognised loss type: {loss_type!r}. "
+                "Must be one of: mse, huber, pearson, mse+pearson, huber+pearson"
+            )
 
     @staticmethod
     def _make_time_grid(B: int, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -141,7 +207,7 @@ class MICH(LightningModule):
         n_times: int,
         n_space: int,
         device: torch.device,
-        source_position: torch.Tensor | None = None,
+        source_position: torch.Tensor,
         dense_spatial_radius: int = 5,
         dense_spatial_frac: float = 0.8,
         dense_time_frac: float = 0.8,
@@ -240,31 +306,38 @@ class MICH(LightningModule):
         )
 
         # Apply per-layer Gaussian PSF to pred_bold [B, L, T, H, W]
-        psf_fwhm = getattr(self.hparams, "psf_fwhm", None)
-        if psf_fwhm is not None:
-            B_size, L_size = pred_bold.shape[:2]
+        if getattr(self.hparams, "psf_fwhm", None) is not None:
+            B_size, L_size, T_size, H_size, W_size = pred_bold.shape
             layers_blurred = []
             for layer_idx in range(L_size):
-                psf = PointSpreadFunction(fwhm=psf_fwhm[layer_idx])
-                batch_blurred = torch.stack(
-                    [psf.apply(pred_bold[b, layer_idx]) for b in range(B_size)], dim=0
-                )
-                layers_blurred.append(batch_blurred)
+                kernel = getattr(self, f"_psf_kernel_{layer_idx}", None)
+                if kernel is None:
+                    layers_blurred.append(pred_bold[:, layer_idx])
+                else:
+                    pad = kernel.shape[-1] // 2
+                    x = pred_bold[:, layer_idx].reshape(B_size * T_size, 1, H_size, W_size)
+                    blurred = F.conv2d(x, kernel, padding=pad).reshape(
+                        B_size, T_size, H_size, W_size
+                    )
+                    layers_blurred.append(blurred)
             pred_bold = torch.stack(layers_blurred, dim=1)  # [B, L, T, H, W]
 
         true_bold = (
             self.normaliser.denormalize(bold_norm) if self.normaliser is not None else bold_norm
         )
 
-        # Collocation loss
+        # Collocation loss -- per layer shape: [B, n_times, n_space]; Pearson over n_times (dim=1)
         pred_bold_at = self._gather_bold_at(pred_bold, collocation)
         true_bold_at = self._gather_bold_at(true_bold, collocation)
         L = pred_bold_at.shape[1]
         colloc_loss = torch.stack(
-            [F.mse_loss(pred_bold_at[:, layer], true_bold_at[:, layer]) for layer in range(L)]
+            [
+                self._bold_loss_fn(pred_bold_at[:, layer], true_bold_at[:, layer])
+                for layer in range(L)
+            ]
         ).mean()
 
-        # Source voxel loss -- full T, all layers, per sample
+        # Source voxel loss -- full T, all layers, per sample; shape per layer: [B, T]; Pearson over T (dim=1)
         B = pred_bold.shape[0]
         b_idx = torch.arange(B, device=pred_bold.device)
         src_h = source_position[:, 0].long()
@@ -272,7 +345,10 @@ class MICH(LightningModule):
         pred_bold_src = pred_bold[b_idx, :, :, src_h, src_w]  # [B, L, T]
         true_bold_src = true_bold[b_idx, :, :, src_h, src_w]  # [B, L, T]
         src_loss = torch.stack(
-            [F.mse_loss(pred_bold_src[:, layer], true_bold_src[:, layer]) for layer in range(L)]
+            [
+                self._bold_loss_fn(pred_bold_src[:, layer], true_bold_src[:, layer])
+                for layer in range(L)
+            ]
         ).mean()
 
         return colloc_loss + self.hparams.loss_config.lambda_src * src_loss
@@ -316,19 +392,29 @@ class MICH(LightningModule):
             states["qstar"],
         )
 
+        s_scale = 1.0
+        f_scale = 1.0
+        v_scale = 1.0
+        q_scale = 1.0
+        v_star_scale = 1.0
+        q_star_scale = 1.0
+
         ds_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="s")
         s_target = x - self.hparams.haemo.kappa * s - self.hparams.haemo.gamma * (f - 1)
-        s_loss = F.mse_loss(ds_dt[:, burn_in:], s_target[:, burn_in:])
+        s_loss = self._ode_loss_fn(ds_dt[:, burn_in:] / s_scale, s_target[:, burn_in:] / s_scale)
 
         df_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="f")
-        f_loss = F.mse_loss(df_dt[:, burn_in:], s[:, burn_in:])
+        f_loss = self._ode_loss_fn(df_dt[:, burn_in:] / f_scale, s[:, burn_in:] / f_scale)
 
         dv_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="v")
         target_vdot = f - v ** (1 / self.hparams.haemo.alpha)
         if layer > 0:
             vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             target_vdot += self.hparams.haemo.lambda_d * vstar_deeper
-        v_loss = F.mse_loss(dv_dt[:, burn_in:], target_vdot[:, burn_in:] / self.hparams.haemo.tau)
+        v_loss = self._ode_loss_fn(
+            dv_dt[:, burn_in:] / v_scale,
+            (target_vdot[:, burn_in:] / self.hparams.haemo.tau) / v_scale,
+        )
 
         dq_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="q")
         target_qdot = f * (
@@ -337,16 +423,22 @@ class MICH(LightningModule):
         if layer > 0:
             qstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
             target_qdot += self.hparams.haemo.lambda_d * qstar_deeper
-
-        q_loss = F.mse_loss(dq_dt[:, burn_in:], target_qdot[:, burn_in:] / self.hparams.haemo.tau)
+        q_loss = self._ode_loss_fn(
+            dq_dt[:, burn_in:] / q_scale,
+            (target_qdot[:, burn_in:] / self.hparams.haemo.tau) / q_scale,
+        )
 
         dv_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
         v_star_target = (-v_star + v - 1) / self.hparams.haemo.tau
-        v_star_loss = F.mse_loss(dv_star_dt[:, burn_in:], v_star_target[:, burn_in:])
+        v_star_loss = self._ode_loss_fn(
+            dv_star_dt[:, burn_in:] / v_star_scale, v_star_target[:, burn_in:] / v_star_scale
+        )
 
         dq_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar")
         q_star_target = (-q_star + q - 1) / self.hparams.haemo.tau
-        q_star_loss = F.mse_loss(dq_star_dt[:, burn_in:], q_star_target[:, burn_in:])
+        q_star_loss = self._ode_loss_fn(
+            dq_star_dt[:, burn_in:] / q_star_scale, q_star_target[:, burn_in:] / q_star_scale
+        )
 
         return (s_loss + f_loss + v_loss + q_loss + v_star_loss + q_star_loss) / 6.0
 

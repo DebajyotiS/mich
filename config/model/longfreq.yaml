@@ -92,7 +92,7 @@ normaliser:
 
 loss_config:
   lambda_data: 10.0
-  lambda_physics: 0.1
+  lambda_physics: 1.0
   lambda_src: 10.0
   lambda_smooth: 0.0
   warmup_steps_physics: 10000
@@ -108,6 +108,13 @@ loss_config:
   dense_spatial_frac: 0.8
   dense_spatial_radius: ${model.spatial_radius}
   burn_in: 0
+  bold_loss:
+    type: "mse"
+    lambda_pearson: 1.0
+    huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
+  ode_loss:
+    type: "mse"
+    huber_delta: 0.1 #used if type is "huber"
 
 haemo:
   kappa: 0.65
