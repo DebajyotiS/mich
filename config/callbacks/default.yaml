@@ -8,7 +8,7 @@ latest_model_checkpoint:
 best_model_checkpoint:
   _target_: pytorch_lightning.callbacks.ModelCheckpoint
   dirpath: ${paths.full_path}/checkpoints
-  monitor: val/total_loss
+  monitor: val/loss/total
   mode: min
   save_weights_only: false
   save_last: False

@@ -40,7 +40,7 @@ repos:
     hooks:
       - id: ruff-check
         name: ruff check
-        entry: ruff check src tests
+        entry: ruff check --fix src tests
         language: system
         pass_filenames: false
         stages: [pre-push]

@@ -140,4 +140,4 @@ scheduler:
 lightning:
   interval: step
   frequency: 1
-  monitor: val/total_loss
+  monitor: val/loss/total

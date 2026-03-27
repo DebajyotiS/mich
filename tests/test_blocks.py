@@ -407,29 +407,29 @@ def test_fourier_time_embedding_forces_float32_and_can_cause_dtype_mismatch_if_m
     assert out.dtype == torch.float32  # intentional behavior in implementation
 
 
-def test_spatiotemporal_decoder_reshape_output_requires_out_channels_multiple_of_7L():
-    # If out_channels != 7*L, view should fail with RuntimeError
+def test_spatiotemporal_decoder_out_channels_is_accepted_as_legacy_param():
+    # out_channels is accepted for backwards compatibility but no longer validated;
+    # the output head always maps c_dec -> 7 (L is handled in the batch dim).
     B, T, H, W = 1, 2, 3, 3
     L = 2
     cin = 3
     c_dec = 4
-    bad_out_channels = 7 * L + 1
 
-    with pytest.raises(AssertionError):
-        dec = SpatioTemporalDecoder(
-            cin=cin,
-            c_dec=c_dec,
-            out_channels=bad_out_channels,
-            activation="silu",
-            L=L,
-            temporal_embedding_config=dict(num_freqs=2, max_freq=2.0),
-            temporal_film_config=dict(embed_dim=4, hidden_dim=8, activation="silu", c_dec=c_dec),
-            upsample=False,
-        )
+    dec = SpatioTemporalDecoder(
+        cin=cin,
+        c_dec=c_dec,
+        out_channels=7 * L,  # accepted but not used to size the conv
+        activation="silu",
+        L=L,
+        temporal_embedding_config=dict(num_freqs=2, max_freq=2.0),
+        temporal_film_config=dict(embed_dim=4, hidden_dim=8, activation="silu", c_dec=c_dec),
+        upsample=False,
+    )
 
-        x = torch.randn(B, T, cin, H, W)
-        t = torch.linspace(0, 1, T).unsqueeze(0).expand(B, -1)
-        _ = dec(x, t, return_gradients=False)
+    x = torch.randn(B, T, cin, H, W)
+    t = torch.linspace(0, 1, T).unsqueeze(0).expand(B, -1)
+    m = dec(x, t, return_gradients=False)
+    assert m.z_hat.shape == (B, 7, L, T, H, W)
 
 
 # -----------------------------

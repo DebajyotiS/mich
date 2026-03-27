@@ -543,7 +543,9 @@ class MICH(LightningModule):
 
         on_step = stage == "train"
         on_epoch = stage == "val"
-        # --- loss/ : raw unscaled components (logged for both train and val) ---
+        # Train metrics: logger=False — direct run.log() below is the sole W&B sink.
+        # Val metrics: logger=True — ModelCheckpoint needs them via PL's logger.
+        _to_logger = stage == "val"
         self.log(
             f"{stage}/loss/data",
             data_loss,
@@ -551,6 +553,7 @@ class MICH(LightningModule):
             on_epoch=on_epoch,
             prog_bar=True,
             sync_dist=True,
+            logger=_to_logger,
         )
         self.log(
             f"{stage}/loss/physics",
@@ -559,6 +562,7 @@ class MICH(LightningModule):
             on_epoch=on_epoch,
             prog_bar=True,
             sync_dist=True,
+            logger=_to_logger,
         )
         self.log(
             f"{stage}/loss/total",
@@ -567,72 +571,31 @@ class MICH(LightningModule):
             on_epoch=on_epoch,
             prog_bar=True,
             sync_dist=True,
+            logger=_to_logger,
         )
 
-        if stage == "train":
-            # --- parameters/ : scheduled effective hyperparameters ---
-            self.log(
-                "parameters/lambda_physics",
-                lambda_physics_eff,
-                on_step=True,
-                on_epoch=False,
-                sync_dist=True,
-            )
-            self.log(
-                "parameters/lambda_smooth",
-                lambda_smooth_eff,
-                on_step=True,
-                on_epoch=False,
-                sync_dist=True,
-            )
-            # --- train/ode/ : per-equation ODE residuals ---
-            for _sig, _loss_val in per_eq_physics.items():
-                self.log(
-                    f"train/ode/{_sig}", _loss_val, on_step=True, on_epoch=False, sync_dist=True
-                )
-            # --- train/loss_weighted/ : lambda-scaled contributions to total loss ---
-            self.log(
-                "train/loss_weighted/data",
-                data_loss * lc.lambda_data,
-                on_step=True,
-                on_epoch=False,
-                sync_dist=True,
-            )
-            self.log(
-                "train/loss_weighted/physics",
-                physics_loss * lambda_physics_eff,
-                on_step=True,
-                on_epoch=False,
-                sync_dist=True,
-            )
-            self.log(
-                "train/loss_weighted/src",
-                src_loss * lc.lambda_src,
-                on_step=True,
-                on_epoch=False,
-                sync_dist=True,
-            )
-
-        # Log unsynced per-rank metrics to each rank's own wandb run.
-        # Only log during training and throttle to match log_every_n_steps so
-        # the W&B step axis on rank 1 stays in sync with rank 0's WandbLogger.
+        # Log per-rank training metrics directly so all ranks share the global_step x-axis.
+        # Rank 0 uses wandb.run; ranks 1-N use their own _rank_run.
+        # Throttle to log_every_n_steps to match PL's WandbLogger cadence.
+        _direct_run = wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
         if (
             stage == "train"
-            and not self.trainer.is_global_zero
-            and getattr(self, "_rank_run", None) is not None
+            and _direct_run is not None
             and self.global_step % self.trainer.log_every_n_steps == 0
         ):
-            self._rank_run.log(
+            _direct_run.log(
                 {
+                    "global_step": self.global_step,
                     "train/loss/data": data_loss.item(),
                     "train/loss/physics": physics_loss.item(),
                     "train/loss/total": total_loss.item(),
+                    "parameters/lambda_physics": lambda_physics_eff,
+                    "parameters/lambda_smooth": lambda_smooth_eff,
                     **{f"train/ode/{k}": v.item() for k, v in per_eq_physics.items()},
                     "train/loss_weighted/data": (data_loss * lc.lambda_data).item(),
                     "train/loss_weighted/physics": (physics_loss * lambda_physics_eff).item(),
                     "train/loss_weighted/src": (src_loss * lc.lambda_src).item(),
                 },
-                step=self.global_step,
             )
 
         if stage == "train":
@@ -768,7 +731,7 @@ class MICH(LightningModule):
             images.append(wandb.Image(image))
             plt.close(image)
         if run is not None and images:
-            run.log({"media/predictions": images}, commit=False)
+            run.log({"global_step": self.global_step, "media/predictions": images}, commit=False)
 
     def _plot_and_log_latents(
         self,
@@ -806,17 +769,30 @@ class MICH(LightningModule):
             images.append(wandb.Image(image))
             plt.close(image)
         if run is not None and images:
-            run.log({"media/latents": images}, commit=True)
+            run.log({"global_step": self.global_step, "media/latents": images}, commit=True)
 
     def on_after_backward(self):
+        if self.global_step == 0:
+            return
         if self.global_step % self.trainer.log_every_n_steps == 0:
             film_params = list(self.heinzle_net.spatial_decoder.time_film.parameters())
             norms = [p.grad.norm() for p in film_params if p.grad is not None]
             if norms:
-                self.log("gradients/film_norm", torch.stack(norms).norm())
+                _direct_run = (
+                    wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
+                )
+                if _direct_run is not None:
+                    _direct_run.log(
+                        {
+                            "global_step": self.global_step,
+                            "train/film_grad_norm": torch.stack(norms).norm().item(),
+                        }
+                    )
 
     def on_fit_start(self) -> None:
         if self.trainer.is_global_zero:
+            wandb.define_metric("global_step")
+            wandb.define_metric("*", step_metric="global_step")
             return
         logger = self.trainer.logger
         base_name = logger._wandb_init.get("name", logger.name).rsplit(": rank", 1)[0]
@@ -826,6 +802,8 @@ class MICH(LightningModule):
             "reinit": True,
         }
         self._rank_run = wandb.init(**init_kwargs)
+        self._rank_run.define_metric("global_step")
+        self._rank_run.define_metric("*", step_metric="global_step")
 
     def on_fit_end(self) -> None:
         rank_run = getattr(self, "_rank_run", None)

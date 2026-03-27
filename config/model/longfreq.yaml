@@ -4,14 +4,14 @@ L: 3
 C: 32
 c_enc: 32
 c_dec: 32
-num_freqs: 12
+num_freqs: 10
 min_freq: 5.0
-max_freq: 32.0
+max_freq: 20.0
 tcn_kernel: 3
 spatial_radius: 5
 grid_size: 32
 
-embed_dim: 24 # This needs to be manually set. 2 x num_freqs
+embed_dim: 20 # This needs to be manually set. 2 x num_freqs
 out_channels: 21
 
 heinzle_net:
@@ -81,6 +81,7 @@ heinzle_net:
     out_channels: ${model.out_channels}
     activation: silu
     L: ${model.L}
+    layer_embed_dim: 8
 
 normaliser:
   _target_: src.models.normaliser.LayerwiseBOLDNormalizer
@@ -152,4 +153,4 @@ scheduler:
 lightning:
   interval: step
   frequency: 1
-  monitor: val/total_loss
+  monitor: val/loss/total

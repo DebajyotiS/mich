@@ -82,9 +82,9 @@ HEINZLE_ACTIVATIONS_ORDERED: list[ChannelActivation] = [
 def _init_heinzle_output_bias(out_conv: nn.Conv2d, L: int) -> None:
     if out_conv.bias is None:
         raise ValueError("Expected out_conv to have a bias for Heinzle output initialization.")
-    if out_conv.out_channels != 7 * L:
+    if out_conv.out_channels != 7:
         raise ValueError(
-            f"Expected out_conv to have out_channels={7 * L} for Heinzle output initialization, "
+            f"Expected out_conv to have out_channels=7 for Heinzle output initialization, "
             f"got {out_conv.out_channels}."
         )
 
@@ -98,10 +98,9 @@ def _init_heinzle_output_bias(out_conv: nn.Conv2d, L: int) -> None:
 
     with torch.no_grad():
         out_conv.bias.zero_()
-        for layer_idx in range(L):
-            out_conv.bias[x_idx * L + layer_idx] = softplus_inv_0
-            for sidx in (f_idx, v_idx, q_idx):
-                out_conv.bias[sidx * L + layer_idx] = softplus_inv_1
+        out_conv.bias[x_idx] = softplus_inv_0
+        for sidx in (f_idx, v_idx, q_idx):
+            out_conv.bias[sidx] = softplus_inv_1
 
 
 class MaskedLayerMixing(nn.Module):
@@ -170,9 +169,9 @@ class DepthWiseSeparableConvLayer(nn.Module):
         )
         self.pointwise = nn.Conv2d(cin, cout, kernel_size=pw_kernel, bias=False)
 
-        assert num_groups > 0 and cout % num_groups == 0, (
-            "num_groups must be a positive divisor of cout"
-        )
+        assert (
+            num_groups > 0 and cout % num_groups == 0
+        ), "num_groups must be a positive divisor of cout"
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=cout)
         self.activation = get_activation(activation)
 
@@ -225,9 +224,9 @@ class TemporalDepthWiseTCNLayer(nn.Module):
         )
         self.pointwise = nn.Conv1d(cin, cin, kernel_size=1, bias=False)
 
-        assert num_groups > 0 and cin % num_groups == 0, (
-            "num_groups must be a positive divisor of cin"
-        )
+        assert (
+            num_groups > 0 and cin % num_groups == 0
+        ), "num_groups must be a positive divisor of cin"
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=cin)
         self.activation = get_activation(activation)
 
@@ -361,12 +360,11 @@ class SpatioTemporalDecoder(nn.Module):
         temporal_film_config: Mapping[str, Any],
         temporal_embedding_config: Mapping[str, Any],
         *,
+        layer_embed_dim: int = 16,
         upsample: bool = False,
         channel_activations: list[ChannelActivation] | None = HEINZLE_ACTIVATIONS_ORDERED,
     ):
         super().__init__()
-
-        assert out_channels == 7 * L, f"out_channels ({out_channels}) must equal 7*L ({7 * L})"
 
         if channel_activations is not None:
             assert len(channel_activations) == HEINZLE_N_SIGNALS, (
@@ -375,15 +373,21 @@ class SpatioTemporalDecoder(nn.Module):
             )
 
         self.L = L
+        self.layer_embed_dim = layer_embed_dim
         self.upsample = upsample
         self.channel_activations = channel_activations  # None means identity everywhere
 
         self.conv = DepthWiseSeparableConvLayer(
             cin=cin, cout=c_dec, activation=activation, stride=1
         )
-        self.out = nn.Conv2d(c_dec, out_channels, kernel_size=1)
+        self.out = nn.Conv2d(c_dec, 7, kernel_size=1)
         self.time_embedding = FourierTimeEmbedding(**temporal_embedding_config)
-        self.time_film = TimeFiLM(**temporal_film_config)
+        self.layer_embed = nn.Embedding(L, layer_embed_dim)
+
+        num_freqs = temporal_embedding_config["num_freqs"]
+        film_config = dict(temporal_film_config)
+        film_config["embed_dim"] = 2 * num_freqs + layer_embed_dim
+        self.time_film = TimeFiLM(**film_config)
 
         if self.channel_activations is not None:
             _init_heinzle_output_bias(self.out, self.L)
@@ -427,31 +431,62 @@ class SpatioTemporalDecoder(nn.Module):
         return u, (B, T, H, W)
 
     def _gamma_beta(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """t: [B, T] -> gamma, beta: [B, T, c_dec]"""
-        emb = self.time_embedding(t)
-        return self.time_film(emb)
+        """t: [B, T] -> gamma, beta: [B, T, L, c_dec]"""
+        B, T = t.shape
+        L = self.L
+        time_emb = self.time_embedding(t)  # [B, T, 2F]
+
+        layer_ids = torch.arange(L, device=t.device)
+        layer_toks = self.layer_embed(layer_ids)  # [L, layer_embed_dim]
+
+        time_emb_exp = time_emb.unsqueeze(2).expand(B, T, L, -1)  # [B, T, L, 2F]
+        layer_toks_exp = layer_toks[None, None, :, :].expand(
+            B, T, L, -1
+        )  # [B, T, L, layer_embed_dim]
+        film_input = torch.cat(
+            [time_emb_exp, layer_toks_exp], dim=-1
+        )  # [B, T, L, 2F+layer_embed_dim]
+        film_input_flat = film_input.reshape(B * T * L, -1)
+
+        gamma_flat, beta_flat = self.time_film(film_input_flat)  # [B*T*L, c_dec]
+        c_dec = gamma_flat.shape[-1]
+        gamma = gamma_flat.view(B, T, L, c_dec)
+        beta = beta_flat.view(B, T, L, c_dec)
+        return gamma, beta
 
     def _gamma_beta_time_grads(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Analytic d(gamma)/dt and d(beta)/dt via vmap + jacrev over scalar t.
-        Returns: dgamma_dt, dbeta_dt -- each [B, T, c_dec]
+        Runs L separate vmap(jacrev(...)) calls to avoid tracing through nn.Embedding.
+        Returns: dgamma_dt, dbeta_dt -- each [B, T, L, c_dec]
         """
         B, T = t.shape
+        L = self.L
         t_flat = t.reshape(-1)  # [BT]
 
-        def _gb_from_scalar(ts: torch.Tensor) -> torch.Tensor:
-            """ts: scalar -> stacked [2, c_dec] = [gamma; beta]"""
-            emb = self.time_embedding(ts)
-            g, b = self.time_film(emb)
-            return torch.stack([g, b], dim=0)  # [2, c_dec]
+        layer_ids = torch.arange(L, device=t.device)
+        layer_toks = self.layer_embed(layer_ids)  # [L, layer_embed_dim] -- constant w.r.t. t
 
-        # grads_flat: [BT, 2, c_dec]
-        grads_flat = vmap(jacrev(_gb_from_scalar))(t_flat)
-        c_dec = grads_flat.shape[-1]
+        all_dgamma = []
+        all_dbeta = []
+        for l_idx in range(L):
+            tok = layer_toks[l_idx]  # [layer_embed_dim]
 
-        grads = grads_flat.view(B, T, 2, c_dec)
-        dgamma_dt = grads[:, :, 0, :]  # [B, T, c_dec]
-        dbeta_dt = grads[:, :, 1, :]  # [B, T, c_dec]
+            def _gb_from_scalar(ts: torch.Tensor, _tok: torch.Tensor = tok) -> torch.Tensor:
+                """ts: scalar -> [2, c_dec] = [gamma; beta]"""
+                emb = self.time_embedding(ts)  # [2F]
+                film_in = torch.cat([emb, _tok.to(emb.dtype)], dim=-1)  # [2F+layer_embed_dim]
+                g, b = self.time_film(film_in)
+                return torch.stack([g, b], dim=0)  # [2, c_dec]
+
+            grads_flat = vmap(jacrev(_gb_from_scalar))(t_flat)  # [BT, 2, c_dec]
+            c_dec = grads_flat.shape[-1]
+            grads = grads_flat.view(B, T, 2, c_dec)
+            all_dgamma.append(grads[:, :, 0, :])  # [B, T, c_dec]
+            all_dbeta.append(grads[:, :, 1, :])  # [B, T, c_dec]
+
+        dgamma_dt = torch.stack(all_dgamma, dim=2)  # [B, T, L, c_dec]
+        dbeta_dt = torch.stack(all_dbeta, dim=2)  # [B, T, L, c_dec]
         return dgamma_dt, dbeta_dt
 
     def _decode_from_film(
@@ -465,32 +500,38 @@ class SpatioTemporalDecoder(nn.Module):
         W: int,
     ) -> torch.Tensor:
         """FiLM -> 1x1 conv -> [B, 7, L, T, H, W]  (pre-activation)"""
-        y = gamma[..., None, None] * u + beta[..., None, None]  # [B, T, c_dec, H, W]
-        y_bt = y.reshape(B * T, y.shape[2], H, W)
-        out_bt = self.out(y_bt)  # [BT, 7*L, H, W]
-        return self._reshape_output(out_bt, B, T, H, W)
+        L = self.L
+        c_dec = u.shape[2]
+
+        # u: [B, T, c_dec, H, W] -> [B, T, L, c_dec, H, W]
+        u_exp = u.unsqueeze(2).expand(B, T, L, c_dec, H, W)
+        g = gamma[..., None, None]  # [B, T, L, c_dec, 1, 1]
+        b = beta[..., None, None]  # [B, T, L, c_dec, 1, 1]
+        y = g * u_exp + b  # [B, T, L, c_dec, H, W]
+
+        y_btl = y.reshape(B * T * L, c_dec, H, W)
+        out_btl = self.out(y_btl)  # [B*T*L, 7, H, W]
+        return out_btl.view(B, T, L, 7, H, W).permute(0, 3, 2, 1, 4, 5).contiguous()
 
     def _decode_dt_from_film(self, u, dgamma_dt, dbeta_dt, B, T, H, W):
-        dy_dt = dgamma_dt[..., None, None] * u + dbeta_dt[..., None, None]
-        dy_bt = dy_dt.reshape(B * T, dy_dt.shape[2], H, W)
+        L = self.L
+        c_dec = u.shape[2]
 
+        u_exp = u.unsqueeze(2).expand(B, T, L, c_dec, H, W)
+        g = dgamma_dt[..., None, None]  # [B, T, L, c_dec, 1, 1]
+        b = dbeta_dt[..., None, None]  # [B, T, L, c_dec, 1, 1]
+        dy = g * u_exp + b  # [B, T, L, c_dec, H, W]
+
+        dy_btl = dy.reshape(B * T * L, c_dec, H, W)
         # Apply conv weights only -- no bias for derivative
-        dout_bt = F.conv2d(
-            dy_bt,
+        dout_btl = F.conv2d(
+            dy_btl,
             self.out.weight,
             bias=None,
             stride=self.out.stride,
             padding=self.out.padding,
-        )
-        return self._reshape_output(dout_bt, B, T, H, W)
-
-    def _reshape_output(self, out_bt: torch.Tensor, B: int, T: int, H: int, W: int) -> torch.Tensor:
-        """[BT, 7*L, H, W] -> [B, 7, L, T, H, W]"""
-        return (
-            out_bt.view(B, T, HEINZLE_N_SIGNALS, self.L, H, W)
-            .permute(0, 2, 3, 1, 4, 5)
-            .contiguous()
-        )
+        )  # [B*T*L, 7, H, W]
+        return dout_btl.view(B, T, L, 7, H, W).permute(0, 3, 2, 1, 4, 5).contiguous()
 
     def _apply_activations(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -549,18 +590,8 @@ class HeinzleNet(nn.Module):
         self, x: torch.Tensor, t: torch.Tensor, return_gradients: bool = False
     ) -> SpatialDecoderManifest:
         xmix = self.layer_mixing(x)  # [B, T, C, H, W]
-
-        # checkpoint the two following encoders to save on memory.
-
         xenc = self.spatial_encoder(xmix)  # [B, T, C', H, W]
         xmix = self.temporal_mixing(xenc)  # [B, T, C', H, W]
-        # print(torch.cuda.memory_summary(device=xmix.device, abbreviated=True))
-        # for obj in gc.get_objects():
-        #     try:
-        #         if torch.is_tensor(obj) and obj.is_cuda and obj.numel() * obj.element_size() > 100 * 1024 * 1024:
-        #             print(f"Large tensor: {obj.shape} {obj.dtype} {obj.numel() * obj.element_size() / 1024**2:.1f} MB")
-        #     except:
-        #         pass
         z_hat = self.spatial_decoder(
             xmix, t, return_gradients=return_gradients
         )  # [B, 7, L, T, H, W]
