@@ -351,7 +351,8 @@ class MICH(LightningModule):
             ]
         ).mean()
 
-        return colloc_loss + self.hparams.loss_config.lambda_src * src_loss
+        total = colloc_loss + self.hparams.loss_config.lambda_src * src_loss
+        return total, colloc_loss, src_loss
 
     def _sanitise_states(self, states: dict[str, Any]) -> dict[str, Any]:
         for key, value in states.items():
@@ -440,7 +441,14 @@ class MICH(LightningModule):
             dq_star_dt[:, burn_in:] / q_star_scale, q_star_target[:, burn_in:] / q_star_scale
         )
 
-        return (s_loss + f_loss + v_loss + q_loss + v_star_loss + q_star_loss) / 6.0
+        return {
+            "s": s_loss,
+            "f": f_loss,
+            "v": v_loss,
+            "q": q_loss,
+            "vstar": v_star_loss,
+            "qstar": q_star_loss,
+        }
 
     def _get_scheduled_lambda(
         self, lambda_target: float, warmup_steps: int, delay_steps: int = 0
@@ -476,19 +484,23 @@ class MICH(LightningModule):
             dense_time_hi=self.hparams.loss_config.dense_time_hi,
             uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
         )
+        _eq_keys = ("s", "f", "v", "q", "vstar", "qstar")
         tot_physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=torch.float32)
-        for layer in range(z_hat.shape[2]):
-            tot_physics_loss += (
-                self._compute_physics_layer_loss(
-                    z_hat, dz_hat_dt, idx, layer=layer, burn_in=self.hparams.loss_config.burn_in
-                ).float()
-                / z_hat.shape[2]
+        per_eq = {k: torch.tensor(0.0, device=z_hat.device, dtype=torch.float32) for k in _eq_keys}
+        n_layers = z_hat.shape[2]
+        for layer in range(n_layers):
+            layer_losses = self._compute_physics_layer_loss(
+                z_hat, dz_hat_dt, idx, layer=layer, burn_in=self.hparams.loss_config.burn_in
             )
+            layer_total = sum(layer_losses.values()).float() / 6.0
+            tot_physics_loss = tot_physics_loss + layer_total / n_layers
+            for k in _eq_keys:
+                per_eq[k] = per_eq[k] + layer_losses[k].float() / n_layers
 
         # Smoothness of gradients
         dz_dt_fd = z_hat[:, :, :, 1:] - z_hat[:, :, :, :-1]  # [B, S, L, T-1, H, W]
         smoothness_loss = dz_dt_fd.pow(2).mean()
-        return tot_physics_loss + lambda_smooth * smoothness_loss
+        return tot_physics_loss + lambda_smooth * smoothness_loss, per_eq
 
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
         bold, neural = batch["bold"], batch["neural"]
@@ -519,8 +531,10 @@ class MICH(LightningModule):
             getattr(lc, "delay_steps_smooth", 0),
         )
 
-        data_loss = self._data_loss(z_hat, bold_norm, source_position=source_position)
-        physics_loss = self._physics_loss(
+        data_loss, colloc_loss, src_loss = self._data_loss(
+            z_hat, bold_norm, source_position=source_position
+        )
+        physics_loss, per_eq_physics = self._physics_loss(
             z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position
         )
         total_loss = (
@@ -529,8 +543,9 @@ class MICH(LightningModule):
 
         on_step = stage == "train"
         on_epoch = stage == "val"
+        # --- loss/ : raw unscaled components (logged for both train and val) ---
         self.log(
-            f"{stage}/data_loss",
+            f"{stage}/loss/data",
             data_loss,
             on_step=on_step,
             on_epoch=on_epoch,
@@ -538,7 +553,7 @@ class MICH(LightningModule):
             sync_dist=True,
         )
         self.log(
-            f"{stage}/physics_loss",
+            f"{stage}/loss/physics",
             physics_loss,
             on_step=on_step,
             on_epoch=on_epoch,
@@ -546,7 +561,7 @@ class MICH(LightningModule):
             sync_dist=True,
         )
         self.log(
-            f"{stage}/total_loss",
+            f"{stage}/loss/total",
             total_loss,
             on_step=on_step,
             on_epoch=on_epoch,
@@ -555,8 +570,48 @@ class MICH(LightningModule):
         )
 
         if stage == "train":
-            self.log("train/lambda_physics_eff", lambda_physics_eff, on_step=True, on_epoch=False)
-            self.log("train/lambda_smooth_eff", lambda_smooth_eff, on_step=True, on_epoch=False)
+            # --- parameters/ : scheduled effective hyperparameters ---
+            self.log(
+                "parameters/lambda_physics",
+                lambda_physics_eff,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+            self.log(
+                "parameters/lambda_smooth",
+                lambda_smooth_eff,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+            # --- train/ode/ : per-equation ODE residuals ---
+            for _sig, _loss_val in per_eq_physics.items():
+                self.log(
+                    f"train/ode/{_sig}", _loss_val, on_step=True, on_epoch=False, sync_dist=True
+                )
+            # --- train/loss_weighted/ : lambda-scaled contributions to total loss ---
+            self.log(
+                "train/loss_weighted/data",
+                data_loss * lc.lambda_data,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+            self.log(
+                "train/loss_weighted/physics",
+                physics_loss * lambda_physics_eff,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+            self.log(
+                "train/loss_weighted/src",
+                src_loss * lc.lambda_src,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
 
         # Log unsynced per-rank metrics to each rank's own wandb run.
         # Only log during training and throttle to match log_every_n_steps so
@@ -569,10 +624,15 @@ class MICH(LightningModule):
         ):
             self._rank_run.log(
                 {
-                    f"{stage}/data_loss_step": data_loss.item(),
-                    f"{stage}/physics_loss_step": physics_loss.item(),
-                    f"{stage}/total_loss_step": total_loss.item(),
-                }
+                    "train/loss/data": data_loss.item(),
+                    "train/loss/physics": physics_loss.item(),
+                    "train/loss/total": total_loss.item(),
+                    **{f"train/ode/{k}": v.item() for k, v in per_eq_physics.items()},
+                    "train/loss_weighted/data": (data_loss * lc.lambda_data).item(),
+                    "train/loss_weighted/physics": (physics_loss * lambda_physics_eff).item(),
+                    "train/loss_weighted/src": (src_loss * lc.lambda_src).item(),
+                },
+                step=self.global_step,
             )
 
         if stage == "train":
@@ -695,6 +755,7 @@ class MICH(LightningModule):
         self, pred_bold, true_bold, pred_neural, true_neural, source_layer, source_pos
     ):
         run = getattr(self, "_rank_run", None) or wandb.run
+        images = []
         for i in range(pred_bold.shape[0]):
             image = plot_neural_bold_layers(
                 pred_bold=pred_bold[i],
@@ -704,9 +765,10 @@ class MICH(LightningModule):
                 source_layer=source_layer[i],
                 source_pos=source_pos[i],
             )
-            if run is not None:
-                run.log({"predictions": wandb.Image(image)})
+            images.append(wandb.Image(image))
             plt.close(image)
+        if run is not None and images:
+            run.log({"media/predictions": images}, commit=False)
 
     def _plot_and_log_latents(
         self,
@@ -724,6 +786,7 @@ class MICH(LightningModule):
         true_q_star,
     ):
         run = getattr(self, "_rank_run", None) or wandb.run
+        images = []
         for i in range(pred_s.shape[0]):
             image = plot_latent_layers(
                 pred_f=pred_f[i],
@@ -740,13 +803,19 @@ class MICH(LightningModule):
                 true_q_star=true_q_star[i],
                 title="Latent States",
             )
-            if run is not None:
-                run.log({"latents": wandb.Image(image)})
+            images.append(wandb.Image(image))
             plt.close(image)
+        if run is not None and images:
+            run.log({"media/latents": images}, commit=True)
+
+    def on_after_backward(self):
+        if self.global_step % self.trainer.log_every_n_steps == 0:
+            film_params = list(self.heinzle_net.spatial_decoder.time_film.parameters())
+            norms = [p.grad.norm() for p in film_params if p.grad is not None]
+            if norms:
+                self.log("gradients/film_norm", torch.stack(norms).norm())
 
     def on_fit_start(self) -> None:
-        # Rank 0's wandb run is owned by WandbLogger -- nothing to do here.
-        # Non-zero ranks initialize their own run so per-rank metrics are tracked.
         if self.trainer.is_global_zero:
             return
         logger = self.trainer.logger

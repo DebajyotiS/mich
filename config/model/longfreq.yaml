@@ -95,7 +95,7 @@ loss_config:
   lambda_physics: 1.0
   lambda_src: 10.0
   lambda_smooth: 0.0
-  warmup_steps_physics: 10000
+  warmup_steps_physics: 20000
   warmup_steps_smooth: 0
   delay_steps_physics: 2000
   delay_steps_smooth: 0

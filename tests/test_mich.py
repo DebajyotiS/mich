@@ -259,7 +259,7 @@ class TestMICHLosses:
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
         z_hat = model(bold, time).z_hat
         src_pos = torch.randint(0, min(_H, _W), (_B, 2))
-        loss = model._data_loss(z_hat, bold, source_position=src_pos)
+        loss, _, _ = model._data_loss(z_hat, bold, source_position=src_pos)
         assert loss.ndim == 0
         assert torch.isfinite(loss)
 
@@ -271,7 +271,7 @@ class TestMICHLosses:
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
         manifest = model(bold, time, return_gradients=True)
         src_pos = torch.randint(0, min(_H, _W), (_B, 2))
-        loss = model._physics_loss(manifest.z_hat, manifest.grads, source_position=src_pos)
+        loss, _ = model._physics_loss(manifest.z_hat, manifest.grads, source_position=src_pos)
         assert loss.ndim == 0
         assert torch.isfinite(loss)
 
@@ -282,7 +282,7 @@ class TestMICHLosses:
         bold = torch.randn(_B, _L, _T, _H, _W)
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
         manifest = model(bold, time, return_gradients=True)
-        loss = model._physics_loss(manifest.z_hat, manifest.grads, source_position=None)
+        loss, _ = model._physics_loss(manifest.z_hat, manifest.grads, source_position=None)
         assert torch.isfinite(loss)
 
     def test_total_loss_backward_propagates_finite_gradients(self):
@@ -293,8 +293,10 @@ class TestMICHLosses:
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
         src_pos = torch.randint(0, min(_H, _W), (_B, 2))
         manifest = model(bold, time, return_gradients=True)
-        data_loss = model._data_loss(manifest.z_hat, bold, source_position=src_pos)
-        physics_loss = model._physics_loss(manifest.z_hat, manifest.grads, source_position=src_pos)
+        data_loss, _, _ = model._data_loss(manifest.z_hat, bold, source_position=src_pos)
+        physics_loss, _ = model._physics_loss(
+            manifest.z_hat, manifest.grads, source_position=src_pos
+        )
         (data_loss + physics_loss).backward()
         grads_with_value = [p.grad for p in model.parameters() if p.grad is not None]
         assert len(grads_with_value) > 0, "No parameter received a gradient"
