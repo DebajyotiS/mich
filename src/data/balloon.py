@@ -74,6 +74,12 @@ class PointSpreadFunction:
         """Gaussian sigma corresponding to this FWHM."""
         return self.fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
 
+    def kernel_2d(self) -> np.ndarray:
+        """2-D separable Gaussian kernel as a (1, 1, k, k) float32 numpy array."""
+        k1d = _gaussian_kernel_1d(self.sigma)
+        k2d = (k1d[:, None] * k1d[None, :]).astype(np.float32)
+        return k2d[np.newaxis, np.newaxis]  # (1, 1, k, k)
+
     def apply(self, data: Timecourse) -> Timecourse:
         """Apply Gaussian blur to spatial dimensions of data shaped (T, *spatial)."""
         if self.fwhm <= 0.0:
@@ -205,24 +211,33 @@ def _apply_psf_numpy(data: np.ndarray, sigma: float) -> np.ndarray:
     return gaussian_filter(data, sigma=spatial_sigma)
 
 
+def _reflect_pad(x: torch.Tensor, pad: int, dim: int) -> torch.Tensor:
+    """Reflect-pad tensor along `dim` by `pad` elements; works for pad >= size."""
+    size = x.shape[dim]
+    period = 2 * (size - 1)
+    i = torch.arange(-pad, size + pad, device=x.device, dtype=torch.long)
+    i = ((i % period) + period) % period
+    idx = torch.where(i < size, i, period - i)
+    return x.index_select(dim, idx)
+
+
 def _apply_psf_torch(data: torch.Tensor, sigma: float) -> torch.Tensor:
     if data.ndim <= 1:
         return data
     kernel_np = _gaussian_kernel_1d(sigma)
     kernel = torch.as_tensor(kernel_np, dtype=data.dtype, device=data.device)
+    pad = len(kernel_np) // 2
     n_spatial = data.ndim - 1
 
     if n_spatial == 1:
-        pad = len(kernel_np) // 2
         k = kernel.reshape(1, 1, -1)
-        out = torch.nn.functional.conv1d(data.unsqueeze(1), k, padding=pad)
-        return out.squeeze(1)
+        x = _reflect_pad(data.unsqueeze(1), pad, dim=2)
+        return torch.nn.functional.conv1d(x, k, padding=0).squeeze(1)
 
     if n_spatial == 2:
-        pad = len(kernel_np) // 2
         k2d = (kernel[:, None] * kernel[None, :]).reshape(1, 1, -1, len(kernel))
-        out = torch.nn.functional.conv2d(data.unsqueeze(1), k2d, padding=pad)
-        return out.squeeze(1)
+        x = _reflect_pad(_reflect_pad(data.unsqueeze(1), pad, dim=2), pad, dim=3)
+        return torch.nn.functional.conv2d(x, k2d, padding=0).squeeze(1)
 
     raise NotImplementedError(f"PSF not implemented for {n_spatial}D spatial data in torch")
 

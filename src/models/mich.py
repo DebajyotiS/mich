@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal, Mapping
@@ -11,7 +10,7 @@ import torch.nn.functional as F
 import wandb
 from pytorch_lightning import LightningModule
 
-from src.data.balloon import AcquisitionConstants
+from src.data.balloon import AcquisitionConstants, PointSpreadFunction, _reflect_pad
 from src.models.blocks import HeinzleSignal, SpatialDecoderManifest
 from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
@@ -35,6 +34,7 @@ class MICHManifest:
     data_loss: torch.Tensor
     physics_loss: torch.Tensor
     total_loss: torch.Tensor
+    supervision_loss: torch.Tensor | None = None
     bold: torch.Tensor | None = None  # [B, L, T, H, W]
     neural: torch.Tensor | None = None  # [B, L, T, H, W]
     z_hat: torch.Tensor | None = None  # [B, 7, L, T, H, W]
@@ -59,6 +59,7 @@ class MICH(LightningModule):
         lc = self.hparams.loss_config
         self._bold_loss_fn = MICH._make_loss_fn(getattr(lc, "bold_loss", None))
         self._ode_loss_fn = MICH._make_loss_fn(getattr(lc, "ode_loss", None))
+        self._supervision_loss_fn = MICH._make_loss_fn(getattr(lc, "supervision_loss", None))
         self.pred_buffer = []
         self.neural_buffer = []
         self.bold_buffer = []
@@ -66,20 +67,17 @@ class MICH(LightningModule):
         self.source_position_buffer = []
         self.true_z_hat_buffer = []
 
-        # Precompute PSF kernels once and register as buffers so they move with the device.
+        # Build PSF objects and register 2D kernels as buffers so they move with the device.
         psf_fwhm = getattr(self.hparams, "psf_fwhm", None)
         if psf_fwhm is not None:
-            for i, fwhm in enumerate(psf_fwhm):
-                if fwhm > 0.0:
-                    sigma = fwhm / (2.0 * math.sqrt(2.0 * math.log(2.0)))
-                    radius = int(4.0 * sigma + 0.5)
-                    x = torch.arange(-radius, radius + 1, dtype=torch.float32)
-                    k1d = torch.exp(-0.5 * (x / sigma) ** 2)
-                    k1d = k1d / k1d.sum()
-                    kernel = (k1d[:, None] * k1d[None, :]).reshape(1, 1, len(k1d), len(k1d))
-                    self.register_buffer(f"_psf_kernel_{i}", kernel)
-                else:
-                    self.register_buffer(f"_psf_kernel_{i}", None)
+            self._psf = [PointSpreadFunction(fwhm=f) for f in psf_fwhm]
+            for i, psf in enumerate(self._psf):
+                self.register_buffer(
+                    f"_psf_kernel_{i}",
+                    torch.as_tensor(psf.kernel_2d(), dtype=torch.float32),
+                )
+        else:
+            self._psf = None
 
     def forward(
         self,
@@ -306,20 +304,17 @@ class MICH(LightningModule):
         )
 
         # Apply per-layer Gaussian PSF to pred_bold [B, L, T, H, W]
-        if getattr(self.hparams, "psf_fwhm", None) is not None:
+        if self._psf is not None:
             B_size, L_size, T_size, H_size, W_size = pred_bold.shape
             layers_blurred = []
-            for layer_idx in range(L_size):
-                kernel = getattr(self, f"_psf_kernel_{layer_idx}", None)
-                if kernel is None:
-                    layers_blurred.append(pred_bold[:, layer_idx])
-                else:
-                    pad = kernel.shape[-1] // 2
-                    x = pred_bold[:, layer_idx].reshape(B_size * T_size, 1, H_size, W_size)
-                    blurred = F.conv2d(x, kernel, padding=pad).reshape(
-                        B_size, T_size, H_size, W_size
-                    )
-                    layers_blurred.append(blurred)
+            for i in range(L_size):
+                kernel = getattr(self, f"_psf_kernel_{i}")
+                pad = kernel.shape[-1] // 2
+                x = pred_bold[:, i].reshape(B_size * T_size, 1, H_size, W_size)
+                x = _reflect_pad(_reflect_pad(x, pad, dim=2), pad, dim=3)
+                layers_blurred.append(
+                    F.conv2d(x, kernel, padding=0).reshape(B_size, T_size, H_size, W_size)
+                )
             pred_bold = torch.stack(layers_blurred, dim=1)  # [B, L, T, H, W]
 
         true_bold = (
@@ -450,6 +445,86 @@ class MICH(LightningModule):
             "qstar": q_star_loss,
         }
 
+    # Mapping from z_hat signal name -> batch key
+    _SUPERVISION_KEYS = (
+        ("s", "s"),
+        ("f", "f"),
+        ("v", "v"),
+        ("q", "q"),
+        ("vstar", "v_star"),
+        ("qstar", "q_star"),
+    )
+
+    def _supervision_loss(
+        self,
+        z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
+        batch: dict,
+        source_position: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """MSE between predicted and ground-truth latent states at collocation points."""
+        # Use T_min so collocation indices are valid for both z_hat and true latents.
+        T_latent = batch["s"].shape[2]
+        T_min = min(z_hat.shape[3], T_latent)
+        lc = self.hparams.loss_config
+        idx = MICH._sample_collocation_indices(
+            T=T_min,
+            H=z_hat.shape[4],
+            W=z_hat.shape[5],
+            n_times=lc.n_time,
+            n_space=lc.n_space,
+            device=z_hat.device,
+            source_position=source_position,
+            dense_spatial_frac=lc.dense_spatial_frac,
+            dense_spatial_radius=lc.dense_spatial_radius,
+            dense_time_frac=lc.dense_time_frac,
+            dense_time_lo=lc.dense_time_lo,
+            dense_time_hi=lc.dense_time_hi,
+            uniform_time_lo=lc.uniform_time_lo,
+        )
+        per_sig: dict[str, torch.Tensor] = {}
+        for sig, bk in self._SUPERVISION_KEYS:
+            true = batch[bk].float()  # [B, L, T_latent, H, W]
+            pred_at = MICH._gather_z_hat_at(z_hat, idx, signal=sig).float()  # [B, L, n_t, n_s]
+            true_at = MICH._gather_bold_at(true, idx).float()  # [B, L, n_t, n_s]
+            L = pred_at.shape[1]
+            per_sig[sig] = torch.stack(
+                [
+                    self._supervision_loss_fn(pred_at[:, layer], true_at[:, layer])
+                    for layer in range(L)
+                ]
+            ).mean()
+        total = sum(per_sig.values()) / len(per_sig)
+        return total, per_sig
+
+    def _source_supervision_loss(
+        self,
+        z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
+        batch: dict,
+        source_position: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """MSE between predicted and ground-truth latent states at the source voxel across all T."""
+        B = z_hat.shape[0]
+        b_idx = torch.arange(B, device=z_hat.device)
+        src_h = source_position[:, 0].long()
+        src_w = source_position[:, 1].long()
+        T_latent = batch["s"].shape[2]
+        T_pred = z_hat.shape[3]
+        T_min = min(T_pred, T_latent)
+
+        per_sig: dict[str, torch.Tensor] = {}
+        for sig, bk in self._SUPERVISION_KEYS:
+            true = batch[bk].float()  # [B, L, T_latent, H, W]
+            pred = z_hat[:, MICH._signal_index(sig)].float()  # [B, L, T, H, W]
+            pred_src = pred[b_idx, :, :T_min, src_h, src_w]  # [B, L, T_min]
+            true_src = true[b_idx, :, :T_min, src_h, src_w]  # [B, L, T_min]
+            L = pred_src.shape[1]
+            per_sig[sig] = torch.stack(
+                [self._supervision_loss_fn(pred_src[:, l], true_src[:, l]) for l in range(L)]
+            ).mean()
+
+        total = sum(per_sig.values()) / len(per_sig)
+        return total, per_sig
+
     def _get_scheduled_lambda(
         self, lambda_target: float, warmup_steps: int, delay_steps: int = 0
     ) -> float:
@@ -508,17 +583,6 @@ class MICH(LightningModule):
 
         bold_norm = self.normaliser(bold, source_position) if self.normaliser is not None else bold
 
-        sd_manifest = self(
-            bold_norm,
-            self._make_time_grid(
-                B=bold.shape[0], T=bold.shape[2], device=bold.device, dtype=bold.dtype
-            ),
-            return_gradients=True,
-            normalise=False,
-        )
-        z_hat = sd_manifest.z_hat
-        dz_hat_dt = sd_manifest.grads
-
         lc = self.hparams.loss_config
         lambda_physics_eff = self._get_scheduled_lambda(
             lc.lambda_physics,
@@ -530,22 +594,60 @@ class MICH(LightningModule):
             getattr(lc, "warmup_steps_smooth", 0),
             getattr(lc, "delay_steps_smooth", 0),
         )
+        need_grads = (lambda_physics_eff > 0.0) or (stage == "val")
+        sd_manifest = self(
+            bold_norm,
+            self._make_time_grid(
+                B=bold.shape[0], T=bold.shape[2], device=bold.device, dtype=bold.dtype
+            ),
+            return_gradients=need_grads,
+            normalise=False,
+        )
+        z_hat = sd_manifest.z_hat
+        dz_hat_dt = sd_manifest.grads  # None when need_grads=False
 
         data_loss, colloc_loss, src_loss = self._data_loss(
             z_hat, bold_norm, source_position=source_position
         )
-        physics_loss, per_eq_physics = self._physics_loss(
-            z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position
-        )
-        total_loss = (
-            self.hparams.loss_config.lambda_data * data_loss + lambda_physics_eff * physics_loss
-        )
+        if need_grads:
+            physics_loss, per_eq_physics = self._physics_loss(
+                z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position
+            )
+        else:
+            physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=torch.float32)
+            per_eq_physics = {}
+        total_loss = lc.lambda_data * data_loss + lambda_physics_eff * physics_loss
 
+        supervision_loss = None
+        lambda_supervision_eff = 0.0
+        per_sig_supervision: dict = {}
+        if batch.get("s") is not None:
+            lambda_supervision_eff = self._get_scheduled_lambda(
+                lc.lambda_supervision,
+                getattr(lc, "warmup_steps_supervision", 0),
+                getattr(lc, "delay_steps_supervision", 0),
+            )
+            supervision_loss, per_sig_supervision = self._source_supervision_loss(
+                z_hat, batch, source_position
+            )
+            total_loss = total_loss + lambda_supervision_eff * supervision_loss
+
+        # --- Lightning logger (progress bar + val checkpointing) ---
+        # Train: logger=False —> W&B sink is direct run.log() below.
+        # Val: logger=True —> ModelCheckpoint reads from PL logger.
+        _to_logger = stage == "val"
         on_step = stage == "train"
         on_epoch = stage == "val"
-        # Train metrics: logger=False — direct run.log() below is the sole W&B sink.
-        # Val metrics: logger=True — ModelCheckpoint needs them via PL's logger.
-        _to_logger = stage == "val"
+
+        self.log(
+            f"{stage}/loss/total",
+            total_loss,
+            on_step=on_step,
+            on_epoch=on_epoch,
+            prog_bar=True,
+            sync_dist=True,
+            logger=_to_logger,
+        )
         self.log(
             f"{stage}/loss/data",
             data_loss,
@@ -560,53 +662,73 @@ class MICH(LightningModule):
             physics_loss,
             on_step=on_step,
             on_epoch=on_epoch,
-            prog_bar=True,
+            prog_bar=False,
             sync_dist=True,
             logger=_to_logger,
         )
-        self.log(
-            f"{stage}/loss/total",
-            total_loss,
-            on_step=on_step,
-            on_epoch=on_epoch,
-            prog_bar=True,
-            sync_dist=True,
-            logger=_to_logger,
-        )
+        if supervision_loss is not None:
+            self.log(
+                f"{stage}/loss/supervision",
+                supervision_loss,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=False,
+                sync_dist=True,
+                logger=_to_logger,
+            )
 
-        # Log per-rank training metrics directly so all ranks share the global_step x-axis.
-        # Rank 0 uses wandb.run; ranks 1-N use their own _rank_run.
-        # Throttle to log_every_n_steps to match PL's WandbLogger cadence.
+        # --- Direct W&B logging (train only, throttled to log_every_n_steps) ---
         _direct_run = wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
         if (
             stage == "train"
             and _direct_run is not None
             and self.global_step % self.trainer.log_every_n_steps == 0
         ):
-            _direct_run.log(
-                {
-                    "global_step": self.global_step,
-                    "train/loss/data": data_loss.item(),
-                    "train/loss/physics": physics_loss.item(),
-                    "train/loss/total": total_loss.item(),
-                    "parameters/lambda_physics": lambda_physics_eff,
-                    "parameters/lambda_smooth": lambda_smooth_eff,
-                    **{f"train/ode/{k}": v.item() for k, v in per_eq_physics.items()},
-                    "train/loss_weighted/data": (data_loss * lc.lambda_data).item(),
-                    "train/loss_weighted/physics": (physics_loss * lambda_physics_eff).item(),
-                    "train/loss_weighted/src": (src_loss * lc.lambda_src).item(),
-                },
-            )
+            log_dict = {
+                "global_step": self.global_step,
+                # top-level loss scalars
+                "train/loss/total": total_loss.item(),
+                "train/loss/data": data_loss.item(),
+                "train/loss/physics": physics_loss.item(),
+                # weighted contributions
+                "train/loss_weighted/total": total_loss.item(),
+                "train/loss_weighted/data": (data_loss * lc.lambda_data).item(),
+                "train/loss_weighted/physics": (physics_loss * lambda_physics_eff).item(),
+                "train/loss_weighted/src": (src_loss * lc.lambda_src).item(),
+                # scheduled lambdas
+                "parameters/lambda_physics": lambda_physics_eff,
+                "parameters/lambda_smooth": lambda_smooth_eff,
+                # ODE residuals — own section
+                **{f"ode/{k}": v.item() for k, v in per_eq_physics.items()},
+            }
+            if supervision_loss is not None:
+                log_dict.update(
+                    {
+                        "train/loss/supervision": supervision_loss.item(),
+                        "train/loss_weighted/supervision": (
+                            supervision_loss * lambda_supervision_eff
+                        ).item(),
+                        # latent supervision per signal — own section
+                        **{
+                            f"supervision/src_{k}": v.item() for k, v in per_sig_supervision.items()
+                        },
+                    }
+                )
+            _direct_run.log(log_dict)
 
         if stage == "train":
             return MICHManifest(
-                data_loss=data_loss, physics_loss=physics_loss, total_loss=total_loss
+                data_loss=data_loss,
+                physics_loss=physics_loss,
+                total_loss=total_loss,
+                supervision_loss=supervision_loss,
             )
         elif stage == "val":
             return MICHManifest(
                 data_loss=data_loss,
                 physics_loss=physics_loss,
                 total_loss=total_loss,
+                supervision_loss=supervision_loss,
                 z_hat=z_hat,
                 bold=bold,
                 neural=neural,
@@ -625,7 +747,6 @@ class MICH(LightningModule):
         )
 
         manifest = self._shared_step(batch, stage="val")
-
         # True latents
         true_s = batch["s"]
         true_f = batch["f"]
@@ -775,19 +896,38 @@ class MICH(LightningModule):
         if self.global_step == 0:
             return
         if self.global_step % self.trainer.log_every_n_steps == 0:
-            film_params = list(self.heinzle_net.spatial_decoder.time_film.parameters())
-            norms = [p.grad.norm() for p in film_params if p.grad is not None]
-            if norms:
-                _direct_run = (
-                    wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
-                )
-                if _direct_run is not None:
-                    _direct_run.log(
-                        {
-                            "global_step": self.global_step,
-                            "train/film_grad_norm": torch.stack(norms).norm().item(),
-                        }
-                    )
+            _direct_run = (
+                wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
+            )
+            if _direct_run is None:
+                return
+
+            log_dict = {"global_step": self.global_step}
+
+            # FiLM linear vs output layer grad norms
+            decoder = self.heinzle_net.spatial_decoder
+            film = decoder.time_film
+            linear_norms = [p.grad.norm() for p in film.linear.parameters() if p.grad is not None]
+            out_norms = [p.grad.norm() for p in film.out.parameters() if p.grad is not None]
+            if linear_norms:
+                log_dict["gradients/film_linear_norm"] = torch.stack(linear_norms).norm().item()
+            if out_norms:
+                log_dict["gradients/film_out_norm"] = torch.stack(out_norms).norm().item()
+            all_film_norms = linear_norms + out_norms
+            if all_film_norms:
+                log_dict["gradients/film_grad_norm"] = torch.stack(all_film_norms).norm().item()
+
+            # Output head grad norms
+            head_norms = [
+                p.grad.norm()
+                for head in decoder.out_heads
+                for p in head.parameters()
+                if p.grad is not None
+            ]
+            if head_norms:
+                log_dict["gradients/out_heads_norm"] = torch.stack(head_norms).norm().item()
+
+            _direct_run.log(log_dict)
 
     def on_fit_start(self) -> None:
         if self.trainer.is_global_zero:

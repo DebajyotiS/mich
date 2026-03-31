@@ -34,7 +34,7 @@ def _mk_small_inputs(*, B=2, L=3, T=4, H=8, W=7, dtype=torch.float32, device="cp
     return x, t
 
 
-def _mk_heinzle_configs(*, L=3, Cmix=4, Cenc=6, c_dec=8):
+def _mk_heinzle_configs(*, L=3, Cmix=4, Cenc=6, c_dec=8, c_film=4):
     layer_mixing_config = dict(L=L, C=Cmix, init_identity=True)
 
     spatial_encoder_config = [
@@ -63,11 +63,12 @@ def _mk_heinzle_configs(*, L=3, Cmix=4, Cenc=6, c_dec=8):
         embed_dim=2 * time_embedding_config["num_freqs"],
         hidden_dim=16,
         activation="silu",
-        c_dec=c_dec,
+        c_dec=c_film,
     )
     spatial_decoder_config = dict(
         cin=Cenc,
         c_dec=c_dec,
+        c_film=c_film,
         out_channels=7 * L,
         activation="silu",
         L=L,
@@ -134,7 +135,7 @@ def test_masked_layer_mixing_forward_shape_and_layer_check():
     m = MaskedLayerMixing(L=L, C=7)
 
     y = m(x)
-    assert tuple(y.shape) == (B, T, m.C, H, W)
+    assert tuple(y.shape) == (B, T, L, m.C, H, W)
 
     # Wrong L should raise AssertionError
     x_bad = torch.randn(B, L + 1, T, H, W)
@@ -143,24 +144,24 @@ def test_masked_layer_mixing_forward_shape_and_layer_check():
 
 
 def test_masked_layer_mixing_respects_mask_zeroing_off_diagonal():
-    # If we put signal only in the last layer and set W to identity,
-    # output after conv2d with W_eff should copy that layer into itself only.
+    # With identity W, each layer's mixed output equals its own input.
+    # expand_net: Conv2d(1, C, 1) — set weights to 1 so output = input value broadcast to C channels.
     B, L, T, H, W = 1, 3, 2, 4, 4
-    m = MaskedLayerMixing(L=L, C=4, init_identity=True)
+    C = 4
+    m = MaskedLayerMixing(L=L, C=C, init_identity=True)
     with torch.no_grad():
-        m.expand_net.weight.zero_()
+        m.expand_net.weight.fill_(1.0)
         m.expand_net.bias.zero_()
-        # make expand_net pass through first input channel into all C channels for easy checking
-        # Here expand_net maps L->C with 1x1 conv; we set weights so that channel 0 maps to all outputs.
-        m.expand_net.weight[:, 0, 0, 0] = 1.0
 
     x = torch.zeros(B, L, T, H, W)
-    x[:, -1] = 5.0  # only last layer has signal
+    x[:, 0] = 5.0  # only first layer has signal
 
-    y = m(x)  # [B,T,C,H,W]
-    # Because expand_net reads channel 0 after layer mixing, we need to ensure layer mixing channel 0 is zero.
-    # With identity W and mask, layer mixing preserves each channel. Channel 0 was zero input => y should be zero.
-    assert torch.allclose(y, torch.zeros_like(y), atol=1e-6)
+    y = m(x)  # [B, T, L, C, H, W]
+    assert tuple(y.shape) == (B, T, L, C, H, W)
+    # Layer 0 output should be non-zero (contains the signal)
+    assert not torch.allclose(y[:, :, 0], torch.zeros_like(y[:, :, 0]), atol=1e-6)
+    # Layer 2 output should be zero (no signal, and identity W means no cross-layer bleed from layer 0)
+    assert torch.allclose(y[:, :, 2], torch.zeros_like(y[:, :, 2]), atol=1e-6)
 
 
 # -----------------------------
@@ -199,11 +200,11 @@ def test_spatial_encoder_preserves_batch_time_and_changes_channels():
             ),
         ]
     )
-    x = torch.randn(2, 5, 4, 11, 9)  # [B,T,C,H,W]
+    x = torch.randn(2, 5, 3, 4, 11, 9)  # [B,T,L,C,H,W]
     y = enc(x)
-    assert y.shape[:2] == (2, 5)
-    assert y.shape[2] == 7
-    assert y.shape[3:] == (11, 9)
+    assert y.shape[:3] == (2, 5, 3)
+    assert y.shape[3] == 7
+    assert y.shape[4:] == (11, 9)
 
 
 # -----------------------------
@@ -255,7 +256,7 @@ def test_temporal_mixing_encoder_sets_dilations_powers_of_two():
 
 def test_temporal_mixing_encoder_forward_shape_roundtrip():
     enc = TemporalMixingEncoder([dict(cin=5, kernel_size=3, num_groups=1, activation="silu")])
-    x = torch.randn(2, 6, 5, 4, 3)  # [B,T,C,H,W]
+    x = torch.randn(2, 6, 3, 5, 4, 3)  # [B,T,L,C,H,W]
     y = enc(x)
     assert y.shape == x.shape
 
@@ -330,20 +331,22 @@ def test_spatiotemporal_decoder_output_shape_no_grads():
     L = 3
     cin = 5
     c_dec = 7
+    c_film = 4
     out_channels = 7 * L
 
     dec = SpatioTemporalDecoder(
         cin=cin,
         c_dec=c_dec,
+        c_film=c_film,
         out_channels=out_channels,
         activation="silu",
         L=L,
         temporal_embedding_config=dict(num_freqs=4, max_freq=3.0),
-        temporal_film_config=dict(embed_dim=8, hidden_dim=16, activation="silu", c_dec=c_dec),
+        temporal_film_config=dict(embed_dim=8, hidden_dim=16, activation="silu", c_dec=c_film),
         upsample=False,
     )
 
-    x = torch.randn(B, T, cin, H, W)
+    x = torch.randn(B, T, L, cin, H, W)
     t = torch.linspace(0, 1, T).unsqueeze(0).expand(B, -1)
 
     m = dec(x, t, return_gradients=False)
@@ -359,21 +362,23 @@ def test_spatiotemporal_decoder_output_shape_with_grads_and_central_difference_c
     L = 2
     cin = 3
     c_dec = 5
+    c_film = 3
     out_channels = 7 * L
 
     dec = SpatioTemporalDecoder(
         cin=cin,
         c_dec=c_dec,
+        c_film=c_film,
         out_channels=out_channels,
         activation="silu",
         L=L,
         temporal_embedding_config=dict(num_freqs=3, max_freq=2.0),
-        temporal_film_config=dict(embed_dim=6, hidden_dim=12, activation="silu", c_dec=c_dec),
+        temporal_film_config=dict(embed_dim=6, hidden_dim=12, activation="silu", c_dec=c_film),
         upsample=False,
     )
     dec.eval()
 
-    x = torch.randn(B, T, cin, H, W, dtype=torch.float32)
+    x = torch.randn(B, T, L, cin, H, W, dtype=torch.float32)
     t = torch.linspace(0.1, 0.9, T, dtype=torch.float32).unsqueeze(0).expand(B, -1)
 
     m = dec(x, t, return_gradients=True)
@@ -408,25 +413,26 @@ def test_fourier_time_embedding_forces_float32_and_can_cause_dtype_mismatch_if_m
 
 
 def test_spatiotemporal_decoder_out_channels_is_accepted_as_legacy_param():
-    # out_channels is accepted for backwards compatibility but no longer validated;
-    # the output head always maps c_dec -> 7 (L is handled in the batch dim).
+    # out_channels is accepted for backwards compatibility but no longer validated.
     B, T, H, W = 1, 2, 3, 3
     L = 2
     cin = 3
     c_dec = 4
+    c_film = 3
 
     dec = SpatioTemporalDecoder(
         cin=cin,
         c_dec=c_dec,
+        c_film=c_film,
         out_channels=7 * L,  # accepted but not used to size the conv
         activation="silu",
         L=L,
         temporal_embedding_config=dict(num_freqs=2, max_freq=2.0),
-        temporal_film_config=dict(embed_dim=4, hidden_dim=8, activation="silu", c_dec=c_dec),
+        temporal_film_config=dict(embed_dim=4, hidden_dim=8, activation="silu", c_dec=c_film),
         upsample=False,
     )
 
-    x = torch.randn(B, T, cin, H, W)
+    x = torch.randn(B, T, L, cin, H, W)
     t = torch.linspace(0, 1, T).unsqueeze(0).expand(B, -1)
     m = dec(x, t, return_gradients=False)
     assert m.z_hat.shape == (B, 7, L, T, H, W)

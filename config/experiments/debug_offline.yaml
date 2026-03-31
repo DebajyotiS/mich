@@ -1,0 +1,71 @@
+# @package _global_
+# Fast offline debugging run — small model, 1 GPU, no wandb sync.
+# Usage: python scripts/train_mich.py experiment=debug_offline
+
+defaults:
+  - override /model: longfreq
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+project_name: mich-debug
+network_name: debug-offline
+
+# ── Trainer ───────────────────────────────────────────────────────────────────
+trainer:
+  devices: 1
+  strategy: auto          # ddp needs >1 GPU; auto falls back to single-device
+  max_epochs: 3
+  log_every_n_steps: 5
+  num_sanity_val_steps: 1
+  enable_progress_bar: True
+
+# ── Model dims (small) ────────────────────────────────────────────────────────
+model:
+  C: 8
+  c_enc: 8
+  c_dec: 8
+  c_film: 4
+  signal_embed_dim: 4
+  num_freqs: 4
+  # Shrink the temporal stack to 2 layers for speed
+  heinzle_net:
+    temporal_mixing_config:
+      - cin: 8
+        kernel_size: 3
+        num_groups: 4
+        activation: silu
+      - cin: 8
+        kernel_size: 3
+        num_groups: 4
+        activation: silu
+
+# ── Loss — data-only, no physics warmup stall ─────────────────────────────────
+  loss_config:
+    lambda_data: 1.0
+    lambda_physics: 0.0     # off while debugging forward pass
+    lambda_src: 0.0
+    lambda_smooth: 0.0
+    lambda_supervision: 1.0
+    warmup_steps_physics: 0
+    warmup_steps_smooth: 0
+    delay_steps_physics: 0
+    delay_steps_smooth: 0
+    n_time: 20
+    n_space: 50
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+datamodule:
+  loader:
+    batch_size: 1
+    num_workers: 0          # easier stack traces
+    pin_memory: false
+    persistent_workers: false
+    prefetch_factor: null
+  split:
+    train_count: 8          # tiny subset so epochs are instant
+    val_count: 2
+    test_count: null
+
+# ── Logging — wandb fully offline ─────────────────────────────────────────────
+loggers:
+  wandb:
+    offline: True
