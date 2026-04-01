@@ -128,7 +128,7 @@ acquisition:
   r0: 340           # Intravascular relaxation rate (Hz)
   eps: 1.0e-32
   k1: 10.4624375
-  k2: 2.433125e-32
+  k2: 2.89e-31
   k3: 1.0
 
 V0: 0.5

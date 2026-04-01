@@ -98,29 +98,32 @@ normaliser:
 loss_config:
   lambda_data: 100.0
   lambda_physics: 1.0
+  warmup_steps_physics: 20000
+  delay_steps_physics: 3000
   lambda_src: 10.0
   lambda_smooth: 0.0
-  warmup_steps_physics: 20000
   warmup_steps_smooth: 0
-  delay_steps_physics: 3000
   delay_steps_smooth: 0
-  n_time: 80
-  n_space: 400
-  dense_time_frac: 0.85
-  dense_time_lo: 0.1
-  dense_time_hi: 0.70
-  uniform_time_lo: 0.1
-  dense_spatial_frac: 0.95
-  dense_spatial_radius: ${model.spatial_radius}
-  burn_in: 0
   lambda_supervision: 10.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
+  n_space: 225
+  dense_spatial_frac: 0.95
+  dense_spatial_radius: ${model.spatial_radius}
+  n_time: 100
+  dense_time_frac: 0.0
+  dense_time_lo: 0.0
+  dense_time_hi: 0.70
+  uniform_time_lo: 0.0
+  burn_in: 0
   supervision_loss:
-    type: "mse"
+    type: "mse+pearson"
+    lambda_npearson: 10.0
+    lambda_pearson: 1.0
     huber_delta: 0.1
   bold_loss:
-    type: "mse"
+    type: "mse+pearson"
+    lambda_npearson: 10.0
     lambda_pearson: 1.0
     huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
   ode_loss:

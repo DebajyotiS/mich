@@ -123,15 +123,19 @@ class MICH(LightningModule):
         elif loss_type == "mse+pearson":
 
             def _mse_pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-                return F.mse_loss(pred, true) + lambda_pearson * _pearson(pred, true)
+                lambda_npearson = getattr(loss_cfg, "lambda_npearson", 1.0)
+                return lambda_npearson * F.mse_loss(pred, true) + lambda_pearson * _pearson(
+                    pred, true
+                )
 
             return _mse_pearson
         elif loss_type == "huber+pearson":
 
             def _huber_pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-                return F.huber_loss(pred, true, delta=huber_delta) + lambda_pearson * _pearson(
-                    pred, true
-                )
+                lambda_npearson = getattr(loss_cfg, "lambda_npearson", 1.0)
+                return lambda_npearson * F.huber_loss(
+                    pred, true, delta=huber_delta
+                ) + lambda_pearson * _pearson(pred, true)
 
             return _huber_pearson
         else:
@@ -353,7 +357,7 @@ class MICH(LightningModule):
         for key, value in states.items():
             value = torch.nan_to_num(value, nan=0.0, posinf=1e3, neginf=-1e3)
             if key in ("f", "v", "q"):
-                value = torch.clamp(value, min=1e-3)
+                value = torch.clamp(value, min=0.1)
             else:
                 value = torch.clamp(value, min=-1e3, max=1e3)
             states[key] = value
@@ -519,7 +523,10 @@ class MICH(LightningModule):
             true_src = true[b_idx, :, :T_min, src_h, src_w]  # [B, L, T_min]
             L = pred_src.shape[1]
             per_sig[sig] = torch.stack(
-                [self._supervision_loss_fn(pred_src[:, l], true_src[:, l]) for l in range(L)]
+                [
+                    self._supervision_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
+                    for layer_idx in range(L)
+                ]
             ).mean()
 
         total = sum(per_sig.values()) / len(per_sig)
@@ -621,7 +628,7 @@ class MICH(LightningModule):
         supervision_loss = None
         lambda_supervision_eff = 0.0
         per_sig_supervision: dict = {}
-        if batch.get("s") is not None:
+        if batch.get("s") is not None and lc.lambda_supervision > 0:
             lambda_supervision_eff = self._get_scheduled_lambda(
                 lc.lambda_supervision,
                 getattr(lc, "warmup_steps_supervision", 0),
