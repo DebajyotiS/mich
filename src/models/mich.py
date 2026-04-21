@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import wandb
 from pytorch_lightning import LightningModule
 
-from src.data.balloon import AcquisitionConstants
+from src.data.balloon_linear import AcquisitionConstants
 from src.models.blocks import HeinzleSignal, SpatialDecoderManifest
 from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
@@ -462,7 +462,7 @@ class MICH(LightningModule):
             return lambda_target
         return min(1.0, ramp_step / warmup_steps) * lambda_target
 
-    def _physics_loss(
+    def _physics_loss( # add a parameter that says whether the loss is linear or nonlinear
         self,
         z_hat: torch.Tensor,
         dz_hat_dt: torch.Tensor,

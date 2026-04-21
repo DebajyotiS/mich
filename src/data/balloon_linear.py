@@ -312,7 +312,6 @@ def sanitize_state(
 
     return out
 
-
 def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants) -> dict[str, Timecourse]:
     clean = sanitize_state(layer.state.as_dict())
     x = clean["x"]  # type: ignore[assignment]
@@ -321,14 +320,13 @@ def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants) -> dict[st
     v = clean["v"]  # type: ignore[assignment]
     q = clean["q"]  # type: ignore[assignment]
 
-    ds = x - c.kappa * s - c.gamma * (f - 1.0)  # type: ignore[operator]
+    beta = (1 - c.E0) * np.log(1 + c.E0) / c.E0
+
+    ds = x - c.kappa * s - c.gamma * f  # type: ignore[operator]
     df = s  # type: ignore[assignment]
 
-    outflow = v ** (1.0 / c.alpha)  # type: ignore[operator]
-    dv = (f - outflow) / layer.tau  # type: ignore[operator]
-
-    extraction = (1.0 - (1.0 - c.E0) ** (1.0 / f)) / c.E0  # type: ignore[operator]
-    dq = (f * extraction - outflow * (q / v)) / layer.tau  # type: ignore[operator]
+    dv = (f - v / c.alpha) / layer.tau  # type: ignore[operator]
+    dq = ( (1 + beta) * f - q + (1 + 1 / c.alpha) * v ) / layer.tau  # type: ignore[operator]
 
     if layer.drain_from is not None and layer.lambda_d != 0.0:
         delayed = sanitize_state(layer.drain_from.state.as_dict())
@@ -353,8 +351,8 @@ def delay_filter_derivatives(layer: CortexLayer, *, tau_d: float) -> dict[str, T
     v_star = clean["v*"]  # type: ignore[assignment]
     q_star = clean["q*"]  # type: ignore[assignment]
 
-    dv_star = (-v_star + (v - 1.0)) / tau_d  # type: ignore[operator]
-    dq_star = (-q_star + (q - 1.0)) / tau_d  # type: ignore[operator]
+    dv_star = (-v_star + v) / tau_d  # type: ignore[operator]
+    dq_star = (-q_star + q) / tau_d  # type: ignore[operator]
 
     # Cleaner derivative names (avoid '*' in keys)
     return {"dv_star_dt": dv_star, "dq_star_dt": dq_star}
@@ -362,13 +360,9 @@ def delay_filter_derivatives(layer: CortexLayer, *, tau_d: float) -> dict[str, T
 def get_inversion_derivatives(
     layer: CortexLayer, c: HaemodynamicConstants, tau_d: float
 ) -> dict[str, Timecourse]:
-    delayed_derivs = delay_filter_derivatives(layer, tau_d=tau_d)
-    balloon_derivs = balloon_derivatives(layer, c)
+    delayed_derivs = delay_filter_derivatives_linear(layer, tau_d=tau_d)
+    balloon_derivs = balloon_derivatives_linear(layer, c)
     return {**balloon_derivs, **delayed_derivs}
-
-
-
-
 
 
 
@@ -418,7 +412,6 @@ def rk4_step(
             + k4[deriv_keys[k]]
         )
     return out
-
 
 def simulate_cortex(
     layers: list[CortexLayer],
@@ -484,7 +477,7 @@ def simulate_cortex(
                 layer.state.q = ycand["q"]
                 layer.state.v_star = ycand["v*"]
                 layer.state.q_star = ycand["q*"]
-                return delay_filter_derivatives(layer, tau_d=tau_d)
+                return delay_filter_derivatives_linear(layer, tau_d=tau_d)
 
             y_delay_next = rk4_step(
                 y_delay,
@@ -512,7 +505,7 @@ def simulate_cortex(
                 layer.state.f = ycand["f"]
                 layer.state.v = ycand["v"]
                 layer.state.q = ycand["q"]
-                return balloon_derivatives(layer, constants)
+                return balloon_derivatives_linear(layer, constants)
 
             y_next = rk4_step(
                 y,
@@ -559,7 +552,7 @@ def get_bold_from_state(
     q = state["q"]
     v = state["v"]
 
-    bold = V0 * (k1 * (1 - q) + k2 * (1 - q / v) + k3 * (1 - v))
+    bold = V0 * ((k2 - k3) * v + (k2 + k1) * q)
 
     if params is None:
         return bold
@@ -593,4 +586,3 @@ def get_bold_from_state(
             bold = bold + noise_arr
 
     return bold
-

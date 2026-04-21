@@ -1,7 +1,7 @@
 wandb:
   _target_: pytorch_lightning.loggers.wandb.WandbLogger
   entity: ${private.entity}
-  offline: True
+  offline: False
   id: null
   log_model: False
   group: ${network_name}

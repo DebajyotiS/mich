@@ -1,0 +1,222 @@
+seed: null
+project_name: mich-bold-inversion
+network_name: single-layer
+train: true
+ckpt_path: null
+print_config: false
+precision: medium
+compile: false
+resume:
+  state: false
+  ckpt_flag: '*last*'
+private:
+  entity: viktor-skultety-epfl
+  output_dir: /Users/spaceship/work/PINNs/linearised/results
+  data_dir: /Users/spaceship/work/PINNs/linearised/data
+  root_dir: /Users/spaceship/work/PINNs/linearised
+paths:
+  output_dir: /Users/spaceship/work/PINNs/linearised/results
+  data_dir: /Users/spaceship/work/PINNs/linearised/data/simulations.h5
+  root_dir: /Users/spaceship/work/PINNs/linearised
+  full_path: /Users/spaceship/work/PINNs/linearised/results/mich-bold-inversion/single-layer/
+trainer:
+  _target_: pytorch_lightning.Trainer
+  min_epochs: 10
+  max_epochs: 500
+  enable_progress_bar: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+  accelerator: gpu
+  devices: auto
+  strategy: auto
+  gradient_clip_val: 5.0
+  precision: bf16-mixed
+  enable_model_summary: false
+  default_root_dir: /Users/spaceship/work/PINNs/linearised/results/mich-bold-inversion/single-layer/
+model:
+  _target_: src.models.mich.MICH
+  heinzle_net:
+    _target_: src.models.blocks.HeinzleNet
+    layer_mixing_config:
+      L: 3
+      C: 16
+      init_identity: true
+    spatial_encoder_config:
+    - cin: 16
+      cout: 16
+      stride: 1
+      dw_kernel: 3
+      pw_kernel: 1
+      num_groups: 4
+      activation: silu
+    - cin: 16
+      cout: 16
+      stride: 1
+      dw_kernel: 3
+      pw_kernel: 1
+      num_groups: 4
+      activation: silu
+    temporal_mixing_config:
+    - cin: 16
+      kernel_size: 3
+      num_groups: 4
+      activation: silu
+    - cin: 16
+      kernel_size: 3
+      num_groups: 4
+      activation: silu
+    - cin: 16
+      kernel_size: 3
+      num_groups: 4
+      activation: silu
+    - cin: 16
+      kernel_size: 3
+      num_groups: 4
+      activation: silu
+    time_embedding_config:
+      num_freqs: 16
+      max_freq: 500.0
+    time_film_config:
+      embed_dim: 32
+      hidden_dim: 16
+      activation: silu
+      c_dec: 16
+    spatial_decoder_config:
+      cin: 16
+      c_dec: 16
+      out_channels: 21
+      activation: silu
+      L: 3
+  normaliser:
+    _target_: src.models.normaliser.LayerwiseBOLDNormalizer
+    H: 32
+    W: 32
+    eps: 1.0e-06
+    freeze_after_steps: 5000
+  loss_config:
+    lambda_data: 1.0
+    lambda_physics: 1.0
+    lambda_src: 1.0
+    lambda_smooth: 1.0
+    warmup_steps_physics: 10000
+    warmup_steps_smooth: 5000
+    delay_steps_physics: 0
+    delay_steps_smooth: 0
+    n_time: 2000
+    n_space: 400
+    dense_time_frac: 0.8
+    dense_time_lo: 0.05
+    dense_time_hi: 0.55
+    uniform_time_lo: 0.05
+    dense_spatial_frac: 0.8
+    dense_spatial_radius: 5
+    burn_in: 20
+    bold_loss:
+      type: mse
+      lambda_pearson: 1.0
+      huber_delta: 1.0
+    ode_loss:
+      type: mse
+      huber_delta: 1.0
+  haemo:
+    kappa: 0.65
+    gamma: 0.41
+    alpha: 0.32
+    tau: 2.66
+    lambda_d: 0.5
+  acquisition:
+    f0: 28.625
+    E0: 0.34
+    TE: 0.25
+    r0: 340
+    eps: 1.0e-32
+    k1: 10.4624375
+    k2: 2.433125e-32
+    k3: 1.0
+  V0: 0.5
+  psf_fwhm:
+  - 18.0
+  - 27.675
+  - 40.05
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 0.0003
+    weight_decay: 1.0e-05
+  scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    _partial_: true
+    T_max: 312500
+    eta_min: 1.0e-06
+  lightning:
+    interval: step
+    frequency: 1
+    monitor: val/loss/total
+datamodule:
+  _target_: src.data.synthetic.SyntheticDataModule
+  data:
+    path: /Users/spaceship/work/PINNs/linearised/data/simulations.h5
+    layers:
+    - layer_0
+    - layer_1
+    - layer_2
+    dtype: float16
+    return_meta: true
+    return_latents: false
+    val:
+      return_latents: true
+  split:
+    train_frac: 0.6
+    val_frac: 0.1
+    test_frac: 0.3
+    train_count: null
+    val_count: null
+    test_count: null
+    seed: 42
+    shuffle: true
+  loader:
+    batch_size: 2
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    drop_last: true
+  h5_cache:
+    rdcc_nbytes: 268435456
+    rdcc_nslots: 200003
+    rdcc_w0: 0.75
+    swmr: false
+loggers:
+  wandb:
+    _target_: pytorch_lightning.loggers.wandb.WandbLogger
+    entity: viktor-skultety-epfl
+    offline: false
+    id: null
+    log_model: false
+    group: single-layer
+    project: mich-bold-inversion
+    name: 'single-layer: rank 0'
+    save_dir: /Users/spaceship/work/PINNs/linearised/results/mich-bold-inversion/single-layer/
+    resume: false
+callbacks:
+  latest_model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: /Users/spaceship/work/PINNs/linearised/results/mich-bold-inversion/single-layer//checkpoints
+    every_n_train_steps: 25
+    save_on_train_epoch_end: true
+    filename: last
+  best_model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: /Users/spaceship/work/PINNs/linearised/results/mich-bold-inversion/single-layer//checkpoints
+    monitor: val/loss/total
+    mode: min
+    save_weights_only: false
+    save_last: false
+    auto_insert_metric_name: false
+    filename: best
+  lr_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+  model_summary:
+    _target_: pytorch_lightning.callbacks.ModelSummary
+    max_depth: 2
