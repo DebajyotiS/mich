@@ -649,7 +649,7 @@ class MICH(LightningModule):
         )
         if need_grads:
             physics_loss, per_eq_physics = self._physics_loss(
-                z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position, order=order
+                z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position, order=self.hparams.loss_config.order
             )
         else:
             physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=torch.float32)

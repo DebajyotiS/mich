@@ -96,6 +96,7 @@ normaliser:
   neighbourhood_radius: ${model.spatial_radius}
 
 loss_config:
+  order: linear # choose between linear, quadratic, exact
   lambda_data: 100.0
   lambda_physics: 1.0
   warmup_steps_physics: 20000
