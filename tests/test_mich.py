@@ -55,7 +55,9 @@ def _seed():
     torch.manual_seed(0)
 
 
-def _mk_heinzle_configs(*, L: int = 2, Cmix: int = 4, Cenc: int = 6, c_dec: int = 8) -> dict:
+def _mk_heinzle_configs(
+    *, L: int = 2, Cmix: int = 4, Cenc: int = 6, c_dec: int = 8, c_film: int = 4
+) -> dict:
     """Minimal HeinzleNet constructor kwargs, following test_blocks.py conventions."""
     num_freqs = 4
     return dict(
@@ -77,11 +79,12 @@ def _mk_heinzle_configs(*, L: int = 2, Cmix: int = 4, Cenc: int = 6, c_dec: int 
             embed_dim=2 * num_freqs,
             hidden_dim=16,
             activation="silu",
-            c_dec=c_dec,
+            c_dec=c_film,
         ),
         spatial_decoder_config=dict(
             cin=Cenc,
             c_dec=c_dec,
+            c_film=c_film,
             out_channels=7 * L,
             activation="silu",
             L=L,
@@ -300,9 +303,9 @@ class TestMICHLosses:
         (data_loss + physics_loss).backward()
         grads_with_value = [p.grad for p in model.parameters() if p.grad is not None]
         assert len(grads_with_value) > 0, "No parameter received a gradient"
-        assert all(torch.isfinite(g).all() for g in grads_with_value), (
-            "At least one parameter gradient contains NaN or Inf"
-        )
+        assert all(
+            torch.isfinite(g).all() for g in grads_with_value
+        ), "At least one parameter gradient contains NaN or Inf"
 
 
 # -------------------------

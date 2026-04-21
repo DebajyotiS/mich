@@ -5,14 +5,14 @@ data:
   layers: [layer_0, layer_1, layer_2]
   dtype: float16
   return_meta: true
-  return_latents: false
+  return_latents: true
   val:
     return_latents: true
 
 split:
-  train_frac: 0.6
+  train_frac: 0.1
   val_frac: 0.1
-  test_frac: 0.3
+  test_frac: 0.8
   train_count: null
   val_count: null
   test_count: null
@@ -29,6 +29,6 @@ loader:
 
 h5_cache:
   rdcc_nbytes: 268435456   # 256MB per worker
-  rdcc_nslots: 200003     
+  rdcc_nslots: 200003
   rdcc_w0: 0.75
   swmr: false

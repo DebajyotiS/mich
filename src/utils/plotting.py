@@ -4,7 +4,16 @@ import torch
 from matplotlib.figure import Figure
 
 LAYER_NAMES = ["Superficial", "Middle", "Deep"]
-COLOR_HEX = ["#9750a1", "#bb4d3e", "#b94a73", "#6777cf", "#af7f3b", "#67a54f", "#bca73a", "#46c19a"]
+COLOR_HEX = [
+    "#9750a1",
+    "#46c19a",
+    "#bb4d3e",
+    "#b94a73",
+    "#6777cf",
+    "#af7f3b",
+    "#67a54f",
+    "#bca73a",
+]
 SIGNALS_LIST = ["bold", "x", "s", "f", "v", "q", "vstar", "qstar"]
 LATENT_NAMES = ["s", "f", "v", "q", "vstar", "qstar"]
 
@@ -39,6 +48,11 @@ def plot_neural_bold_layers(
     true_neural_np = true_neural.cpu().numpy()
     source_layer = source_layer.cpu().numpy()
     source_pos = source_pos.cpu().numpy()
+
+    bold_min, bold_max = true_bold_np.min(), true_bold_np.max()
+    bold_pad = (bold_max - bold_min) * 0.05
+    neural_min, neural_max = true_neural_np.min(), true_neural_np.max()
+    neural_pad = (neural_max - neural_min) * 0.05
 
     fig, axes = plt.subplots(nrows=n_layers, figsize=(10, 4 * n_layers), constrained_layout=True)
     if n_layers == 1:
@@ -86,9 +100,8 @@ def plot_neural_bold_layers(
         ax_bold.set_xlabel("Time (s)", fontfamily="monospace")
         ax_bold.set_ylabel("BOLD Signal", fontfamily="monospace")
         ax_neural.set_ylabel("Neural Activity", fontfamily="monospace")
-        ax_neural.set_ylim(
-            -0.001,
-        )
+        ax_bold.set_ylim(bold_min - bold_pad, bold_max + bold_pad)
+        ax_neural.set_ylim(neural_min - neural_pad, neural_max + neural_pad)
 
         ax_bold.legend(loc="upper left", frameon=False)
         ax_neural.legend(loc="upper right", frameon=False)
@@ -145,6 +158,12 @@ def plot_latent_layers(
     pred_times = np.linspace(0, total_duration, pred_signals[0].shape[-1])
     true_times = np.linspace(0, total_duration, true_signals[0].shape[-1])
 
+    sig_ylims = []
+    for true_arr in true_signals:
+        lo, hi = true_arr.min(), true_arr.max()
+        pad = (hi - lo) * 0.05
+        sig_ylims.append((lo - pad, hi + pad))
+
     fig, axes = plt.subplots(
         nrows=n_layers,
         ncols=n_signals,
@@ -171,6 +190,7 @@ def plot_latent_layers(
                 label="Pred",
             )
             ax.legend(loc="upper right", frameon=False, fontsize=7)
+            ax.set_ylim(*sig_ylims[col])
 
             # column header on top row only
             if row == 0:

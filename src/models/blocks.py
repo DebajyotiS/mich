@@ -113,7 +113,7 @@ class MaskedLayerMixing(nn.Module):
 
         self.W = nn.Parameter(torch.zeros((self.L, self.L, 1, 1)))  # fp32 params
         self.b = nn.Parameter(torch.zeros((self.L,)))  # fp32 params
-        self.expand_net = nn.Conv2d(self.L, self.C, kernel_size=1, bias=True)
+        self.expand_net = nn.Conv2d(1, self.C, kernel_size=1, bias=True)
 
         if init_identity:
             with torch.no_grad():
@@ -138,10 +138,13 @@ class MaskedLayerMixing(nn.Module):
 
         # No dtype casting. Autocast will handle mixed precision safely.
         W_eff = self.W * self.mask
-        y = F.conv2d(x2d, W_eff, bias=self.b)
-        y = self.expand_net(y)
-        y = y.view(B, T, self.C, H, W)
-        return y
+        y = F.conv2d(x2d, W_eff, bias=self.b)  # [B*T, L, H, W]
+
+        # Apply expand_net independently per layer: treat B*T*L as batch with cin=1
+        y_btl = y.reshape(B * T * L, 1, H, W)
+        y_exp = self.expand_net(y_btl)  # [B*T*L, C, H, W]
+        y_exp = y_exp.view(B, T, L, self.C, H, W)
+        return y_exp
 
 
 class DepthWiseSeparableConvLayer(nn.Module):
@@ -191,12 +194,12 @@ class SpatialEncoder(nn.Module):
             self.module.append(DepthWiseSeparableConvLayer(**config))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C, H, W = x.shape
-        x = x.reshape(B * T, C, H, W)  # [B*T, C, H, W]
+        B, T, L, C, H, W = x.shape
+        x = x.reshape(B * T * L, C, H, W)  # [B*T*L, C, H, W]
         for layer in self.module:
             x = checkpoint(layer, x, use_reentrant=False).to(x.dtype)
         _, C_out, H_out, W_out = x.shape
-        x = x.view(B, T, C_out, H_out, W_out)  # [B, T, C', H, W]
+        x = x.view(B, T, L, C_out, H_out, W_out)  # [B, T, L, C', H, W]
         return x
 
 
@@ -253,11 +256,11 @@ class TemporalMixingEncoder(nn.Module):
             self.module.append(TemporalDepthWiseTCNLayer(**config))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C, H, W = x.shape
-        x = x.permute(0, 3, 4, 2, 1).reshape(B * H * W, C, T)  # [B*H*W, C, T]
+        B, T, L, C, H, W = x.shape
+        x = x.permute(0, 2, 4, 5, 3, 1).reshape(B * L * H * W, C, T)  # [B*L*H*W, C, T]
         for layer in self.module:
             x = checkpoint(layer, x, use_reentrant=False).to(x.dtype)
-        x = x.reshape(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
+        x = x.reshape(B, L, H, W, C, T).permute(0, 5, 1, 4, 2, 3).contiguous()  # [B, T, L, C, H, W]
         return x
 
 
@@ -338,8 +341,13 @@ class SpatioTemporalDecoder(nn.Module):
     Spatial decoder with time-conditioned FiLM, optional per-pixel time
     derivatives, and per-channel output activations for Heinzle model states.
 
+    FiLM is conditioned jointly on time, cortical layer, and signal identity,
+    operating in a thin c_film-dimensional bottleneck projected from c_dec.
+    This gives each of the 7 Heinzle signals its own dedicated temporal dynamics
+    while keeping the total FiLM parameter budget comparable to the shared case.
+
     Inputs:
-        x : [B, T, C_in, H, W]
+        x : [B, T, L, C_in, H, W]
         t : [B, T]
 
     Outputs (via SpatialDecoderManifest):
@@ -360,7 +368,9 @@ class SpatioTemporalDecoder(nn.Module):
         temporal_film_config: Mapping[str, Any],
         temporal_embedding_config: Mapping[str, Any],
         *,
+        c_film: int,
         layer_embed_dim: int = 16,
+        signal_embed_dim: int = 8,
         upsample: bool = False,
         channel_activations: list[ChannelActivation] | None = HEINZLE_ACTIVATIONS_ORDERED,
     ):
@@ -374,23 +384,44 @@ class SpatioTemporalDecoder(nn.Module):
 
         self.L = L
         self.layer_embed_dim = layer_embed_dim
+        self.signal_embed_dim = signal_embed_dim
+        self.c_film = c_film
         self.upsample = upsample
         self.channel_activations = channel_activations  # None means identity everywhere
 
+        # Shared spatial encoder: cin -> c_dec
         self.conv = DepthWiseSeparableConvLayer(
             cin=cin, cout=c_dec, activation=activation, stride=1
         )
-        self.out = nn.Conv2d(c_dec, 7, kernel_size=1)
+        # Bottleneck projection: c_dec -> c_film (shared across signals)
+        self.signal_proj = nn.Conv2d(c_dec, c_film, kernel_size=1, bias=False)
+        # Per-(signal, layer) output heads: 7 * L independent Conv2d(c_film -> 1)
+        # Indexed as head_idx = sig_idx * L + layer_idx
+        self.out_heads = nn.ModuleList(
+            [nn.Conv2d(c_film, 1, kernel_size=1, bias=True) for _ in range(HEINZLE_N_SIGNALS * L)]
+        )
+        with torch.no_grad():
+            for sig_idx in range(HEINZLE_N_SIGNALS):
+                for layer_idx in range(L):
+                    head = self.out_heads[sig_idx * L + layer_idx]
+                    nn.init.zeros_(head.bias)
+                    nn.init.zeros_(head.weight)
+        if channel_activations is not None:
+            with torch.no_grad():
+                for layer_idx in range(L):
+                    self.out_heads[HEINZLE_SIGNAL_IDX["x"] * L + layer_idx].bias.fill_(-3.0)
+                    for sig in ("f", "v", "q"):
+                        self.out_heads[HEINZLE_SIGNAL_IDX[sig] * L + layer_idx].bias.fill_(0.5413)
+
         self.time_embedding = FourierTimeEmbedding(**temporal_embedding_config)
         self.layer_embed = nn.Embedding(L, layer_embed_dim)
+        self.signal_embed = nn.Embedding(HEINZLE_N_SIGNALS, signal_embed_dim)
 
         num_freqs = temporal_embedding_config["num_freqs"]
         film_config = dict(temporal_film_config)
-        film_config["embed_dim"] = 2 * num_freqs + layer_embed_dim
+        film_config["embed_dim"] = 2 * num_freqs + layer_embed_dim + signal_embed_dim
+        film_config["c_dec"] = c_film  # FiLM outputs c_film-dim gamma, beta per signal
         self.time_film = TimeFiLM(**film_config)
-
-        if self.channel_activations is not None:
-            _init_heinzle_output_bias(self.out, self.L)
 
     def forward(
         self,
@@ -399,94 +430,112 @@ class SpatioTemporalDecoder(nn.Module):
         *,
         return_gradients: bool = False,
     ) -> SpatialDecoderManifest:
-        u, (B, T, H, W) = self._pre_film_features(x)
+        u, (B, T, L, H, W) = self._pre_film_features(x)
         gamma, beta = self._gamma_beta(t)
 
-        z_pre = self._decode_from_film(u, gamma, beta, B, T, H, W)  # pre-activation
+        z_pre = self._decode_from_film(u, gamma, beta, B, T, L, H, W)  # pre-activation
         z_hat = self._apply_activations(z_pre)  # post-activation
 
         if not return_gradients:
             return SpatialDecoderManifest(z_hat=z_hat)
 
         dgamma_dt, dbeta_dt = self._gamma_beta_time_grads(t)
-        dz_pre_dt = self._decode_dt_from_film(u, dgamma_dt, dbeta_dt, B, T, H, W)
+        dz_pre_dt = self._decode_dt_from_film(u, dgamma_dt, dbeta_dt, B, T, L, H, W)
 
         # Chain rule: d/dt act(z) = act'(z) * dz/dt
         dz_hat_dt = self._apply_activation_derivatives(z_pre, dz_pre_dt)
 
         return SpatialDecoderManifest(z_hat=z_hat, grads=dz_hat_dt)
 
-    def _pre_film_features(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
-        """[B, T, C, H, W] -> u: [B, T, c_dec, H, W]"""
-        B, T, C, H, W = x.shape
-        x_bt = x.reshape(B * T, C, H, W)
+    def _pre_film_features(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[int, int, int, int, int]]:
+        """[B, T, L, C, H, W] -> u: [B, T, L, c_dec, H, W]"""
+        B, T, L, C, H, W = x.shape
+        x_btl = x.reshape(B * T * L, C, H, W)
 
         if self.upsample:
-            x_bt = F.interpolate(x_bt, scale_factor=2, mode="bilinear", align_corners=False)
-            _, _, H, W = x_bt.shape  # update H, W after upsample
+            x_btl = F.interpolate(x_btl, scale_factor=2, mode="bilinear", align_corners=False)
+            _, _, H, W = x_btl.shape  # update H, W after upsample
 
-        u_bt = self.conv(x_bt)  # [BT, c_dec, H, W]
-        c_dec = u_bt.shape[1]
-        u = u_bt.view(B, T, c_dec, H, W)
-        return u, (B, T, H, W)
+        u_btl = checkpoint(self.conv, x_btl, use_reentrant=False).to(
+            x_btl.dtype
+        )  # [B*T*L, c_dec, H, W]
+        c_dec = u_btl.shape[1]
+        u = u_btl.view(B, T, L, c_dec, H, W)
+        return u, (B, T, L, H, W)
 
     def _gamma_beta(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """t: [B, T] -> gamma, beta: [B, T, L, c_dec]"""
+        """t: [B, T] -> gamma, beta: [B, T, L, 7, c_film]"""
         B, T = t.shape
-        L = self.L
+        L, N_SIG = self.L, HEINZLE_N_SIGNALS
         time_emb = self.time_embedding(t)  # [B, T, 2F]
 
         layer_ids = torch.arange(L, device=t.device)
         layer_toks = self.layer_embed(layer_ids)  # [L, layer_embed_dim]
 
-        time_emb_exp = time_emb.unsqueeze(2).expand(B, T, L, -1)  # [B, T, L, 2F]
-        layer_toks_exp = layer_toks[None, None, :, :].expand(
-            B, T, L, -1
-        )  # [B, T, L, layer_embed_dim]
-        film_input = torch.cat(
-            [time_emb_exp, layer_toks_exp], dim=-1
-        )  # [B, T, L, 2F+layer_embed_dim]
-        film_input_flat = film_input.reshape(B * T * L, -1)
+        sig_ids = torch.arange(N_SIG, device=t.device)
+        sig_toks = self.signal_embed(sig_ids)  # [7, signal_embed_dim]
 
-        gamma_flat, beta_flat = self.time_film(film_input_flat)  # [B*T*L, c_dec]
-        c_dec = gamma_flat.shape[-1]
-        gamma = gamma_flat.view(B, T, L, c_dec)
-        beta = beta_flat.view(B, T, L, c_dec)
+        # Expand all to [B, T, L, 7, *] then concatenate
+        time_emb_exp = time_emb[:, :, None, None, :].expand(B, T, L, N_SIG, -1)
+        layer_toks_exp = layer_toks[None, None, :, None, :].expand(B, T, L, N_SIG, -1)
+        sig_toks_exp = sig_toks[None, None, None, :, :].expand(B, T, L, N_SIG, -1)
+        film_input = torch.cat(
+            [time_emb_exp, layer_toks_exp, sig_toks_exp], dim=-1
+        )  # [B, T, L, 7, 2F+layer_embed_dim+signal_embed_dim]
+
+        gamma_flat, beta_flat = self.time_film(film_input.reshape(B * T * L * N_SIG, -1))
+        c_film = gamma_flat.shape[-1]
+        gamma = gamma_flat.view(B, T, L, N_SIG, c_film)
+        beta = beta_flat.view(B, T, L, N_SIG, c_film)
         return gamma, beta
 
     def _gamma_beta_time_grads(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Analytic d(gamma)/dt and d(beta)/dt via vmap + jacrev over scalar t.
         Runs L separate vmap(jacrev(...)) calls to avoid tracing through nn.Embedding.
-        Returns: dgamma_dt, dbeta_dt -- each [B, T, L, c_dec]
+        Each call returns gradients for all 7 signals simultaneously.
+        Returns: dgamma_dt, dbeta_dt -- each [B, T, L, 7, c_film]
         """
         B, T = t.shape
-        L = self.L
+        L, N_SIG = self.L, HEINZLE_N_SIGNALS
         t_flat = t.reshape(-1)  # [BT]
 
         layer_ids = torch.arange(L, device=t.device)
         layer_toks = self.layer_embed(layer_ids)  # [L, layer_embed_dim] -- constant w.r.t. t
 
+        sig_ids = torch.arange(N_SIG, device=t.device)
+        sig_toks = self.signal_embed(sig_ids)  # [7, signal_embed_dim] -- constant w.r.t. t
+
         all_dgamma = []
         all_dbeta = []
         for l_idx in range(L):
-            tok = layer_toks[l_idx]  # [layer_embed_dim]
+            tok_l = layer_toks[l_idx]  # [layer_embed_dim]
 
-            def _gb_from_scalar(ts: torch.Tensor, _tok: torch.Tensor = tok) -> torch.Tensor:
-                """ts: scalar -> [2, c_dec] = [gamma; beta]"""
+            def _gb_from_scalar(
+                ts: torch.Tensor,
+                _tok_l: torch.Tensor = tok_l,
+                _sig_toks: torch.Tensor = sig_toks,
+            ) -> torch.Tensor:
+                """ts: scalar -> [7, 2, c_film] = [gamma, beta] for all signals"""
                 emb = self.time_embedding(ts)  # [2F]
-                film_in = torch.cat([emb, _tok.to(emb.dtype)], dim=-1)  # [2F+layer_embed_dim]
-                g, b = self.time_film(film_in)
-                return torch.stack([g, b], dim=0)  # [2, c_dec]
+                emb_exp = emb.unsqueeze(0).expand(N_SIG, -1)  # [7, 2F]
+                tok_l_exp = _tok_l.unsqueeze(0).expand(N_SIG, -1).to(emb.dtype)
+                film_in = torch.cat(
+                    [emb_exp, tok_l_exp, _sig_toks.to(emb.dtype)], dim=-1
+                )  # [7, 2F+layer_embed_dim+signal_embed_dim]
+                g, b = self.time_film(film_in)  # [7, c_film]
+                return torch.stack([g, b], dim=1)  # [7, 2, c_film]
 
-            grads_flat = vmap(jacrev(_gb_from_scalar))(t_flat)  # [BT, 2, c_dec]
-            c_dec = grads_flat.shape[-1]
-            grads = grads_flat.view(B, T, 2, c_dec)
-            all_dgamma.append(grads[:, :, 0, :])  # [B, T, c_dec]
-            all_dbeta.append(grads[:, :, 1, :])  # [B, T, c_dec]
+            grads_flat = vmap(jacrev(_gb_from_scalar))(t_flat)  # [BT, 7, 2, c_film]
+            c_film = grads_flat.shape[-1]
+            grads = grads_flat.view(B, T, N_SIG, 2, c_film)
+            all_dgamma.append(grads[:, :, :, 0, :])  # [B, T, 7, c_film]
+            all_dbeta.append(grads[:, :, :, 1, :])  # [B, T, 7, c_film]
 
-        dgamma_dt = torch.stack(all_dgamma, dim=2)  # [B, T, L, c_dec]
-        dbeta_dt = torch.stack(all_dbeta, dim=2)  # [B, T, L, c_dec]
+        dgamma_dt = torch.stack(all_dgamma, dim=2)  # [B, T, L, 7, c_film]
+        dbeta_dt = torch.stack(all_dbeta, dim=2)  # [B, T, L, 7, c_film]
         return dgamma_dt, dbeta_dt
 
     def _decode_from_film(
@@ -496,42 +545,62 @@ class SpatioTemporalDecoder(nn.Module):
         beta: torch.Tensor,
         B: int,
         T: int,
+        L: int,
         H: int,
         W: int,
     ) -> torch.Tensor:
-        """FiLM -> 1x1 conv -> [B, 7, L, T, H, W]  (pre-activation)"""
-        L = self.L
-        c_dec = u.shape[2]
+        """Project -> per-signal FiLM -> per-(signal,layer) head -> [B, 7, L, T, H, W]  (pre-activation)"""
+        # Project shared spatial features to FiLM bottleneck: c_dec -> c_film
+        u_film = checkpoint(
+            self.signal_proj, u.reshape(B * T * L, -1, H, W), use_reentrant=False
+        ).to(u.dtype)  # [B*T*L, c_film, H, W]
+        c_film = u_film.shape[1]
+        u_film = u_film.view(B, T, L, c_film, H, W)
 
-        # u: [B, T, c_dec, H, W] -> [B, T, L, c_dec, H, W]
-        u_exp = u.unsqueeze(2).expand(B, T, L, c_dec, H, W)
-        g = gamma[..., None, None]  # [B, T, L, c_dec, 1, 1]
-        b = beta[..., None, None]  # [B, T, L, c_dec, 1, 1]
-        y = g * u_exp + b  # [B, T, L, c_dec, H, W]
+        # Per-signal FiLM: process one signal at a time to avoid [B, T, L, 7, c_film, H, W]
+        out_parts = []
+        for sig_idx in range(HEINZLE_N_SIGNALS):
+            g_sig = gamma[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
+            b_sig = beta[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
+            y_sig = g_sig * u_film + b_sig  # [B, T, L, c_film, H, W]
+            layer_parts = []
+            for layer_idx in range(L):
+                head = self.out_heads[sig_idx * L + layer_idx]
+                y_sl = y_sig[:, :, layer_idx].reshape(B * T, self.c_film, H, W)
+                out_sl = head(y_sl)  # [B*T, 1, H, W]
+                layer_parts.append(out_sl.view(B, T, 1, 1, H, W))
+            out_parts.append(torch.cat(layer_parts, dim=2))  # [B, T, L, 1, H, W]
+        out = torch.cat(out_parts, dim=3)  # [B, T, L, 7, H, W]
+        return out.permute(0, 3, 2, 1, 4, 5).contiguous()  # [B, 7, L, T, H, W]
 
-        y_btl = y.reshape(B * T * L, c_dec, H, W)
-        out_btl = self.out(y_btl)  # [B*T*L, 7, H, W]
-        return out_btl.view(B, T, L, 7, H, W).permute(0, 3, 2, 1, 4, 5).contiguous()
+    def _decode_dt_from_film(self, u, dgamma_dt, dbeta_dt, B, T, L, H, W):
+        # Same spatial projection as forward pass (u is constant w.r.t. t)
+        u_film = self.signal_proj(u.reshape(B * T * L, -1, H, W))  # [B*T*L, c_film, H, W]
+        c_film = u_film.shape[1]
+        u_film = u_film.view(B, T, L, c_film, H, W)
 
-    def _decode_dt_from_film(self, u, dgamma_dt, dbeta_dt, B, T, H, W):
-        L = self.L
-        c_dec = u.shape[2]
-
-        u_exp = u.unsqueeze(2).expand(B, T, L, c_dec, H, W)
-        g = dgamma_dt[..., None, None]  # [B, T, L, c_dec, 1, 1]
-        b = dbeta_dt[..., None, None]  # [B, T, L, c_dec, 1, 1]
-        dy = g * u_exp + b  # [B, T, L, c_dec, H, W]
-
-        dy_btl = dy.reshape(B * T * L, c_dec, H, W)
-        # Apply conv weights only -- no bias for derivative
-        dout_btl = F.conv2d(
-            dy_btl,
-            self.out.weight,
-            bias=None,
-            stride=self.out.stride,
-            padding=self.out.padding,
-        )  # [B*T*L, 7, H, W]
-        return dout_btl.view(B, T, L, 7, H, W).permute(0, 3, 2, 1, 4, 5).contiguous()
+        # Apply conv weights only -- bias terms are constant so their derivative is zero
+        # Process one signal at a time to avoid materialising [B, T, L, 7, c_film, H, W]
+        dout_parts = []
+        for sig_idx in range(HEINZLE_N_SIGNALS):
+            g_sig = dgamma_dt[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
+            b_sig = dbeta_dt[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
+            dy_sig = g_sig * u_film + b_sig  # [B, T, L, c_film, H, W]
+            layer_parts = []
+            for layer_idx in range(L):
+                head = self.out_heads[sig_idx * L + layer_idx]
+                dy_sl = dy_sig[:, :, layer_idx].reshape(B * T, self.c_film, H, W)
+                dout_sl = F.conv2d(
+                    dy_sl,
+                    head.weight,
+                    bias=None,
+                    stride=head.stride,
+                    padding=head.padding,
+                )  # [B*T, 1, H, W]
+                layer_parts.append(dout_sl.view(B, T, 1, 1, H, W))
+            dout_parts.append(torch.cat(layer_parts, dim=2))  # [B, T, L, 1, H, W]
+        dout = torch.cat(dout_parts, dim=3)  # [B, T, L, 7, H, W]
+        return dout.permute(0, 3, 2, 1, 4, 5).contiguous()  # [B, 7, L, T, H, W]
 
     def _apply_activations(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -589,9 +658,9 @@ class HeinzleNet(nn.Module):
     def forward(
         self, x: torch.Tensor, t: torch.Tensor, return_gradients: bool = False
     ) -> SpatialDecoderManifest:
-        xmix = self.layer_mixing(x)  # [B, T, C, H, W]
-        xenc = self.spatial_encoder(xmix)  # [B, T, C', H, W]
-        xmix = self.temporal_mixing(xenc)  # [B, T, C', H, W]
+        xmix = self.layer_mixing(x)  # [B, T, L, C, H, W]
+        xenc = self.spatial_encoder(xmix)  # [B, T, L, C', H, W]
+        xmix = self.temporal_mixing(xenc)  # [B, T, L, C', H, W]
         z_hat = self.spatial_decoder(
             xmix, t, return_gradients=return_gradients
         )  # [B, 7, L, T, H, W]

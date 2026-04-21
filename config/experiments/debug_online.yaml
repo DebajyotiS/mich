@@ -1,0 +1,54 @@
+# @package _global_
+# Online debugging run — moderate model, multi-GPU, wandb synced.
+# Keeps physics loss active but with a short warmup so training signal arrives fast.
+# Usage: python scripts/train_mich.py experiment=debug_online trainer.devices=2
+
+defaults:
+  - override /model: longfreq
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+project_name: mich-debug
+network_name: debug-online
+
+# ── Trainer ───────────────────────────────────────────────────────────────────
+trainer:
+  devices: 1              # override on CLI: trainer.devices=N
+  strategy: auto
+  max_epochs: 10
+  log_every_n_steps: 10
+  num_sanity_val_steps: 2
+
+# ── Model dims (medium — same as longfreq defaults) ───────────────────────────
+# No overrides; uses longfreq as-is. Add overrides here when testing dim changes.
+
+# ── Loss — all terms on, but short warmups ────────────────────────────────────
+model:
+  loss_config:
+    lambda_data: 10.0
+    lambda_physics: 1.0
+    lambda_src: 10.0
+    lambda_smooth: 0.0
+    lambda_supervision: 1.0
+    warmup_steps_physics: 500    # short so physics kicks in quickly
+    delay_steps_physics: 100
+    warmup_steps_smooth: 0
+    delay_steps_smooth: 0
+    warmup_steps_supervision: 0
+    delay_steps_supervision: 0
+    n_time: 80
+    n_space: 450
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+datamodule:
+  loader:
+    batch_size: 2
+    num_workers: 4
+  split:
+    train_count: 32       # small but enough to expose distributed issues
+    val_count: 8
+    test_count: null
+
+# ── Logging — wandb online ─────────────────────────────────────────────────────
+loggers:
+  wandb:
+    offline: False

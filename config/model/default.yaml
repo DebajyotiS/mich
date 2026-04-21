@@ -3,11 +3,13 @@ _target_: src.models.mich.MICH
 # -- Free scalars --------------------------------------------------------------
 # Constraints on derived values are annotated inline with "# = <expression>".
 #
-#   L         number of cortical input layers
-#   C         MaskedLayerMixing output channels -> first spatial encoder cin
-#   c_enc     final spatial encoder output channels -> all temporal cin + decoder cin
-#   c_dec     decoder feature channels -> time_film_config.c_dec must equal this
-#   num_freqs Fourier frequencies -> time_film_config.embed_dim = 2 * num_freqs
+#   L              number of cortical input layers
+#   C              MaskedLayerMixing output channels -> first spatial encoder cin
+#   c_enc          final spatial encoder output channels -> all temporal cin + decoder cin
+#   c_dec          decoder feature channels (spatial encoder output width)
+#   c_film         FiLM bottleneck width per signal (set ~c_dec/7 for budget-neutral)
+#   signal_embed_dim  learnable embedding dim per Heinzle signal (fed into FiLM)
+#   num_freqs      Fourier frequencies -> embed_dim auto-computed in SpatioTemporalDecoder
 # -----------------------------------------------------------------------------
 
 heinzle_net:
@@ -60,15 +62,17 @@ heinzle_net:
     max_freq: 500.0
 
   time_film_config:
-    embed_dim: 32       # = 2 * num_freqs
+    embed_dim: 32       # overridden in SpatioTemporalDecoder.__init__; kept for reference
     hidden_dim: 16
     activation: silu
-    c_dec: 16           #  c_dec; must equal spatial_decoder_config.c_dec
+    c_dec: 4            # overridden to c_film in SpatioTemporalDecoder.__init__
 
   spatial_decoder_config:
     cin: 16             # = c_enc
-    c_dec: 16           # c_dec; must equal time_film_config.c_dec
-    out_channels: 21    # = 7 * L  (hardcoded reshape in SpatialDecoder.forward:255)
+    c_dec: 16           # spatial feature width (encoder output)
+    c_film: 4           # FiLM bottleneck per signal (~c_dec / 7, rounded up)
+    signal_embed_dim: 8
+    out_channels: 21    # = 7 * L  (kept for compatibility)
     activation: silu
     L: 3                # = L
 
@@ -96,6 +100,12 @@ loss_config:
   dense_spatial_frac: 0.8
   dense_spatial_radius: 5
   burn_in: 20
+  lambda_supervision: 1.0
+  warmup_steps_supervision: 0
+  delay_steps_supervision: 0
+  supervision_loss:
+    type: "mse"
+    huber_delta: 1.0
   bold_loss:
     type: "mse"
     lambda_pearson: 1.0
@@ -118,7 +128,7 @@ acquisition:
   r0: 340           # Intravascular relaxation rate (Hz)
   eps: 1.0e-32
   k1: 10.4624375
-  k2: 2.433125e-32
+  k2: 2.89e-31
   k3: 1.0
 
 V0: 0.5
