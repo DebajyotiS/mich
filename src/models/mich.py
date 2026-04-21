@@ -71,11 +71,12 @@ class MICH(LightningModule):
         psf_fwhm = getattr(self.hparams, "psf_fwhm", None)
         if psf_fwhm is not None:
             self._psf = [PointSpreadFunction(fwhm=f) for f in psf_fwhm]
-            for i, psf in enumerate(self._psf):
-                self.register_buffer(
-                    f"_psf_kernel_{i}",
-                    torch.as_tensor(psf.kernel_2d(), dtype=torch.float32),
-                )
+            for i, (fwhm, psf) in enumerate(zip(psf_fwhm, self._psf)):
+                if fwhm is not None and fwhm > 0:
+                    kernel = torch.as_tensor(psf.kernel_2d(), dtype=torch.float32)
+                else:
+                    kernel = torch.tensor([[1.0]], dtype=torch.float32)
+                self.register_buffer(f"_psf_kernel_{i}", kernel)
         else:
             self._psf = None
 
