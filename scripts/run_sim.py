@@ -62,6 +62,7 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
     time_duration: int = sc["time_duration"]
     max_pulses: int = sc["max_pulses"]
     steps: int = int(time_duration / dt)
+    order: str = sc["order"]
 
     layers_cfg: list[dict] = sc["layers"]
     if len(layers_cfg) != num_layers:
@@ -160,6 +161,7 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
         x_inputs=x_inputs_haemo,  # type: ignore
         dt=haemo_dt,
         tau_d=sc["tau_d"],
+        order=order
     )
 
     # Downsample haemodynamic outputs back to neural dt resolution for storage

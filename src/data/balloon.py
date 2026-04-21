@@ -313,7 +313,7 @@ def sanitize_state(
     return out
 
 
-def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants) -> dict[str, Timecourse]:
+def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants, order: str) -> dict[str, Timecourse]:
     clean = sanitize_state(layer.state.as_dict())
     x = clean["x"]  # type: ignore[assignment]
     s = clean["s"]  # type: ignore[assignment]
@@ -324,11 +324,42 @@ def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants) -> dict[st
     ds = x - c.kappa * s - c.gamma * (f - 1.0)  # type: ignore[operator]
     df = s  # type: ignore[assignment]
 
-    outflow = v ** (1.0 / c.alpha)  # type: ignore[operator]
-    dv = (f - outflow) / layer.tau  # type: ignore[operator]
+    if order == "exact":
+        outflow = v ** (1.0 / c.alpha)  # type: ignore[operator]
+        extraction = (1.0 - (1.0 - c.E0) ** (1.0 / f)) / c.E0  # type: ignore[operator]
 
-    extraction = (1.0 - (1.0 - c.E0) ** (1.0 / f)) / c.E0  # type: ignore[operator]
-    dq = (f * extraction - outflow * (q / v)) / layer.tau  # type: ignore[operator]
+        dv = (f - outflow) / layer.tau  # type: ignore[operator]
+        dq = (f * extraction - outflow * (q / v)) / layer.tau  # type: ignore[operator]
+
+    elif order == "linear":
+        v -= 1
+        f -= 1
+        q -= 1
+        beta = (1 - c.E0) * np.log(1 - c.E0) / c.E0 
+        dv = (f - v / c.alpha) / layer.tau  
+        dq = ( (1 + beta) * f - q - (1/c.alpha - 1) * v ) / layer.tau 
+        v += 1
+        f += 1
+        q += 1
+
+    elif order == "quadratic":
+        v -= 1
+        f -= 1
+        q -= 1
+        beta = (1 - c.E0) * np.log(1 - c.E0) / c.E0
+        gamma = beta * np.log(1 - c.E0) / 2
+        dv = (f - v / c.alpha - (1 - c.alpha) / (2 * c.alpha**2) * v**2) / layer.tau
+        dq = ((1 + beta) * f - q - (1/c.alpha - 1) * v
+            - gamma * f**2
+            - (1/c.alpha - 1) * v * q
+            - (1/2) * (1/c.alpha - 1) * (1/c.alpha - 2) * v**2) / layer.tau        
+        v += 1
+        f += 1
+        q += 1
+
+    else:
+        raise ValueError(f"Unknown order: '{order}'. Implemented 'exact', 'linear', or 'quadratic'.")
+
 
     if layer.drain_from is not None and layer.lambda_d != 0.0:
         delayed = sanitize_state(layer.drain_from.state.as_dict())
@@ -360,10 +391,10 @@ def delay_filter_derivatives(layer: CortexLayer, *, tau_d: float) -> dict[str, T
     return {"dv_star_dt": dv_star, "dq_star_dt": dq_star}
 
 def get_inversion_derivatives(
-    layer: CortexLayer, c: HaemodynamicConstants, tau_d: float
+    layer: CortexLayer, c: HaemodynamicConstants, tau_d: float, order: str
 ) -> dict[str, Timecourse]:
     delayed_derivs = delay_filter_derivatives(layer, tau_d=tau_d)
-    balloon_derivs = balloon_derivatives(layer, c)
+    balloon_derivs = balloon_derivatives(layer, c, order)
     return {**balloon_derivs, **delayed_derivs}
 
 
@@ -426,7 +457,8 @@ def simulate_cortex(
     x_inputs: list[Timecourse],
     *,
     dt: float,
-    tau_d: float,
+    tau_d: float, 
+    order: str,
 ) -> dict[int, dict[str, Timecourse]]:
     if len(layers) != len(x_inputs):
         raise ValueError(f"len(layers)={len(layers)} must match len(x_inputs)={len(x_inputs)}")
@@ -512,7 +544,7 @@ def simulate_cortex(
                 layer.state.f = ycand["f"]
                 layer.state.v = ycand["v"]
                 layer.state.q = ycand["q"]
-                return balloon_derivatives(layer, constants)
+                return balloon_derivatives(layer, constants, order)
 
             y_next = rk4_step(
                 y,
@@ -593,4 +625,6 @@ def get_bold_from_state(
             bold = bold + noise_arr
 
     return bold
+
+
 

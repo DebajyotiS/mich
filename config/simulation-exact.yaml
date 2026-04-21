@@ -4,7 +4,7 @@
 
 num_simulations: 100
 seed: 42
-output_path: data/simulations.h5
+output_path: data/simulations-exact.h5
 
 # -- Haemodynamic constants ----------------------
 haemodynamic:
@@ -37,6 +37,7 @@ simulation:
   diffusion_coefficient_inter: 0.0
   decay_rate: 1.0      # s-1, neural decay timescale (L = sqrt(D/k) ~ 5 voxels)
   tau_d: 1.0
+  order: "exact"
 
   # One entry per layer, bottom (deep) to top (superficial).
   # layer[i>0] drains from layer[i-1].
