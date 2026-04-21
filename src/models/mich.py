@@ -665,10 +665,11 @@ class MICH(LightningModule):
                 getattr(lc, "warmup_steps_supervision", 0),
                 getattr(lc, "delay_steps_supervision", 0),
             )
-            supervision_loss, per_sig_supervision = self._source_supervision_loss(
-                z_hat, batch, source_position
-            )
-            total_loss = total_loss + lambda_supervision_eff * supervision_loss
+            if lambda_supervision_eff > 0:
+                supervision_loss, per_sig_supervision = self._source_supervision_loss(
+                    z_hat, batch, source_position
+                )
+                total_loss = total_loss + lambda_supervision_eff * supervision_loss
 
         # --- Lightning logger (progress bar + val checkpointing) ---
         # Train: logger=False —> W&B sink is direct run.log() below.
