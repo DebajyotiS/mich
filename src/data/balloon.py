@@ -76,6 +76,8 @@ class PointSpreadFunction:
 
     def kernel_2d(self) -> np.ndarray:
         """2-D separable Gaussian kernel as a (1, 1, k, k) float32 numpy array."""
+        if self.fwhm <= 0.0:
+            return np.array([[[[1.0]]]], dtype=np.float32)
         k1d = _gaussian_kernel_1d(self.sigma)
         k2d = (k1d[:, None] * k1d[None, :]).astype(np.float32)
         return k2d[np.newaxis, np.newaxis]  # (1, 1, k, k)
