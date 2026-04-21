@@ -86,15 +86,10 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    import os
-    import subprocess
-    import torch
-
     os.environ["HYDRA_FULL_ERROR"] = "1"
 
     if torch.backends.mps.is_available():
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-        device = "mps"
         print("Using Apple Metal GPU (mps)")
 
     elif torch.cuda.is_available():
@@ -107,19 +102,22 @@ if __name__ == "__main__":
                 text=True,
             )
             if result.returncode == 0:
-                rows = [line.split(",") for line in result.stdout.strip().split("\n") if line.strip()]
+                rows = [
+                    line.split(",")
+                    for line in result.stdout.strip().split("\n")
+                    if line.strip()
+                ]
                 best = min(rows, key=lambda r: int(r[1]))
-                os.environ["CUDA_VISIBLE_DEVICES"] = best[0].strip()
-                print(f"Auto-selected GPU {best[0].strip()}")
+                selected = best[0].strip()
+                os.environ["CUDA_VISIBLE_DEVICES"] = selected
+                print(f"Auto-selected GPU {selected}")
             else:
                 log.warning("nvidia-smi failed, not setting CUDA_VISIBLE_DEVICES")
 
-        device = "cuda"
         print("Using CUDA GPU")
 
     else:
-        device = "cpu"
         print("Using CPU")
 
-    main(device=device)
+    main()
     log.info("All done. Exiting gracefully.")
