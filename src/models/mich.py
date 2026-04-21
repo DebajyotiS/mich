@@ -370,6 +370,7 @@ class MICH(LightningModule):
         idx: CollocationBatch,
         layer: int,
         burn_in: int,
+        order: str,
     ) -> torch.Tensor:
         x = MICH._gather_z_hat_at(z_hat, idx, signal="x")[:, layer]
         s = MICH._gather_z_hat_at(z_hat, idx, signal="s")[:, layer]
@@ -399,43 +400,72 @@ class MICH(LightningModule):
         v_star_scale = 1.0
         q_star_scale = 1.0
 
+        alpha = self.hparams.haemo.alpha
+        gamma = self.hparams.haemo.gamma
+        kappa = self.hparams.haemo.kappa
+        lambda_d = self.hparams.haemo.lambda_d
+        tau = self.hparams.haemo.tau
+        E0 = self.hparams.acquisition.E0
+
         ds_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="s")
-        s_target = x - self.hparams.haemo.kappa * s - self.hparams.haemo.gamma * (f - 1)
+        s_target = x - kappa * s - gamma * (f - 1)
         s_loss = self._ode_loss_fn(ds_dt[:, burn_in:] / s_scale, s_target[:, burn_in:] / s_scale)
 
         df_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="f")
         f_loss = self._ode_loss_fn(df_dt[:, burn_in:] / f_scale, s[:, burn_in:] / f_scale)
 
         dv_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="v")
-        target_vdot = f - v ** (1 / self.hparams.haemo.alpha)
+        if order == "exact":
+            target_vdot = f - v ** (1 / alpha)
+        elif order == "linear":
+            f, v, q = f - 1, v - 1, q - 1
+            target_vdot = f - v / alpha
+            f, v, q = f + 1, v + 1, q + 1
+        elif order == "quadratic":
+            f, v, q = f - 1, v - 1, q - 1
+            target_vdot = f - v / alpha - (1 - alpha) / (2 * alpha**2) * v**2
+            f, v, q = f + 1, v + 1, q + 1
         if layer > 0:
             vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
-            target_vdot += self.hparams.haemo.lambda_d * vstar_deeper
+            target_vdot += lambda_d * vstar_deeper
         v_loss = self._ode_loss_fn(
             dv_dt[:, burn_in:] / v_scale,
-            (target_vdot[:, burn_in:] / self.hparams.haemo.tau) / v_scale,
+            (target_vdot[:, burn_in:] / tau) / v_scale,
         )
 
         dq_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="q")
-        target_qdot = f * (
-            1 - (1 - self.hparams.acquisition.E0) ** (1 / f)
-        ) / self.hparams.acquisition.E0 - q * v ** (1 / self.hparams.haemo.alpha - 1)
+        if order == "exact":
+            target_qdot = f * ( 1 - (1 - E0) ** (1 / f) ) / E0 - q * v ** (1 / alpha - 1)
+        elif order == "linear":
+            f, v, q = f - 1, v - 1, q - 1
+            beta_1 = (1 - E0) * np.log(1 - E0) / E0
+            target_qdot = (1 + beta_1) * f - q - (1/alpha - 1) * v
+            f, v, q = f + 1, v + 1, q + 1
+        elif order == "quadratic":
+            f, v, q = f - 1, v - 1, q - 1
+            beta_1 = (1 - E0) * np.log(1 - E0) / E0
+            beta_2 = beta_1 * np.log(1 - E0) / 2
+            target_qdot = ( (1 + beta_1) * f - q - (1/alpha - 1) * v
+                - beta_2 * f**2
+                - (1/alpha - 1) * v * q
+                - (1/2) * (1/alpha - 1) * (1/alpha - 2) * v**2 )
+            f, v, q = f + 1, v + 1, q + 1
         if layer > 0:
             qstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
-            target_qdot += self.hparams.haemo.lambda_d * qstar_deeper
+            target_qdot += lambda_d * qstar_deeper
         q_loss = self._ode_loss_fn(
             dq_dt[:, burn_in:] / q_scale,
-            (target_qdot[:, burn_in:] / self.hparams.haemo.tau) / q_scale,
+            (target_qdot[:, burn_in:] / tau) / q_scale,
         )
 
         dv_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
-        v_star_target = (-v_star + v - 1) / self.hparams.haemo.tau
+        v_star_target = (-v_star + v - 1) / tau
         v_star_loss = self._ode_loss_fn(
             dv_star_dt[:, burn_in:] / v_star_scale, v_star_target[:, burn_in:] / v_star_scale
         )
 
         dq_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar")
-        q_star_target = (-q_star + q - 1) / self.hparams.haemo.tau
+        q_star_target = (-q_star + q - 1) / tau
         q_star_loss = self._ode_loss_fn(
             dq_star_dt[:, burn_in:] / q_star_scale, q_star_target[:, burn_in:] / q_star_scale
         )
@@ -548,6 +578,7 @@ class MICH(LightningModule):
         self,
         z_hat: torch.Tensor,
         dz_hat_dt: torch.Tensor,
+        order: str,
         lambda_smooth: float = 0.0,
         source_position: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -572,7 +603,7 @@ class MICH(LightningModule):
         n_layers = z_hat.shape[2]
         for layer in range(n_layers):
             layer_losses = self._compute_physics_layer_loss(
-                z_hat, dz_hat_dt, idx, layer=layer, burn_in=self.hparams.loss_config.burn_in
+                z_hat, dz_hat_dt, idx, layer=layer, burn_in=self.hparams.loss_config.burn_in, order=order
             )
             layer_total = sum(layer_losses.values()).float() / 6.0
             tot_physics_loss = tot_physics_loss + layer_total / n_layers
@@ -618,7 +649,7 @@ class MICH(LightningModule):
         )
         if need_grads:
             physics_loss, per_eq_physics = self._physics_loss(
-                z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position
+                z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position, order=order
             )
         else:
             physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=torch.float32)
