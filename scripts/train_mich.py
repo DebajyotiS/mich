@@ -88,22 +88,38 @@ def main(cfg: DictConfig) -> None:
 if __name__ == "__main__":
     import os
     import subprocess
+    import torch
 
-    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            rows = [line.split(",") for line in result.stdout.strip().split("\n")]
-            best = min(rows, key=lambda r: int(r[1]))
-            os.environ["CUDA_VISIBLE_DEVICES"] = best[0].strip()
-            print(f"Auto-selected GPU {best[0].strip()}")
-        else:
-            log.warning("nvidia-smi failed, not setting CUDA_VISIBLE_DEVICES")
-    # Set environment variable to show full error tracebacks in Hydra
     os.environ["HYDRA_FULL_ERROR"] = "1"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    main()
+
+    if torch.backends.mps.is_available():
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        device = "mps"
+        print("Using Apple Metal GPU (mps)")
+
+    elif torch.cuda.is_available():
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+        if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                rows = [line.split(",") for line in result.stdout.strip().split("\n") if line.strip()]
+                best = min(rows, key=lambda r: int(r[1]))
+                os.environ["CUDA_VISIBLE_DEVICES"] = best[0].strip()
+                print(f"Auto-selected GPU {best[0].strip()}")
+            else:
+                log.warning("nvidia-smi failed, not setting CUDA_VISIBLE_DEVICES")
+
+        device = "cuda"
+        print("Using CUDA GPU")
+
+    else:
+        device = "cpu"
+        print("Using CPU")
+
+    main(device=device)
     log.info("All done. Exiting gracefully.")

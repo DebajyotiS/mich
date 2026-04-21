@@ -5,6 +5,7 @@ from functools import partial
 from typing import Any, Literal, Mapping
 
 import matplotlib.pyplot as plt
+import math
 import torch
 import torch.nn.functional as F
 import wandb
@@ -426,6 +427,8 @@ class MICH(LightningModule):
             f, v, q = f - 1, v - 1, q - 1
             target_vdot = f - v / alpha - (1 - alpha) / (2 * alpha**2) * v**2
             f, v, q = f + 1, v + 1, q + 1
+        else:
+            raise ValueError(f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}")
         if layer > 0:
             vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             target_vdot += lambda_d * vstar_deeper
@@ -439,13 +442,13 @@ class MICH(LightningModule):
             target_qdot = f * ( 1 - (1 - E0) ** (1 / f) ) / E0 - q * v ** (1 / alpha - 1)
         elif order == "linear":
             f, v, q = f - 1, v - 1, q - 1
-            beta_1 = (1 - E0) * np.log(1 - E0) / E0
+            beta_1 = (1 - E0) * math.log(1 - E0) / E0
             target_qdot = (1 + beta_1) * f - q - (1/alpha - 1) * v
             f, v, q = f + 1, v + 1, q + 1
         elif order == "quadratic":
             f, v, q = f - 1, v - 1, q - 1
-            beta_1 = (1 - E0) * np.log(1 - E0) / E0
-            beta_2 = beta_1 * np.log(1 - E0) / 2
+            beta_1 = (1 - E0) * math.log(1 - E0) / E0
+            beta_2 = beta_1 * math.log(1 - E0) / 2
             target_qdot = ( (1 + beta_1) * f - q - (1/alpha - 1) * v
                 - beta_2 * f**2
                 - (1/alpha - 1) * v * q
