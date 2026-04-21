@@ -372,7 +372,7 @@ class MICH(LightningModule):
         layer: int,
         burn_in: int,
         order: str,
-    ) -> torch.Tensor:
+    ) -> Mapping[str, torch.Tensor]:
         x = MICH._gather_z_hat_at(z_hat, idx, signal="x")[:, layer]
         s = MICH._gather_z_hat_at(z_hat, idx, signal="s")[:, layer]
         f = MICH._gather_z_hat_at(z_hat, idx, signal="f")[:, layer]
