@@ -1,131 +1,148 @@
 _target_: src.models.mich.MICH
 
-# -- Free scalars --------------------------------------------------------------
-# Constraints on derived values are annotated inline with "# = <expression>".
-#
-#   L              number of cortical input layers
-#   C              MaskedLayerMixing output channels -> first spatial encoder cin
-#   c_enc          final spatial encoder output channels -> all temporal cin + decoder cin
-#   c_dec          decoder feature channels (spatial encoder output width)
-#   c_film         FiLM bottleneck width per signal (set ~c_dec/7 for budget-neutral)
-#   signal_embed_dim  learnable embedding dim per Heinzle signal (fed into FiLM)
-#   num_freqs      Fourier frequencies -> embed_dim auto-computed in SpatioTemporalDecoder
-# -----------------------------------------------------------------------------
+L: 3
+C: 32
+c_enc: 64
+c_dec: 64
+c_film: 32           # FiLM bottleneck per signal (~c_dec / 7, rounded up for groups)
+signal_embed_dim: 8
+num_freqs: 10
+min_freq: 5.0
+max_freq: 20.0
+tcn_kernel: 3
+spatial_radius: 2
+grid_size: 32
+
+embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
+out_channels: 21
 
 heinzle_net:
   _target_: src.models.blocks.HeinzleNet
+
   layer_mixing_config:
-    L: 3                #  L
-    C: 16               #  C
+    L: ${model.L}
+    C: ${model.C}
     init_identity: true
 
-  # Each layer's cin must equal the previous layer's cout.
-  # First cin = C; last cout = c_enc.
   spatial_encoder_config:
-    - cin: 16           # = C
-      cout: 16          # = c_enc (single-stage: set to c_enc directly)
+    - cin: ${model.C}
+      cout: ${model.c_enc}
       stride: 1
       dw_kernel: 3
       pw_kernel: 1
-      num_groups: 4     # must divide cout
+      num_groups: 8
       activation: silu
-    - cin: 16           # = previous cout
-      cout: 16          # = c_enc
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
       stride: 1
       dw_kernel: 3
       pw_kernel: 1
-      num_groups: 4     # must divide cout
+      num_groups: 8
       activation: silu
 
-  # Dilations are auto-set to 2^i by TemporalMixingEncoder so do not add dilation.
-  # All layers must share the same cin (residual skip connection x + residual).
   temporal_mixing_config:
-    - cin: 16           # = c_enc
-      kernel_size: 3
-      num_groups: 4     # must divide cin
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
       activation: silu
-    - cin: 16           # = c_enc
-      kernel_size: 3
-      num_groups: 4
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
       activation: silu
-    - cin: 16           # = c_enc
-      kernel_size: 3
-      num_groups: 4
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
       activation: silu
-    - cin: 16           # = c_enc
-      kernel_size: 3
-      num_groups: 4
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
       activation: silu
 
   time_embedding_config:
-    num_freqs: 16       #  num_freqs
-    max_freq: 500.0
+    num_freqs: ${model.num_freqs}
+    min_freq: ${model.min_freq}
+    max_freq: ${model.max_freq}
 
   time_film_config:
-    embed_dim: 32       # overridden in SpatioTemporalDecoder.__init__; kept for reference
-    hidden_dim: 16
+    embed_dim: ${model.embed_dim}  # overridden in SpatioTemporalDecoder.__init__
+    hidden_dim: ${model.c_film}
     activation: silu
-    c_dec: 4            # overridden to c_film in SpatioTemporalDecoder.__init__
+    c_dec: ${model.c_film}         # overridden to c_film in SpatioTemporalDecoder.__init__
 
   spatial_decoder_config:
-    cin: 16             # = c_enc
-    c_dec: 16           # spatial feature width (encoder output)
-    c_film: 4           # FiLM bottleneck per signal (~c_dec / 7, rounded up)
-    signal_embed_dim: 8
-    out_channels: 21    # = 7 * L  (kept for compatibility)
+    cin: ${model.c_enc}
+    c_dec: ${model.c_dec}
+    c_film: ${model.c_film}
+    signal_embed_dim: ${model.signal_embed_dim}
+    out_channels: ${model.out_channels}
     activation: silu
-    L: 3                # = L
+    L: ${model.L}
+    layer_embed_dim: 8
 
 normaliser:
   _target_: src.models.normaliser.LayerwiseBOLDNormalizer
-  H: 32 # This needs to change if  the number of grid points change
-  W: 32 # This needs to change if  the number of grid points change
+  H: ${model.grid_size}
+  W: ${model.grid_size}
   eps: 1.0e-6
   freeze_after_steps: 5000
+  neighbourhood_radius: ${model.spatial_radius}
+
 loss_config:
-  lambda_data: 1.0
+  order: linear # choose between linear, quadratic, exact
+  lambda_data: 100.0
   lambda_physics: 1.0
-  lambda_src: 1.0
-  lambda_smooth: 1.0
-  warmup_steps_physics: 10000
-  warmup_steps_smooth: 5000
-  delay_steps_physics: 0
+  warmup_steps_physics: 20000
+  delay_steps_physics: 3000
+  lambda_src: 10.0
+  lambda_smooth: 0.0
+  warmup_steps_smooth: 0
   delay_steps_smooth: 0
-  n_time: 2000
-  n_space: 400
-  dense_time_frac: 0.8
-  dense_time_lo: 0.05
-  dense_time_hi: 0.55
-  uniform_time_lo: 0.05
-  dense_spatial_frac: 0.8
-  dense_spatial_radius: 5
-  burn_in: 20
-  lambda_supervision: 1.0
+  lambda_supervision: 10.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
+  n_space: 225
+  dense_spatial_frac: 0.95
+  dense_spatial_radius: ${model.spatial_radius}
+  n_time: 100
+  dense_time_frac: 0.0
+  dense_time_lo: 0.0
+  dense_time_hi: 0.70
+  uniform_time_lo: 0.0
+  burn_in: 0
   supervision_loss:
-    type: "mse"
-    huber_delta: 1.0
-  bold_loss:
-    type: "mse"
+    type: "mse+pearson"
+    lambda_npearson: 10.0
     lambda_pearson: 1.0
-    huber_delta: 1.0
+    huber_delta: 0.1
+  bold_loss:
+    type: "mse+pearson"
+    lambda_npearson: 10.0
+    lambda_pearson: 1.0
+    huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
   ode_loss:
     type: "mse"
-    huber_delta: 1.0
+    huber_delta: 0.1 #used if type is "huber"
 
 haemo:
-  kappa: 0.65       # Vasodilatory signal decay rate
-  gamma: 0.41       # Autoregulatory feedback rate
-  alpha: 0.32       # Grubb's exponent
-  tau: 2.66          # Mean transit time (s)
+  kappa: 0.65
+  gamma: 0.41
+  alpha: 0.32
+  tau: 2.66
   lambda_d: 0.5
 
 acquisition:
-  f0: 28.625        # Frequency offset at outer vessel surface (Hz)
-  E0: 0.34          # Resting oxygen extraction fraction
-  TE: 0.25          # Echo time (s)
-  r0: 340           # Intravascular relaxation rate (Hz)
+  f0: 28.625
+  E0: 0.34
+  TE: 0.25
+  r0: 340
   eps: 1.0e-32
   k1: 10.4624375
   k2: 2.89e-31
@@ -144,7 +161,7 @@ optimizer:
 scheduler:
   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
   _partial_: true
-  T_max: 312500
+  T_max: 125000
   eta_min: 1.0e-6
 
 lightning:
