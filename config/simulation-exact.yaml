@@ -4,7 +4,7 @@
 
 num_simulations: 100
 seed: 42
-output_path: data/simulations-exact.h5
+output_path: data/simulations-exact-4x4.h5
 
 # -- Haemodynamic constants ----------------------
 haemodynamic:
@@ -24,7 +24,7 @@ acquisition:
 # -- Simulation ----------------------------------
 simulation:
   num_layers: 3
-  grid_size: [32, 32]
+  grid_size: [4, 4] # [32, 32]
   dt: 1.0
   haemo_dt: 0.05
   time_duration: 100

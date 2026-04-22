@@ -11,7 +11,7 @@ min_freq: 5.0
 max_freq: 20.0
 tcn_kernel: 3
 spatial_radius: 2
-grid_size: 32
+grid_size: 4 # this was 32
 
 embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
 out_channels: 21
@@ -98,14 +98,14 @@ normaliser:
 loss_config:
   order: linear # choose between linear, quadratic, exact
   lambda_data: 100.0
-  lambda_physics: 1.0
-  warmup_steps_physics: 20000
-  delay_steps_physics: 3000
+  lambda_physics: 1000.0
+  warmup_steps_physics: 20
+  delay_steps_physics: 10
   lambda_src: 10.0
   lambda_smooth: 0.0
   warmup_steps_smooth: 0
   delay_steps_smooth: 0
-  lambda_supervision: 10.0
+  lambda_supervision: 0.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
   n_space: 225
