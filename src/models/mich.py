@@ -280,6 +280,22 @@ class MICH(LightningModule):
         q = MICH._gather_z_hat_at(z_hat, idx, signal="q")
         return MICH._compute_bold(v, q, acquisition, V0)
 
+    def _antisteady_loss(
+        self,
+        z_hat: torch.Tensor,       # [B, 7, L, T, H, W]
+        source_position: torch.Tensor,  # [B, 2]
+    ) -> torch.Tensor:
+        B = z_hat.shape[0]
+        b_idx = torch.arange(B, device=z_hat.device)
+        src_h = source_position[:, 0].long()
+        src_w = source_position[:, 1].long()
+        x_idx = MICH._signal_index("x")
+        # x at source voxel: [B, L, T]
+        x_src = z_hat[b_idx, x_idx, :, :, src_h, src_w]
+        x_var = x_src.var(dim=-1)  # [B, L]
+        eps = getattr(self.hparams.loss_config, "antisteady_epsilon", 0.01)
+        return F.relu(eps - x_var).mean()
+        
     def _data_loss(
         self,
         z_hat: torch.Tensor,
@@ -663,6 +679,18 @@ class MICH(LightningModule):
             per_eq_physics = {}
         total_loss = lc.lambda_data * data_loss + lambda_physics_eff * physics_loss
 
+        lambda_antisteady_eff = self._get_scheduled_lambda(
+            getattr(lc, "lambda_antisteady", 0.0),
+            getattr(lc, "warmup_steps_antisteady", 0),
+            getattr(lc, "delay_steps_antisteady", 0),
+        )
+
+        if lambda_antisteady_eff > 0.0:
+            antisteady_loss = self._antisteady_loss(z_hat, source_position)
+            total_loss = total_loss + lambda_antisteady_eff * antisteady_loss
+        else:
+            antisteady_loss = None
+
         supervision_loss = None
         lambda_supervision_eff = 0.0
         per_sig_supervision: dict = {}
@@ -744,6 +772,9 @@ class MICH(LightningModule):
                 # scheduled lambdas
                 "parameters/lambda_physics": lambda_physics_eff,
                 "parameters/lambda_smooth": lambda_smooth_eff,
+                "parameters/lambda_antisteady": lambda_antisteady_eff,
+                **({"train/loss/antisteady": antisteady_loss.item(),
+                    "train/loss_weighted/antisteady": (antisteady_loss * lambda_antisteady_eff).item()} if antisteady_loss is not None else {}),
                 # ODE residuals — own section
                 **{f"ode/{k}": v.item() for k, v in per_eq_physics.items()},
             }

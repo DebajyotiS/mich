@@ -105,6 +105,10 @@ loss_config:
   lambda_smooth: 0.0
   warmup_steps_smooth: 0
   delay_steps_smooth: 0
+  lambda_antisteady: 0.5        # set 0.0 to disable
+  antisteady_epsilon: 0.01      # variance threshold (hinge)
+  warmup_steps_antisteady: 0    # optional warm-up
+  delay_steps_antisteady: 0
   lambda_supervision: 0.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
