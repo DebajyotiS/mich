@@ -24,7 +24,7 @@ acquisition:
 # -- Simulation ----------------------------------
 simulation:
   num_layers: 3
-  grid_size: [4, 4] # [32, 32]
+  grid_size: [10, 10] # [32, 32]
   dt: 1.0
   haemo_dt: 0.05
   time_duration: 100
@@ -33,7 +33,7 @@ simulation:
   pulse_type: rect
   neural_SNR: .inf
   BOLD_SNR: 20.0
-  diffusion_coefficient_intra: 12.0
+  diffusion_coefficient_intra: 3.0
   diffusion_coefficient_inter: 0.0
   decay_rate: 1.0      # s-1, neural decay timescale (L = sqrt(D/k) ~ 5 voxels)
   tau_d: 1.0
@@ -51,7 +51,7 @@ simulation:
 
 # -- BOLD post-processing ------------------------
 bold:
-  psf_fwhm: [18.0, 27.675, 40.05]   # per-layer PSF FWHM (grid units)
+  psf_fwhm: [11.25, 17.30, 25.03] # for 32x32 use [18.0, 27.675, 40.05]   # per-layer PSF FWHM (grid units)
   noise_model:
     field: "7T"
     V: 8.0

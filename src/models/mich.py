@@ -615,9 +615,12 @@ class MICH(LightningModule):
                 per_eq[k] = per_eq[k] + layer_losses[k].float() / n_layers
 
         # Smoothness of gradients
-        dz_dt_fd = z_hat[:, :, :, 1:] - z_hat[:, :, :, :-1]  # [B, S, L, T-1, H, W]
-        smoothness_loss = dz_dt_fd.pow(2).mean()
-        return tot_physics_loss + lambda_smooth * smoothness_loss, per_eq
+        if lambda_smooth <= 0:
+            return tot_physics_loss
+        else:
+            dz_dt_fd = z_hat[:, :, :, 1:] - z_hat[:, :, :, :-1]  # [B, S, L, T-1, H, W]
+            smoothness_loss = dz_dt_fd.pow(2).mean()
+            return tot_physics_loss + lambda_smooth * smoothness_loss, per_eq
 
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
         bold, neural = batch["bold"], batch["neural"]
@@ -648,7 +651,7 @@ class MICH(LightningModule):
         z_hat = sd_manifest.z_hat
         dz_hat_dt = sd_manifest.grads  # None when need_grads=False
 
-        data_loss, colloc_loss, src_loss = self._data_loss(
+        data_loss, _colloc_loss, src_loss = self._data_loss(
             z_hat, bold_norm, source_position=source_position
         )
         if need_grads:
