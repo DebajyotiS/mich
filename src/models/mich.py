@@ -632,7 +632,7 @@ class MICH(LightningModule):
 
         # Smoothness of gradients
         if lambda_smooth <= 0:
-            return tot_physics_loss
+            return tot_physics_loss, per_eq
         else:
             dz_dt_fd = z_hat[:, :, :, 1:] - z_hat[:, :, :, :-1]  # [B, S, L, T-1, H, W]
             smoothness_loss = dz_dt_fd.pow(2).mean()
