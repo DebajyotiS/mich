@@ -14,21 +14,21 @@ heinzle_net:
   _target_: src.models.blocks.HeinzleNet
   layer_mixing_config:
     L: 3                #  L
-    C: 16               #  C
+    C: 64             #  C
     init_identity: true
 
   # Each layer's cin must equal the previous layer's cout.
   # First cin = C; last cout = c_enc.
   spatial_encoder_config:
-    - cin: 16           # = C
-      cout: 16          # = c_enc (single-stage: set to c_enc directly)
+    - cin: 64          # = C
+      cout: 64          # = c_enc (single-stage: set to c_enc directly)
       stride: 1
       dw_kernel: 3
       pw_kernel: 1
       num_groups: 4     # must divide cout
       activation: silu
-    - cin: 16           # = previous cout
-      cout: 16          # = c_enc
+    - cin: 64           # = previous cout
+      cout: 64            # = c_enc
       stride: 1
       dw_kernel: 3
       pw_kernel: 1
@@ -38,19 +38,19 @@ heinzle_net:
   # Dilations are auto-set to 2^i by TemporalMixingEncoder so do not add dilation.
   # All layers must share the same cin (residual skip connection x + residual).
   temporal_mixing_config:
-    - cin: 16           # = c_enc
+    - cin: 64           # = c_enc
       kernel_size: 3
       num_groups: 4     # must divide cin
       activation: silu
-    - cin: 16           # = c_enc
+    - cin: 64           # = c_enc
       kernel_size: 3
       num_groups: 4
       activation: silu
-    - cin: 16           # = c_enc
+    - cin: 64           # = c_enc
       kernel_size: 3
       num_groups: 4
       activation: silu
-    - cin: 16           # = c_enc
+    - cin: 64           # = c_enc
       kernel_size: 3
       num_groups: 4
       activation: silu
@@ -63,11 +63,11 @@ heinzle_net:
     embed_dim: 32       # = 2 * num_freqs
     hidden_dim: 16
     activation: silu
-    c_dec: 16           #  c_dec; must equal spatial_decoder_config.c_dec
+    c_dec: 64       #  c_dec; must equal spatial_decoder_config.c_dec
 
   spatial_decoder_config:
-    cin: 16             # = c_enc
-    c_dec: 16           # c_dec; must equal time_film_config.c_dec
+    cin: 64            # = c_enc
+    c_dec: 64           # c_dec; must equal time_film_config.c_dec
     out_channels: 21    # = 7 * L  (hardcoded reshape in SpatialDecoder.forward:255)
     activation: silu
     L: 3                # = L

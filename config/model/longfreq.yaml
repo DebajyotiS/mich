@@ -1,14 +1,14 @@
 _target_: src.models.mich.MICH
 
 L: 3
-C: 32
-c_enc: 32
-c_dec: 32
+C: 64
+c_enc: 64
+c_dec: 64
 num_freqs: 10
 min_freq: 5.0
 max_freq: 20.0
 tcn_kernel: 3
-spatial_radius: 5
+spatial_radius: 1
 grid_size: 32
 
 embed_dim: 20 # This needs to be manually set. 2 x num_freqs
@@ -93,25 +93,25 @@ normaliser:
 
 loss_config:
   lambda_data: 10.0
-  lambda_physics: 1.0
+  lambda_physics: 2.5
   lambda_src: 10.0
-  lambda_smooth: 0.0
-  warmup_steps_physics: 20000
+  lambda_smooth: 0.3
+  warmup_steps_physics: 3000
   warmup_steps_smooth: 0
-  delay_steps_physics: 2000
+  delay_steps_physics: 6000
   delay_steps_smooth: 0
   n_time: 80
-  n_space: 900
+  n_space: 400
   dense_time_frac: 0.85
   dense_time_lo: 0.1
   dense_time_hi: 0.70
   uniform_time_lo: 0.1
-  dense_spatial_frac: 0.8
+  dense_spatial_frac: 0.95
   dense_spatial_radius: ${model.spatial_radius}
   burn_in: 0
   bold_loss:
-    type: "mse"
-    lambda_pearson: 1.0
+    type: "mse+pearson"
+    lambda_pearson: 0.5
     huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
   ode_loss:
     type: "mse"
@@ -141,7 +141,7 @@ psf_fwhm: [18.0, 27.675, 40.05]  # per-layer Gaussian PSF FWHM in grid units (de
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 3.0e-4
+  lr: 1.0e-4
   weight_decay: 1.0e-5
 
 scheduler:

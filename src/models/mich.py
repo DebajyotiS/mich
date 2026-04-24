@@ -279,13 +279,13 @@ class MICH(LightningModule):
     def _data_loss(
         self,
         z_hat: torch.Tensor,
-        bold_norm: torch.Tensor,
+        true_bold: torch.Tensor,
         source_position: torch.Tensor | None = None,
     ) -> torch.Tensor:
         collocation = MICH._sample_collocation_indices(
-            T=bold_norm.shape[2],
-            H=bold_norm.shape[3],
-            W=bold_norm.shape[4],
+            T=true_bold.shape[2],
+            H=true_bold.shape[3],
+            W=true_bold.shape[4],
             n_times=self.hparams.loss_config.n_time,
             n_space=self.hparams.loss_config.n_space,
             device=z_hat.device,
@@ -322,9 +322,9 @@ class MICH(LightningModule):
                     layers_blurred.append(blurred)
             pred_bold = torch.stack(layers_blurred, dim=1)  # [B, L, T, H, W]
 
-        true_bold = (
-            self.normaliser.denormalize(bold_norm) if self.normaliser is not None else bold_norm
-        )
+        #true_bold = (
+        #    self.normaliser.denormalize(bold_norm) if self.normaliser is not None else bold_norm
+        #)
 
         # Collocation loss -- per layer shape: [B, n_times, n_space]; Pearson over n_times (dim=1)
         pred_bold_at = self._gather_bold_at(pred_bold, collocation)
@@ -497,8 +497,10 @@ class MICH(LightningModule):
             for k in _eq_keys:
                 per_eq[k] = per_eq[k] + layer_losses[k].float() / n_layers
 
-        # Smoothness of gradients
-        dz_dt_fd = z_hat[:, :, :, 1:] - z_hat[:, :, :, :-1]  # [B, S, L, T-1, H, W]
+        # Smoothness of gradients (exclude x channel)
+        x_idx = MICH._signal_index("x")
+        non_x = [i for i in range(z_hat.shape[1]) if i != x_idx]
+        dz_dt_fd = z_hat[:, non_x, :, 1:] - z_hat[:, non_x, :, :-1]  # [B, S-1, L, T-1, H, W]
         smoothness_loss = dz_dt_fd.pow(2).mean()
         return tot_physics_loss + lambda_smooth * smoothness_loss, per_eq
 
@@ -532,7 +534,7 @@ class MICH(LightningModule):
         )
 
         data_loss, colloc_loss, src_loss = self._data_loss(
-            z_hat, bold_norm, source_position=source_position
+            z_hat, bold, source_position=source_position
         )
         physics_loss, per_eq_physics = self._physics_loss(
             z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position
@@ -691,6 +693,25 @@ class MICH(LightningModule):
         )
         pred_neural = subset_z_hat[:, MICH._signal_index("x")]
 
+        run = getattr(self, "_rank_run", None) or wandb.run
+        if run is not None:
+            pred_v = subset_z_hat[:, MICH._signal_index("v")]
+            pred_q = subset_z_hat[:, MICH._signal_index("q")]
+            pred_x = subset_z_hat[:, MICH._signal_index("x")]
+            state_log = {"global_step": self.global_step}
+            for layer_idx, layer_name in enumerate(("deep", "mid", "sup")):
+                state_log[f"val/states/{layer_name}/v_mean"] = pred_v[:, layer_idx].mean().item()
+                state_log[f"val/states/{layer_name}/v_min"] = pred_v[:, layer_idx].min().item()
+                state_log[f"val/states/{layer_name}/v_max"] = pred_v[:, layer_idx].max().item()
+                state_log[f"val/states/{layer_name}/q_mean"] = pred_q[:, layer_idx].mean().item()
+                state_log[f"val/states/{layer_name}/q_min"] = pred_q[:, layer_idx].min().item()
+                state_log[f"val/states/{layer_name}/q_max"] = pred_q[:, layer_idx].max().item()
+                state_log[f"val/states/{layer_name}/x_mean"] = pred_x[:, layer_idx].mean().item()
+                state_log[f"val/states/{layer_name}/x_max"] = pred_x[:, layer_idx].max().item()
+            state_log["val/bold/pred_std"] = pred_bold.std().item()
+            state_log["val/bold/true_std"] = subset_bold.std().item()
+            run.log(state_log, commit=False)
+
         self._plot_and_log_predictions(
             pred_bold=pred_bold,
             true_bold=subset_bold,
@@ -818,3 +839,26 @@ class MICH(LightningModule):
             "optimizer": optim,
             "lr_scheduler": {"scheduler": sched, **self.hparams.lightning},
         }
+    
+    
+    def on_after_backward(self):
+        if self.global_step % 50 != 0:
+            return
+
+        run = getattr(self, "_rank_run", None) or wandb.run
+        if run is None:
+            return
+
+        grad_log = {}
+
+        for name, param in self.heinzle_net.spatial_decoder.time_film.named_parameters():
+            if param.grad is not None:
+                grad_log[f"time_film/{name}_grad_norm"] = param.grad.norm().item()
+                grad_log[f"time_film/{name}_grad_mean"] = param.grad.mean().item()
+
+        for name, param in self.heinzle_net.spatial_encoder.named_parameters():
+            if param.grad is not None:
+                grad_log[f"spatial_encoder/{name}_grad_norm"] = param.grad.norm().item()
+
+        if grad_log:
+            run.log(grad_log, step=self.global_step)
