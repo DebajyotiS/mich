@@ -68,6 +68,7 @@ class PointSpreadFunction:
     """
 
     fwhm: float  # full-width at half-maximum in grid units
+    boundary: str = "absorbing"  # "absorbing" (zero-pad) or "reflect"
 
     @property
     def sigma(self) -> float:
@@ -88,8 +89,8 @@ class PointSpreadFunction:
             return data
         sigma = self.sigma
         if isinstance(data, torch.Tensor):
-            return _apply_psf_torch(data, sigma)
-        return _apply_psf_numpy(data, sigma)
+            return _apply_psf_torch(data, sigma, boundary=self.boundary)
+        return _apply_psf_numpy(data, sigma, boundary=self.boundary)
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,12 +206,14 @@ def _gaussian_kernel_1d(sigma: float, truncate: float = 4.0) -> np.ndarray:
     return kernel / kernel.sum()
 
 
-def _apply_psf_numpy(data: np.ndarray, sigma: float) -> np.ndarray:
+def _apply_psf_numpy(data: np.ndarray, sigma: float, *, boundary: str = "absorbing") -> np.ndarray:
     if data.ndim <= 1:
         return data
     # sigma=0 on the time axis, blur only spatial axes
     spatial_sigma = [0.0] + [sigma] * (data.ndim - 1)
-    return gaussian_filter(data, sigma=spatial_sigma)
+    if boundary == "absorbing":
+        return gaussian_filter(data, sigma=spatial_sigma, mode="constant", cval=0.0)
+    return gaussian_filter(data, sigma=spatial_sigma, mode="reflect")
 
 
 def _reflect_pad(x: torch.Tensor, pad: int, dim: int) -> torch.Tensor:
@@ -223,7 +226,7 @@ def _reflect_pad(x: torch.Tensor, pad: int, dim: int) -> torch.Tensor:
     return x.index_select(dim, idx)
 
 
-def _apply_psf_torch(data: torch.Tensor, sigma: float) -> torch.Tensor:
+def _apply_psf_torch(data: torch.Tensor, sigma: float, *, boundary: str = "absorbing") -> torch.Tensor:
     if data.ndim <= 1:
         return data
     kernel_np = _gaussian_kernel_1d(sigma)
@@ -233,11 +236,15 @@ def _apply_psf_torch(data: torch.Tensor, sigma: float) -> torch.Tensor:
 
     if n_spatial == 1:
         k = kernel.reshape(1, 1, -1)
+        if boundary == "absorbing":
+            return torch.nn.functional.conv1d(data.unsqueeze(1), k, padding=pad).squeeze(1)
         x = _reflect_pad(data.unsqueeze(1), pad, dim=2)
         return torch.nn.functional.conv1d(x, k, padding=0).squeeze(1)
 
     if n_spatial == 2:
         k2d = (kernel[:, None] * kernel[None, :]).reshape(1, 1, -1, len(kernel))
+        if boundary == "absorbing":
+            return torch.nn.functional.conv2d(data.unsqueeze(1), k2d, padding=pad).squeeze(1)
         x = _reflect_pad(_reflect_pad(data.unsqueeze(1), pad, dim=2), pad, dim=3)
         return torch.nn.functional.conv2d(x, k2d, padding=0).squeeze(1)
 

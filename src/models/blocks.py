@@ -14,6 +14,7 @@ from src.utils.torch_utils import (
 
 HeinzleSignal = Literal["x", "s", "f", "v", "q", "vstar", "qstar"]
 HEINZLE_SIGNALS: list[HeinzleSignal] = ["x", "s", "f", "v", "q", "vstar", "qstar"]
+HEINZLE_SIGNALS_SINGLE: list[HeinzleSignal] = ["x", "s", "f", "v", "q"]
 HEINZLE_N_SIGNALS = len(HEINZLE_SIGNALS)
 HEINZLE_SIGNAL_IDX: dict[HeinzleSignal, int] = {s: i for i, s in enumerate(HEINZLE_SIGNALS)}
 
@@ -372,15 +373,17 @@ class SpatioTemporalDecoder(nn.Module):
         layer_embed_dim: int = 16,
         signal_embed_dim: int = 8,
         upsample: bool = False,
-        channel_activations: list[ChannelActivation] | None = HEINZLE_ACTIVATIONS_ORDERED,
+        signals: list[HeinzleSignal] = HEINZLE_SIGNALS,
     ):
         super().__init__()
 
-        if channel_activations is not None:
-            assert len(channel_activations) == HEINZLE_N_SIGNALS, (
-                f"channel_activations must have {HEINZLE_N_SIGNALS} entries "
-                f"(one per Heinzle signal), got {len(channel_activations)}."
-            )
+        assert all(s in HEINZLE_ACTIVATIONS for s in signals), (
+            f"All signals must be valid Heinzle signals. Got: {signals}"
+        )
+        self.signals = signals
+        self.signal_idx: dict[HeinzleSignal, int] = {s: i for i, s in enumerate(signals)}
+        N_SIG = len(signals)
+        channel_activations = [HEINZLE_ACTIVATIONS[s] for s in signals]
 
         self.L = L
         self.layer_embed_dim = layer_embed_dim
@@ -398,24 +401,23 @@ class SpatioTemporalDecoder(nn.Module):
         # Per-(signal, layer) output heads: 7 * L independent Conv2d(c_film -> 1)
         # Indexed as head_idx = sig_idx * L + layer_idx
         self.out_heads = nn.ModuleList(
-            [nn.Conv2d(c_film, 1, kernel_size=1, bias=True) for _ in range(HEINZLE_N_SIGNALS * L)]
+            [nn.Conv2d(c_film, 1, kernel_size=1, bias=True) for _ in range(N_SIG * L)]
         )
         with torch.no_grad():
-            for sig_idx in range(HEINZLE_N_SIGNALS):
+            for sig_idx, sig in enumerate(signals):
                 for layer_idx in range(L):
                     head = self.out_heads[sig_idx * L + layer_idx]
-                    nn.init.zeros_(head.bias)
                     nn.init.zeros_(head.weight)
-        if channel_activations is not None:
-            with torch.no_grad():
-                for layer_idx in range(L):
-                    self.out_heads[HEINZLE_SIGNAL_IDX["x"] * L + layer_idx].bias.fill_(-3.0)
-                    for sig in ("f", "v", "q"):
-                        self.out_heads[HEINZLE_SIGNAL_IDX[sig] * L + layer_idx].bias.fill_(0.5413)
+                    if sig == "x":
+                        head.bias.fill_(-3.0)
+                    elif sig in ("f", "v", "q"):
+                        head.bias.fill_(0.5413)
+                    else:
+                        nn.init.zeros_(head.bias)
 
         self.time_embedding = FourierTimeEmbedding(**temporal_embedding_config)
         self.layer_embed = nn.Embedding(L, layer_embed_dim)
-        self.signal_embed = nn.Embedding(HEINZLE_N_SIGNALS, signal_embed_dim)
+        self.signal_embed = nn.Embedding(N_SIG, signal_embed_dim)
 
         num_freqs = temporal_embedding_config["num_freqs"]
         film_config = dict(temporal_film_config)
@@ -468,7 +470,7 @@ class SpatioTemporalDecoder(nn.Module):
     def _gamma_beta(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """t: [B, T] -> gamma, beta: [B, T, L, 7, c_film]"""
         B, T = t.shape
-        L, N_SIG = self.L, HEINZLE_N_SIGNALS
+        L, N_SIG = self.L, len(self.signals)
         time_emb = self.time_embedding(t)  # [B, T, 2F]
 
         layer_ids = torch.arange(L, device=t.device)
@@ -499,7 +501,7 @@ class SpatioTemporalDecoder(nn.Module):
         Returns: dgamma_dt, dbeta_dt -- each [B, T, L, 7, c_film]
         """
         B, T = t.shape
-        L, N_SIG = self.L, HEINZLE_N_SIGNALS
+        L, N_SIG = self.L, len(self.signals)
         t_flat = t.reshape(-1)  # [BT]
 
         layer_ids = torch.arange(L, device=t.device)
@@ -559,7 +561,7 @@ class SpatioTemporalDecoder(nn.Module):
 
         # Per-signal FiLM: process one signal at a time to avoid [B, T, L, 7, c_film, H, W]
         out_parts = []
-        for sig_idx in range(HEINZLE_N_SIGNALS):
+        for sig_idx in range(len(self.signals)):
             g_sig = gamma[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
             b_sig = beta[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
             y_sig = g_sig * u_film + b_sig  # [B, T, L, c_film, H, W]
@@ -582,7 +584,7 @@ class SpatioTemporalDecoder(nn.Module):
         # Apply conv weights only -- bias terms are constant so their derivative is zero
         # Process one signal at a time to avoid materialising [B, T, L, 7, c_film, H, W]
         dout_parts = []
-        for sig_idx in range(HEINZLE_N_SIGNALS):
+        for sig_idx in range(len(self.signals)):
             g_sig = dgamma_dt[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
             b_sig = dbeta_dt[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
             dy_sig = g_sig * u_film + b_sig  # [B, T, L, c_film, H, W]
@@ -611,7 +613,7 @@ class SpatioTemporalDecoder(nn.Module):
         if self.channel_activations is None:
             return z
         return torch.stack(
-            [self.channel_activations[i].fn(z[:, i]) for i in range(HEINZLE_N_SIGNALS)],
+            [self.channel_activations[i].fn(z[:, i]) for i in range(len(self.signals))],
             dim=1,
         )
 
@@ -629,7 +631,7 @@ class SpatioTemporalDecoder(nn.Module):
         return torch.stack(
             [
                 self.channel_activations[i].dfn_dx(z_pre[:, i]) * dz_dt[:, i]
-                for i in range(HEINZLE_N_SIGNALS)
+                for i in range(len(self.signals))
             ],
             dim=1,
         )

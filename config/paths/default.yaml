@@ -1,4 +1,4 @@
 output_dir: ${private.output_dir}
-data_dir: ${private.data_dir}/simulations-linear-4x4.h5
+data_dir: ${private.data_dir}
 root_dir: ${private.root_dir}
 full_path: ${private.output_dir}/${project_name}/${network_name}/

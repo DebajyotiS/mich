@@ -344,8 +344,8 @@ def main() -> None:
     parser.add_argument(
         "--latent-downsample",
         type=int,
-        default=10,
-        help="Downsample factor for latent states (default: 10)",
+        default=1,
+        help="Downsample factor for latent states (default: 1)",
     )
     args = parser.parse_args()
 
