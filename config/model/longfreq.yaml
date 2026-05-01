@@ -1,6 +1,6 @@
 _target_: src.models.mich.MICH
 
-L: 3
+L: 1
 C: 32
 c_enc: 64
 c_dec: 64
@@ -14,7 +14,7 @@ spatial_radius: 2
 grid_size: 4 # this was 32
 
 embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
-out_channels: 21
+out_channels: 5
 
 heinzle_net:
   _target_: src.models.blocks.HeinzleNet
@@ -86,6 +86,7 @@ heinzle_net:
     activation: silu
     L: ${model.L}
     layer_embed_dim: 8
+    signals: [x, s, f, v, q]
 
 normaliser:
   _target_: src.models.normaliser.LayerwiseBOLDNormalizer
@@ -105,7 +106,7 @@ loss_config:
   lambda_smooth: 0.0
   warmup_steps_smooth: 0
   delay_steps_smooth: 0
-  lambda_supervision: 0.0
+  lambda_supervision: 100.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
   n_space: 225
@@ -119,7 +120,7 @@ loss_config:
   burn_in: 0
   supervision_loss:
     type: "mse+pearson"
-    lambda_npearson: 10.0
+    lambda_npearson: 100.0
     lambda_pearson: 1.0
     huber_delta: 0.1
   bold_loss:
@@ -150,7 +151,7 @@ acquisition:
 
 V0: 0.5
 
-psf_fwhm: [18.0, 27.675, 40.05]  # per-layer Gaussian PSF FWHM in grid units (deep, mid, superficial)
+psf_fwhm: [11.25]  # per-layer Gaussian PSF FWHM in grid units (deep, mid, superficial)
 
 optimizer:
   _target_: torch.optim.AdamW

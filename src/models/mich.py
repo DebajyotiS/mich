@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import wandb
 from pytorch_lightning import LightningModule
 
-from src.data.balloon import AcquisitionConstants, PointSpreadFunction, _reflect_pad
+from src.data.balloon import AcquisitionConstants, PointSpreadFunction
 from src.models.blocks import HeinzleSignal, SpatialDecoderManifest
 from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
@@ -325,7 +325,7 @@ class MICH(LightningModule):
             pred_v, pred_q, acquisition=self.hparams.acquisition, V0=self.hparams.V0
         )
 
-        # Apply per-layer Gaussian PSF to pred_bold [B, L, T, H, W]
+        # Apply Gaussian PSF to pred_bold [B, L, T, H, W]
         if self._psf is not None:
             B_size, L_size, T_size, H_size, W_size = pred_bold.shape
             layers_blurred = []
@@ -333,9 +333,8 @@ class MICH(LightningModule):
                 kernel = getattr(self, f"_psf_kernel_{i}")
                 pad = kernel.shape[-1] // 2
                 x = pred_bold[:, i].reshape(B_size * T_size, 1, H_size, W_size)
-                x = _reflect_pad(_reflect_pad(x, pad, dim=2), pad, dim=3)
                 layers_blurred.append(
-                    F.conv2d(x, kernel, padding=0).reshape(B_size, T_size, H_size, W_size)
+                    F.conv2d(x, kernel, padding=pad).reshape(B_size, T_size, H_size, W_size).to(pred_bold.dtype)
                 )
             pred_bold = torch.stack(layers_blurred, dim=1)  # [B, L, T, H, W]
 
@@ -390,33 +389,29 @@ class MICH(LightningModule):
         burn_in: int,
         order: str,
     ) -> Mapping[str, torch.Tensor]:
+        has_drain = z_hat.shape[1] > 5  # vstar/qstar only present in multi-layer mode
+
         x = MICH._gather_z_hat_at(z_hat, idx, signal="x")[:, layer]
         s = MICH._gather_z_hat_at(z_hat, idx, signal="s")[:, layer]
         f = MICH._gather_z_hat_at(z_hat, idx, signal="f")[:, layer]
         v = MICH._gather_z_hat_at(z_hat, idx, signal="v")[:, layer]
         q = MICH._gather_z_hat_at(z_hat, idx, signal="q")[:, layer]
-        v_star = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer]
-        q_star = MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer]
 
-        states = self._sanitise_states(
-            {"x": x, "s": s, "f": f, "v": v, "q": q, "vstar": v_star, "qstar": q_star}
-        )
-        x, s, f, v, q, v_star, q_star = (
-            states["x"],
-            states["s"],
-            states["f"],
-            states["v"],
-            states["q"],
-            states["vstar"],
-            states["qstar"],
-        )
+        state_dict = {"x": x, "s": s, "f": f, "v": v, "q": q}
+        if has_drain:
+            v_star = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer]
+            q_star = MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer]
+            state_dict.update({"vstar": v_star, "qstar": q_star})
+
+        states = self._sanitise_states(state_dict)
+        x, s, f, v, q = states["x"], states["s"], states["f"], states["v"], states["q"]
+        if has_drain:
+            v_star, q_star = states["vstar"], states["qstar"]
 
         s_scale = 1.0
         f_scale = 1.0
         v_scale = 1.0
         q_scale = 1.0
-        v_star_scale = 1.0
-        q_star_scale = 1.0
 
         alpha = self.hparams.haemo.alpha
         gamma = self.hparams.haemo.gamma
@@ -445,7 +440,7 @@ class MICH(LightningModule):
             f, v, q = f + 1, v + 1, q + 1
         else:
             raise ValueError(f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}")
-        if layer > 0:
+        if has_drain and layer > 0:
             vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             target_vdot += lambda_d * vstar_deeper
         v_loss = self._ode_loss_fn(
@@ -470,7 +465,7 @@ class MICH(LightningModule):
                 - (1/alpha - 1) * v * q
                 - (1/2) * (1/alpha - 1) * (1/alpha - 2) * v**2 )
             f, v, q = f + 1, v + 1, q + 1
-        if layer > 0:
+        if has_drain and layer > 0:
             qstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
             target_qdot += lambda_d * qstar_deeper
         q_loss = self._ode_loss_fn(
@@ -478,36 +473,33 @@ class MICH(LightningModule):
             (target_qdot[:, burn_in:] / tau) / q_scale,
         )
 
-        dv_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
-        v_star_target = (-v_star + v - 1) / tau
-        v_star_loss = self._ode_loss_fn(
-            dv_star_dt[:, burn_in:] / v_star_scale, v_star_target[:, burn_in:] / v_star_scale
-        )
+        losses = {"s": s_loss, "f": f_loss, "v": v_loss, "q": q_loss}
 
-        dq_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar")
-        q_star_target = (-q_star + q - 1) / tau
-        q_star_loss = self._ode_loss_fn(
-            dq_star_dt[:, burn_in:] / q_star_scale, q_star_target[:, burn_in:] / q_star_scale
-        )
+        if has_drain:
+            dv_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
+            v_star_target = (-v_star + v - 1) / tau
+            losses["vstar"] = self._ode_loss_fn(
+                dv_star_dt[:, burn_in:], v_star_target[:, burn_in:]
+            )
+            dq_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar")
+            q_star_target = (-q_star + q - 1) / tau
+            losses["qstar"] = self._ode_loss_fn(
+                dq_star_dt[:, burn_in:], q_star_target[:, burn_in:]
+            )
 
-        return {
-            "s": s_loss,
-            "f": f_loss,
-            "v": v_loss,
-            "q": q_loss,
-            "vstar": v_star_loss,
-            "qstar": q_star_loss,
-        }
+        return losses
 
     # Mapping from z_hat signal name -> batch key
-    _SUPERVISION_KEYS = (
-        ("s", "s"),
-        ("f", "f"),
-        ("v", "v"),
-        ("q", "q"),
-        ("vstar", "v_star"),
-        ("qstar", "q_star"),
+    _SUPERVISION_KEYS_FULL = (
+        ("s", "s"), ("f", "f"), ("v", "v"), ("q", "q"),
+        ("vstar", "v_star"), ("qstar", "q_star"),
     )
+    _SUPERVISION_KEYS_SINGLE = (
+        ("s", "s"), ("f", "f"), ("v", "v"), ("q", "q"),
+    )
+
+    def _supervision_keys(self, z_hat: torch.Tensor):
+        return self._SUPERVISION_KEYS_SINGLE if z_hat.shape[1] <= 5 else self._SUPERVISION_KEYS_FULL
 
     def _supervision_loss(
         self,
@@ -536,7 +528,7 @@ class MICH(LightningModule):
             uniform_time_lo=lc.uniform_time_lo,
         )
         per_sig: dict[str, torch.Tensor] = {}
-        for sig, bk in self._SUPERVISION_KEYS:
+        for sig, bk in self._supervision_keys(z_hat):
             true = batch[bk].float()  # [B, L, T_latent, H, W]
             pred_at = MICH._gather_z_hat_at(z_hat, idx, signal=sig).float()  # [B, L, n_t, n_s]
             true_at = MICH._gather_bold_at(true, idx).float()  # [B, L, n_t, n_s]
@@ -566,7 +558,7 @@ class MICH(LightningModule):
         T_min = min(T_pred, T_latent)
 
         per_sig: dict[str, torch.Tensor] = {}
-        for sig, bk in self._SUPERVISION_KEYS:
+        for sig, bk in self._supervision_keys(z_hat):
             true = batch[bk].float()  # [B, L, T_latent, H, W]
             pred = z_hat[:, MICH._signal_index(sig)].float()  # [B, L, T, H, W]
             pred_src = pred[b_idx, :, :T_min, src_h, src_w]  # [B, L, T_min]
@@ -617,7 +609,9 @@ class MICH(LightningModule):
             dense_time_hi=self.hparams.loss_config.dense_time_hi,
             uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
         )
-        _eq_keys = ("s", "f", "v", "q", "vstar", "qstar")
+        has_drain = z_hat.shape[1] > 5
+        _eq_keys = ("s", "f", "v", "q", "vstar", "qstar") if has_drain else ("s", "f", "v", "q")
+        n_eq = len(_eq_keys)
         tot_physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=torch.float32)
         per_eq = {k: torch.tensor(0.0, device=z_hat.device, dtype=torch.float32) for k in _eq_keys}
         n_layers = z_hat.shape[2]
@@ -625,7 +619,7 @@ class MICH(LightningModule):
             layer_losses = self._compute_physics_layer_loss(
                 z_hat, dz_hat_dt, idx, layer=layer, burn_in=self.hparams.loss_config.burn_in, order=order
             )
-            layer_total = sum(layer_losses.values()).float() / 6.0
+            layer_total = sum(layer_losses.values()).float() / n_eq
             tot_physics_loss = tot_physics_loss + layer_total / n_layers
             for k in _eq_keys:
                 per_eq[k] = per_eq[k] + layer_losses[k].float() / n_layers
@@ -641,6 +635,7 @@ class MICH(LightningModule):
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
         bold, neural = batch["bold"], batch["neural"]
         source_position = batch["source_position"]
+        source_layer = batch.get("source_layer", None)
 
         bold_norm = self.normaliser(bold, source_position) if self.normaliser is not None else bold
 
@@ -829,13 +824,13 @@ class MICH(LightningModule):
         true_f = batch["f"]
         true_v = batch["v"]
         true_q = batch["q"]
-        true_v_star = batch["v_star"]
-        true_q_star = batch["q_star"]
-
         true_x = torch.empty_like(true_s)
-        true_z_hat = torch.stack(
-            [true_x, true_s, true_f, true_v, true_q, true_v_star, true_q_star], dim=1
-        )
+        if "v_star" in batch and "q_star" in batch:
+            true_z_hat = torch.stack(
+                [true_x, true_s, true_f, true_v, true_q, batch["v_star"], batch["q_star"]], dim=1
+            )
+        else:
+            true_z_hat = torch.stack([true_x, true_s, true_f, true_v, true_q], dim=1)
         if len(self.pred_buffer) < 100:
             self.pred_buffer.append(manifest.z_hat.detach().cpu())
             self.bold_buffer.append(manifest.bold.detach().cpu())
@@ -876,17 +871,31 @@ class MICH(LightningModule):
         subset_w = subset_src_pos[..., 1]
         batch_idx = torch.arange(subset_bold.shape[0])
 
+        # Compute pred_bold at full spatial resolution so PSF can be applied before indexing.
+        pred_bold_full = MICH._compute_bold(
+            subset_z_hat[:, MICH._signal_index("v")],
+            subset_z_hat[:, MICH._signal_index("q")],
+            acquisition=self.hparams.acquisition,
+            V0=self.hparams.V0,
+        )  # [B, L, T, H, W]
+        if self._psf is not None:
+            B_s, L_s, T_s, H_s, W_s = pred_bold_full.shape
+            layers_blurred = []
+            for i in range(L_s):
+                kernel = getattr(self, f"_psf_kernel_{i}").to(pred_bold_full.device)
+                pad = kernel.shape[-1] // 2
+                x = pred_bold_full[:, i].reshape(B_s * T_s, 1, H_s, W_s)
+                layers_blurred.append(
+                    F.conv2d(x, kernel, padding=pad).reshape(B_s, T_s, H_s, W_s).to(pred_bold_full.dtype)
+                )
+            pred_bold_full = torch.stack(layers_blurred, dim=1)
+
         subset_bold = subset_bold[batch_idx, :, :, subset_h, subset_w]
         subset_neural = subset_neural[batch_idx, :, :, subset_h, subset_w]
         subset_z_hat = subset_z_hat[batch_idx, :, :, :, subset_h, subset_w]
         subset_true_z_hat = subset_true_z_hat[batch_idx, :, :, :, subset_h, subset_w]
 
-        pred_bold = MICH._compute_bold(
-            subset_z_hat[:, MICH._signal_index("v")],
-            subset_z_hat[:, MICH._signal_index("q")],
-            acquisition=self.hparams.acquisition,
-            V0=self.hparams.V0,
-        )
+        pred_bold = pred_bold_full[batch_idx, :, :, subset_h, subset_w]  # [B, L, T]
         pred_neural = subset_z_hat[:, MICH._signal_index("x")]
 
         self._plot_and_log_predictions(
@@ -897,20 +906,33 @@ class MICH(LightningModule):
             source_layer=subset_src_layer,
             source_pos=subset_src_pos,
         )
-        self._plot_and_log_latents(
-            pred_s=subset_z_hat[:, MICH._signal_index("s")],
-            true_s=subset_true_z_hat[:, MICH._signal_index("s")],
-            pred_f=subset_z_hat[:, MICH._signal_index("f")],
-            true_f=subset_true_z_hat[:, MICH._signal_index("f")],
-            pred_v=subset_z_hat[:, MICH._signal_index("v")],
-            true_v=subset_true_z_hat[:, MICH._signal_index("v")],
-            pred_q=subset_z_hat[:, MICH._signal_index("q")],
-            true_q=subset_true_z_hat[:, MICH._signal_index("q")],
-            pred_v_star=subset_z_hat[:, MICH._signal_index("vstar")],
-            true_v_star=subset_true_z_hat[:, MICH._signal_index("vstar")],
-            pred_q_star=subset_z_hat[:, MICH._signal_index("qstar")],
-            true_q_star=subset_true_z_hat[:, MICH._signal_index("qstar")],
-        )
+        has_drain = subset_z_hat.shape[1] > 5
+        if has_drain:
+            self._plot_and_log_latents(
+                pred_s=subset_z_hat[:, MICH._signal_index("s")],
+                true_s=subset_true_z_hat[:, MICH._signal_index("s")],
+                pred_f=subset_z_hat[:, MICH._signal_index("f")],
+                true_f=subset_true_z_hat[:, MICH._signal_index("f")],
+                pred_v=subset_z_hat[:, MICH._signal_index("v")],
+                true_v=subset_true_z_hat[:, MICH._signal_index("v")],
+                pred_q=subset_z_hat[:, MICH._signal_index("q")],
+                true_q=subset_true_z_hat[:, MICH._signal_index("q")],
+                pred_v_star=subset_z_hat[:, MICH._signal_index("vstar")],
+                true_v_star=subset_true_z_hat[:, MICH._signal_index("vstar")],
+                pred_q_star=subset_z_hat[:, MICH._signal_index("qstar")],
+                true_q_star=subset_true_z_hat[:, MICH._signal_index("qstar")],
+            )
+        else:
+            self._plot_and_log_latents(
+                pred_s=subset_z_hat[:, MICH._signal_index("s")],
+                true_s=subset_true_z_hat[:, MICH._signal_index("s")],
+                pred_f=subset_z_hat[:, MICH._signal_index("f")],
+                true_f=subset_true_z_hat[:, MICH._signal_index("f")],
+                pred_v=subset_z_hat[:, MICH._signal_index("v")],
+                true_v=subset_true_z_hat[:, MICH._signal_index("v")],
+                pred_q=subset_z_hat[:, MICH._signal_index("q")],
+                true_q=subset_true_z_hat[:, MICH._signal_index("q")],
+            )
 
     def _plot_and_log_predictions(
         self, pred_bold, true_bold, pred_neural, true_neural, source_layer, source_pos
@@ -941,29 +963,32 @@ class MICH(LightningModule):
         true_v,
         pred_q,
         true_q,
-        pred_v_star,
-        true_v_star,
-        pred_q_star,
-        true_q_star,
+        pred_v_star=None,
+        true_v_star=None,
+        pred_q_star=None,
+        true_q_star=None,
     ):
         run = getattr(self, "_rank_run", None) or wandb.run
         images = []
         for i in range(pred_s.shape[0]):
-            image = plot_latent_layers(
-                pred_f=pred_f[i],
-                true_f=true_f[i],
-                pred_s=pred_s[i],
-                true_s=true_s[i],
-                pred_v=pred_v[i],
-                true_v=true_v[i],
-                pred_q=pred_q[i],
-                true_q=true_q[i],
-                pred_v_star=pred_v_star[i],
-                true_v_star=true_v_star[i],
-                pred_q_star=pred_q_star[i],
-                true_q_star=true_q_star[i],
-                title="Latent States",
-            )
+            if pred_v_star is not None:
+                image = plot_latent_layers(
+                    pred_f=pred_f[i], true_f=true_f[i],
+                    pred_s=pred_s[i], true_s=true_s[i],
+                    pred_v=pred_v[i], true_v=true_v[i],
+                    pred_q=pred_q[i], true_q=true_q[i],
+                    pred_v_star=pred_v_star[i], true_v_star=true_v_star[i],
+                    pred_q_star=pred_q_star[i], true_q_star=true_q_star[i],
+                    title="Latent States",
+                )
+            else:
+                image = plot_latent_layers(
+                    pred_f=pred_f[i], true_f=true_f[i],
+                    pred_s=pred_s[i], true_s=true_s[i],
+                    pred_v=pred_v[i], true_v=true_v[i],
+                    pred_q=pred_q[i], true_q=true_q[i],
+                    title="Latent States",
+                )
             images.append(wandb.Image(image))
             plt.close(image)
         if run is not None and images:

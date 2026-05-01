@@ -1,10 +1,20 @@
+
+# @package _global_
+
+# Order indicates overwriting
+defaults:
+  - _self_
+  - private: private.yaml
+  - paths: default.yaml
+
 # ----------------------------------------------
 # BOLD simulation config
 # ----------------------------------------------
 
-num_simulations: 100
+
+num_simulations: 5000
 seed: 42
-output_path: data/simulations-linear-4x4.h5
+output_path: ${paths.data_dir}/julie-sim.h5
 
 # -- Haemodynamic constants ----------------------
 haemodynamic:
@@ -23,7 +33,7 @@ acquisition:
 
 # -- Simulation ----------------------------------
 simulation:
-  num_layers: 3
+  num_layers: 1
   grid_size: [10, 10] # [32, 32]
   dt: 1.0
   haemo_dt: 0.05
@@ -44,16 +54,16 @@ simulation:
   layers:
     - tau: 2.66
       lambda_d: 0.0    # deep  --no drain source
-    - tau: 2.66
-      lambda_d: 0.5    # mid   --drains from deep
-    - tau: 2.66
-      lambda_d: 0.5    # sup   --drains from mid
+    #- tau: 2.66
+     # lambda_d: 0.5    # mid   --drains from deep
+    #- tau: 2.66
+     # lambda_d: 0.5    # sup   --drains from mid
 
 # -- BOLD post-processing ------------------------
 bold:
-  psf_fwhm: [11.25, 17.30, 25.03] # for 32x32 use [18.0, 27.675, 40.05]   # per-layer PSF FWHM (grid units)
+  psf_fwhm: [11.25] #keep 11.25/3 # for 32x32 use [18.0, 27.675, 40.05]   # per-layer PSF FWHM (grid units)
   noise_model:
     field: "7T"
     V: 8.0
     TR: 2.0
-  noise_scales: [1.0, 1.23, 1.16]
+  noise_scales: [1.0] #keep 1.0

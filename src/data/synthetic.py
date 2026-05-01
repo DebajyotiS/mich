@@ -118,7 +118,7 @@ class SyntheticH5Dataset(Dataset):
         path: str,
         *,
         cache_cfg: Mapping[str, Any],
-        layers: Sequence[str] = ("layer_0", "layer_1", "layer_2"),
+        layers: Sequence[str] = ("layer_0",),
         dtype: torch.dtype = torch.float32,
         return_meta: bool = False,
         return_latents: bool = False,
@@ -199,8 +199,10 @@ class SyntheticH5Dataset(Dataset):
             self._m_latent_f = [self._h5[lyr]["f"] for lyr in self.layers]
             self._m_latent_v = [self._h5[lyr]["v"] for lyr in self.layers]
             self._m_latent_q = [self._h5[lyr]["q"] for lyr in self.layers]
-            self._m_latent_v_star = [self._h5[lyr]["v_star"] for lyr in self.layers]
-            self._m_latent_q_star = [self._h5[lyr]["q_star"] for lyr in self.layers]
+            # v_star/q_star only exist in multi-layer datasets
+            if "v_star" in self._h5[self.layers[0]]:
+                self._m_latent_v_star = [self._h5[lyr]["v_star"] for lyr in self.layers]
+                self._m_latent_q_star = [self._h5[lyr]["q_star"] for lyr in self.layers]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         self._ensure_open()
@@ -210,7 +212,6 @@ class SyntheticH5Dataset(Dataset):
 
         bold = np.empty((L, T, H, W), dtype=self._np_dtype)
         x = np.empty((L, T, H, W), dtype=self._np_dtype)
-
         for layer_index in range(L):
             self._bold_ds[layer_index].read_direct(
                 bold, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
@@ -235,30 +236,22 @@ class SyntheticH5Dataset(Dataset):
             f = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
             v = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
             q = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
-            v_star = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
-            q_star = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
 
             for layer_index in range(L):
-                self._m_latent_s[layer_index].read_direct(
-                    s, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
-                )
-                self._m_latent_f[layer_index].read_direct(
-                    f, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
-                )
-                self._m_latent_v[layer_index].read_direct(
-                    v, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
-                )
-                self._m_latent_q[layer_index].read_direct(
-                    q, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
-                )
-                self._m_latent_v_star[layer_index].read_direct(
-                    v_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
-                )
-                self._m_latent_q_star[layer_index].read_direct(
-                    q_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
-                )
+                self._m_latent_s[layer_index].read_direct(s, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_f[layer_index].read_direct(f, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_v[layer_index].read_direct(v, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_q[layer_index].read_direct(q, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
 
-            out.update({"s": s, "f": f, "v": v, "q": q, "v_star": v_star, "q_star": q_star})
+            out.update({"s": s, "f": f, "v": v, "q": q})
+
+            if self._m_latent_v_star is not None:
+                v_star = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
+                q_star = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
+                for layer_index in range(L):
+                    self._m_latent_v_star[layer_index].read_direct(v_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                    self._m_latent_q_star[layer_index].read_direct(q_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                out.update({"v_star": v_star, "q_star": q_star})
 
         return out
 
@@ -297,8 +290,8 @@ class SyntheticDataModule(pl.LightningDataModule):
         data_path = cfg.get("path")
         if data_path is None:
             raise ValueError("data.path must be set")
-        layers_val = cfg.get("layers", ("layer_0", "layer_1", "layer_2"))
-        layers = tuple(layers_val) if layers_val is not None else ("layer_0", "layer_1", "layer_2")
+        layers_val = cfg.get("layers", ("layer_0",))
+        layers = tuple(layers_val) if layers_val is not None else ("layer_0",)
         return SyntheticH5Dataset(
             path=str(data_path),
             layers=layers,

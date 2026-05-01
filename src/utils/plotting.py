@@ -122,35 +122,35 @@ def plot_latent_layers(
     true_v: torch.Tensor,
     pred_q: torch.Tensor,
     true_q: torch.Tensor,
-    pred_v_star: torch.Tensor,
-    true_v_star: torch.Tensor,
-    pred_q_star: torch.Tensor,
-    true_q_star: torch.Tensor,
+    pred_v_star: torch.Tensor | None = None,
+    true_v_star: torch.Tensor | None = None,
+    pred_q_star: torch.Tensor | None = None,
+    true_q_star: torch.Tensor | None = None,
     tr: float = 1.0,
     title: str = "Latent States",
 ) -> Figure:
     """
-    Plot all 7 Heinzle latent signals across 3 cortical layers for a single sample.
-
-    Each input tensor is [L, T].
-    Layout: rows = layers (Deep -> Superficial), cols = signals (x, s, f, v, q, v*, q*).
+    Plot Heinzle latent signals for a single sample. Each input tensor is [L, T].
+    v_star/q_star are optional — omit them in single-layer mode (no inter-layer drain).
+    Layout: rows = layers, cols = signals (s, f, v, q, [v*, q*]).
     """
     pred_signals = [
         pred_s.cpu().numpy(),
         pred_f.cpu().numpy(),
         pred_v.cpu().numpy(),
         pred_q.cpu().numpy(),
-        pred_v_star.cpu().numpy(),
-        pred_q_star.cpu().numpy(),
     ]
     true_signals = [
         true_s.cpu().numpy(),
         true_f.cpu().numpy(),
         true_v.cpu().numpy(),
         true_q.cpu().numpy(),
-        true_v_star.cpu().numpy(),
-        true_q_star.cpu().numpy(),
     ]
+    sig_names = ["s", "f", "v", "q"]
+    if pred_v_star is not None:
+        pred_signals += [pred_v_star.cpu().numpy(), pred_q_star.cpu().numpy()]
+        true_signals += [true_v_star.cpu().numpy(), true_q_star.cpu().numpy()]
+        sig_names += ["vstar", "qstar"]
 
     n_layers = pred_signals[0].shape[0]
     n_signals = len(pred_signals)
@@ -172,9 +172,17 @@ def plot_latent_layers(
     )
     fig.suptitle(title, fontfamily="monospace", fontsize=13)
 
-    for row, layer_name in enumerate(LAYER_NAMES):
+    # Ensure axes is always 2D
+    if n_layers == 1 and n_signals == 1:
+        axes = np.array([[axes]])
+    elif n_layers == 1:
+        axes = axes.reshape(1, -1)
+    elif n_signals == 1:
+        axes = axes.reshape(-1, 1)
+
+    for row, layer_name in enumerate(LAYER_NAMES[:n_layers]):
         for col, (pred_arr, true_arr, sig_name) in enumerate(
-            zip(pred_signals, true_signals, LATENT_NAMES, strict=True)
+            zip(pred_signals, true_signals, sig_names, strict=True)
         ):
             ax = axes[row, col]
             color = COLOR_HEX[SIGNALS_LIST.index(sig_name)]
