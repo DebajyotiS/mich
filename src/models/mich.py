@@ -9,6 +9,8 @@ import math
 import torch
 import torch.nn.functional as F
 import wandb
+from src.models.muon import MuonSingleGPU
+
 from pytorch_lightning import LightningModule
 
 from src.data.balloon import AcquisitionConstants, PointSpreadFunction
@@ -898,6 +900,19 @@ class MICH(LightningModule):
         pred_bold = pred_bold_full[batch_idx, :, :, subset_h, subset_w]  # [B, L, T]
         pred_neural = subset_z_hat[:, MICH._signal_index("x")]
 
+        # Neural recovery metrics over the full val set (not just the plot subset)
+        all_src_h = source_position[:, 0].long()
+        all_src_w = source_position[:, 1].long()
+        all_batch = torch.arange(z_hat.shape[0])
+        all_pred_neural = z_hat[all_batch, MICH._signal_index("x"), :, :, all_src_h, all_src_w]  # [B, L, T]
+        all_true_neural = neural[all_batch, :, :, all_src_h, all_src_w]                          # [B, L, T]
+        metrics = MICH._neural_recovery_metrics(all_pred_neural, all_true_neural)
+        run = getattr(self, "_rank_run", None) or wandb.run
+        if run is not None:
+            run.log({"global_step": self.global_step, **metrics})
+        for k, v in metrics.items():
+            self.log(k, v, on_epoch=True, sync_dist=True, logger=True)
+
         self._plot_and_log_predictions(
             pred_bold=pred_bold,
             true_bold=subset_bold,
@@ -933,6 +948,41 @@ class MICH(LightningModule):
                 pred_q=subset_z_hat[:, MICH._signal_index("q")],
                 true_q=subset_true_z_hat[:, MICH._signal_index("q")],
             )
+
+    @staticmethod
+    def _neural_recovery_metrics(
+        pred: torch.Tensor,  # [B, L, T]
+        true: torch.Tensor,  # [B, L, T]
+    ) -> dict[str, float]:
+        """R², Pearson r, and peak cross-correlation lag averaged over samples and layers."""
+        pred = pred.float()
+        true = true.float()
+        T = pred.shape[-1]
+        flat_pred = pred.reshape(-1, T)  # [B*L, T]
+        flat_true = true.reshape(-1, T)
+
+        # R²
+        ss_res = ((flat_true - flat_pred) ** 2).sum(dim=-1)
+        ss_tot = ((flat_true - flat_true.mean(dim=-1, keepdim=True)) ** 2).sum(dim=-1)
+        r2 = (1 - ss_res / ss_tot.clamp(min=1e-8)).mean().item()
+
+        # Pearson
+        p_c = flat_pred - flat_pred.mean(dim=-1, keepdim=True)
+        t_c = flat_true - flat_true.mean(dim=-1, keepdim=True)
+        pearson = (
+            (p_c * t_c).sum(dim=-1)
+            / (p_c.norm(dim=-1) * t_c.norm(dim=-1)).clamp(min=1e-8)
+        ).mean().item()
+
+        # Peak cross-correlation lag (in samples)
+        xcorr = torch.fft.irfft(
+            torch.fft.rfft(flat_true, n=2 * T) * torch.fft.rfft(flat_pred, n=2 * T).conj(),
+            n=2 * T,
+        )  # [B*L, 2T]
+        lags = torch.fft.fftfreq(2 * T, d=1.0 / (2 * T)).long().to(xcorr.device)
+        peak_lag = lags[xcorr.argmax(dim=-1)].float().mean().item()
+
+        return {"val/neural/r2": r2, "val/neural/pearson": pearson, "val/neural/lag_samples": peak_lag}
 
     def _plot_and_log_predictions(
         self, pred_bold, true_bold, pred_neural, true_neural, source_layer, source_pos
@@ -1054,7 +1104,19 @@ class MICH(LightningModule):
             self._rank_run = None
 
     def configure_optimizers(self):
-        optim = self.hparams.optimizer(self.parameters())
+        use_muon = getattr(self.hparams, "use_muon", False)
+        if use_muon:
+            lr = self.hparams.optimizer.keywords.get("lr", 3e-4)
+            wd = self.hparams.optimizer.keywords.get("weight_decay", 1e-5)
+            optim = MuonSingleGPU(
+                [p for p in self.parameters() if p.requires_grad],
+                lr=lr,
+                momentum=0.95,
+                adamw_lr=lr,
+                adamw_wd=wd,
+            )
+        else:
+            optim = self.hparams.optimizer(self.parameters())
         sched = self.hparams.scheduler(optim)
         return {
             "optimizer": optim,

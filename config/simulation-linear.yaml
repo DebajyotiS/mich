@@ -14,7 +14,7 @@ defaults:
 
 num_simulations: 5000
 seed: 42
-output_path: /home/korach/mich/single_linear_10x10.h5
+output_path: /home/korach/mich/data/snr/snr5.h5
 
 # -- Haemodynamic constants ----------------------
 haemodynamic:
