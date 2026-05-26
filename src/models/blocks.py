@@ -214,8 +214,7 @@ class TemporalDepthWiseTCNLayer(nn.Module):
         activation: str = "silu",
     ):
         super().__init__()
-        # This pad is no longer used. We do explicit left-padding in forward() to ensure causality.
-        _pad = (kernel_size - 1) * dilation // 2
+        _pad = (kernel_size - 1) * dilation // 2  # unused, kept for reference
 
         self.depthwise = nn.Conv1d(
             cin,
@@ -237,7 +236,7 @@ class TemporalDepthWiseTCNLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         pad = (self.depthwise.kernel_size[0] - 1) * self.depthwise.dilation[0]
-        x = F.pad(x, (pad, 0))  # left-pad for causality
+        x = F.pad(x, (pad // 2, pad - pad // 2))  # symmetric padding — non-causal
         x = self.depthwise(x)
         x = self.pointwise(x)
         x = self.norm(x)
@@ -635,6 +634,43 @@ class SpatioTemporalDecoder(nn.Module):
             ],
             dim=1,
         )
+
+
+class FullySupervisedNet(nn.Module):
+    """Encoder-only baseline: BOLD → neural (no physics, no decoder).
+
+    Shares the same spatial encoder and temporal TCN as HeinzleNet but
+    replaces the SpatioTemporalDecoder with a single 1×1 conv head that
+    directly regresses neural activity at every voxel and timestep.
+    """
+
+    def __init__(
+        self,
+        layer_mixing_config: Mapping[str, Any],
+        spatial_encoder_config: list[Mapping[str, Any]],
+        temporal_mixing_config: list[Mapping[str, Any]],
+        c_enc: int,
+    ):
+        super().__init__()
+        self.layer_mixing = MaskedLayerMixing(**layer_mixing_config)
+        self.spatial_encoder = SpatialEncoder(spatial_encoder_config)
+        self.temporal_mixing = TemporalMixingEncoder(temporal_mixing_config)
+        self.head = nn.Conv2d(c_enc, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: BOLD input [B, 1, T, H, W]  (1 channel per layer)
+        Returns:
+            neural: predicted neural activity [B, L, T, H, W]
+        """
+        xmix = self.layer_mixing(x)        # [B, T, L, C, H, W]
+        xenc = self.spatial_encoder(xmix)  # [B, T, L, C', H, W]
+        xmix = self.temporal_mixing(xenc)  # [B, T, L, C', H, W]
+        B, T, L, C, H, W = xmix.shape
+        out = xmix.reshape(B * T * L, C, H, W)
+        out = self.head(out)               # [B*T*L, 1, H, W]
+        return out.reshape(B, L, T, H, W)
 
 
 class HeinzleNet(nn.Module):

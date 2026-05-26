@@ -126,7 +126,7 @@ loss_config:
   bold_loss:
     type: "mse+pearson"
     lambda_npearson: 10.0
-    lambda_pearson: 1.0
+    lambda_pearson: 1
     huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
   ode_loss:
     type: "mse"
@@ -152,6 +152,8 @@ acquisition:
 V0: 0.5
 
 psf_fwhm: [1.0375]  # per-layer Gaussian PSF FWHM in grid units — must match simulation-linear.yaml
+
+use_muon: true
 
 optimizer:
   _target_: torch.optim.AdamW
