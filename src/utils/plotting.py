@@ -96,7 +96,7 @@ def plot_neural_bold_layers(
             alpha=0.8,
         )
 
-        ax_bold.set_title("Cortical Layer", fontfamily="monospace")
+        ax_bold.set_title(LAYER_NAMES[n_layers - i - 1], fontfamily="monospace")
         ax_bold.set_xlabel("Time (s)", fontfamily="monospace")
         ax_bold.set_ylabel("BOLD Signal", fontfamily="monospace")
         ax_neural.set_ylabel("Neural Activity", fontfamily="monospace")
