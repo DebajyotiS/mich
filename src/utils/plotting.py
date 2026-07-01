@@ -152,6 +152,9 @@ def plot_latent_layers(
         true_q.cpu().numpy(),
     ]
     sig_names = ["s", "f", "v", "q"]
+    stars = (pred_v_star, true_v_star, pred_q_star, true_q_star)
+    if any(t is not None for t in stars) and not all(t is not None for t in stars):
+        raise ValueError("pred/true v_star and q_star must be provided together")
     if pred_v_star is not None:
         pred_signals += [pred_v_star.cpu().numpy(), pred_q_star.cpu().numpy()]
         true_signals += [true_v_star.cpu().numpy(), true_q_star.cpu().numpy()]
