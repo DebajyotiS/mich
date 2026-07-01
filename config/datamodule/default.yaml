@@ -1,7 +1,7 @@
 _target_: src.data.synthetic.SyntheticDataModule
 
 data:
-  path: /home/korach/mich/single_linear_10x10.h5
+  path: ${paths.data_dir}/single_linear_10x10.h5
   layers: [layer_0]
   dtype: float16
   return_meta: true

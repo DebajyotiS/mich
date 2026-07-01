@@ -135,26 +135,8 @@ loss_config:
     type: "mse"
     huber_delta: 0.1 #used if type is "huber"
 
-haemo:
-  kappa: 0.65
-  gamma: 0.41
-  alpha: 0.32
-  tau: 2.66
-  lambda_d: 0.5
-
-acquisition:
-  f0: 28.625
-  E0: 0.34
-  TE: 0.25
-  r0: 340
-  eps: 1.0e-32
-  k1: 10.4624375
-  k2: 2.89e-31
-  k3: 1.0
-
-V0: 0.5
-
-psf_fwhm: [11.25, 17.30, 25.03] # for 32x32 use [18.0, 27.675, 40.05]  # per-layer Gaussian PSF FWHM in grid units (deep, mid, superficial)
+# haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
+# HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
 
 optimizer:
   _target_: torch.optim.AdamW

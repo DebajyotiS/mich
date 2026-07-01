@@ -50,6 +50,7 @@ lightning_logs/
 # --------------------------------------------------
 # poetry.lock
 # pdm.lock
+uv.lock
 
 # --------------------------------------------------
 # Private / local configuration

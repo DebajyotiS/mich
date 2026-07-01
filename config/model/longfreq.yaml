@@ -10,7 +10,7 @@ num_freqs: 10
 min_freq: 5.0
 max_freq: 20.0
 tcn_kernel: 3
-spatial_radius: 2
+spatial_radius: 1
 grid_size: 10 # this was 32
 
 embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
@@ -106,7 +106,7 @@ loss_config:
   lambda_smooth: 0.0
   warmup_steps_smooth: 0
   delay_steps_smooth: 0
-  lambda_supervision: 100.0
+  lambda_supervision: 10.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
   n_space: 225
@@ -132,26 +132,8 @@ loss_config:
     type: "mse"
     huber_delta: 0.1 #used if type is "huber"
 
-haemo:
-  kappa: 1.92
-  gamma: 0.41
-  alpha: 0.32
-  tau: 2.66
-  lambda_d: 0.5
-
-acquisition:
-  f0: 28.625
-  E0: 0.34
-  TE: 0.25
-  r0: 340
-  eps: 1.0e-32
-  k1: 10.4624375
-  k2: 2.89e-31
-  k3: 1.0
-
-V0: 0.5
-
-psf_fwhm: [1.0375]  # per-layer Gaussian PSF FWHM in grid units — must match simulation-linear.yaml
+# haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
+# HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
 
 use_muon: true
 
