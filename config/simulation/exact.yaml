@@ -1,0 +1,21 @@
+defaults:
+  - base
+  - _self_
+
+output_path: data/simulations-exact.h5
+
+simulation:
+  order: "exact"
+  num_layers: 3
+  grid_size: [4, 4]
+  diffusion_coefficient_intra: 12.0
+  # One entry per layer, bottom (deep) to top (superficial).
+  # layer[i>0] drains from layer[i-1].
+  layers:
+    - {tau: 2.66, lambda_d: 0.0}  # deep  — no drain source
+    - {tau: 2.66, lambda_d: 0.5}  # mid   — drains from deep
+    - {tau: 2.66, lambda_d: 0.5}  # sup   — drains from mid
+
+bold:
+  psf_fwhm: [18.0, 27.675, 40.05]
+  noise_scales: [1.0, 1.23, 1.16]
