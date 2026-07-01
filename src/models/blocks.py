@@ -662,7 +662,7 @@ class FullySupervisedNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: BOLD input [B, 1, T, H, W]  (1 channel per layer)
+            x: BOLD input [B, L, T, H, W]
         Returns:
             neural: predicted neural activity [B, L, T, H, W]
         """
