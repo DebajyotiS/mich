@@ -96,15 +96,17 @@ def plot_neural_bold_layers(
             alpha=0.8,
         )
 
-        ax_bold.set_title(LAYER_NAMES[i], fontfamily="monospace")
+        ax_bold.set_title(LAYER_NAMES[n_layers - i - 1], fontfamily="monospace")
         ax_bold.set_xlabel("Time (s)", fontfamily="monospace")
         ax_bold.set_ylabel("BOLD Signal", fontfamily="monospace")
         ax_neural.set_ylabel("Neural Activity", fontfamily="monospace")
-        ax_bold.set_ylim(bold_min - bold_pad, bold_max + bold_pad)
-        ax_neural.set_ylim(
-            neural_min - neural_pad,
-            np.max((pred_neural_np.max(), true_neural_np.max())) + neural_pad,
-        )
+        bold_lo, bold_hi = bold_min - bold_pad, bold_max + bold_pad
+        if np.isfinite(bold_lo) and np.isfinite(bold_hi) and bold_lo < bold_hi:
+            ax_bold.set_ylim(bold_lo, bold_hi)
+        neural_hi = np.max((pred_neural_np.max(), true_neural_np.max())) + neural_pad
+        neural_lo = neural_min - neural_pad
+        if np.isfinite(neural_lo) and np.isfinite(neural_hi) and neural_lo < neural_hi:
+            ax_neural.set_ylim(neural_lo, neural_hi)
 
         ax_bold.legend(loc="upper left", frameon=False)
         ax_neural.legend(loc="upper right", frameon=False)
@@ -150,6 +152,9 @@ def plot_latent_layers(
         true_q.cpu().numpy(),
     ]
     sig_names = ["s", "f", "v", "q"]
+    stars = (pred_v_star, true_v_star, pred_q_star, true_q_star)
+    if any(t is not None for t in stars) and not all(t is not None for t in stars):
+        raise ValueError("pred/true v_star and q_star must be provided together")
     if pred_v_star is not None:
         pred_signals += [pred_v_star.cpu().numpy(), pred_q_star.cpu().numpy()]
         true_signals += [true_v_star.cpu().numpy(), true_q_star.cpu().numpy()]
@@ -165,7 +170,8 @@ def plot_latent_layers(
     for true_arr in true_signals:
         lo, hi = true_arr.min(), true_arr.max()
         pad = (hi - lo) * 0.05
-        sig_ylims.append((lo - pad, hi + pad))
+        lo, hi = lo - pad, hi + pad
+        sig_ylims.append((lo, hi) if (np.isfinite(lo) and np.isfinite(hi) and lo < hi) else (None, None))
 
     fig, axes = plt.subplots(
         nrows=n_layers,
@@ -201,7 +207,8 @@ def plot_latent_layers(
                 label="Pred",
             )
             ax.legend(loc="upper right", frameon=False, fontsize=7)
-            ax.set_ylim(*sig_ylims[col])
+            if sig_ylims[col][0] is not None:
+                ax.set_ylim(*sig_ylims[col])
 
             # column header on top row only
             if row == 0:

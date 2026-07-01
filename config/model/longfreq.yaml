@@ -126,7 +126,7 @@ loss_config:
   bold_loss:
     type: "mse+pearson"
     lambda_npearson: 10.0
-    lambda_pearson: 1.0
+    lambda_pearson: 1
     huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
   ode_loss:
     type: "mse"
@@ -134,6 +134,8 @@ loss_config:
 
 # haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
 # HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
+
+use_muon: true
 
 optimizer:
   _target_: torch.optim.AdamW
