@@ -382,8 +382,10 @@ class SpatioTemporalDecoder(nn.Module):
         self.signals = signals
         self.signal_idx: dict[HeinzleSignal, int] = {s: i for i, s in enumerate(signals)}
         N_SIG = len(signals)
+        assert out_channels == N_SIG, (
+            f"out_channels must match len(signals): out_channels={out_channels}, len(signals)={N_SIG}"
+        )
         channel_activations = [HEINZLE_ACTIVATIONS[s] for s in signals]
-
         self.L = L
         self.layer_embed_dim = layer_embed_dim
         self.signal_embed_dim = signal_embed_dim
