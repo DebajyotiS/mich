@@ -446,6 +446,7 @@ class MICH(LightningModule):
             raise ValueError(
                 f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}"
             )
+            raise ValueError(f"Expected order to be one of `linear`, `quadratic` or `exact`. But received {order}")
         if has_drain and layer > 0:
             vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             target_vdot += lambda_d * vstar_deeper
@@ -972,19 +973,6 @@ class MICH(LightningModule):
         for k, v in metrics.items():
             self.log(k, v, on_epoch=True, sync_dist=True, logger=True)
 
-        # Neural recovery metrics over the full val set (not just the plot subset)
-        all_src_h = source_position[:, 0].long()
-        all_src_w = source_position[:, 1].long()
-        all_batch = torch.arange(z_hat.shape[0])
-        all_pred_neural = z_hat[all_batch, MICH._signal_index("x"), :, :, all_src_h, all_src_w]  # [B, L, T]
-        all_true_neural = neural[all_batch, :, :, all_src_h, all_src_w]                          # [B, L, T]
-        metrics = MICH._neural_recovery_metrics(all_pred_neural, all_true_neural)
-        run = getattr(self, "_rank_run", None) or wandb.run
-        if run is not None:
-            run.log({"global_step": self.global_step, **metrics})
-        for k, v in metrics.items():
-            self.log(k, v, on_epoch=True, sync_dist=True, logger=True)
-
         self._plot_and_log_predictions(
             pred_bold=pred_bold,
             true_bold=subset_bold,
@@ -1020,6 +1008,52 @@ class MICH(LightningModule):
                 pred_q=subset_z_hat[:, MICH._signal_index("q")],
                 true_q=subset_true_z_hat[:, MICH._signal_index("q")],
             )
+
+    def _plot_and_log_x_recon(
+        self, pred_neural, pred_x_recon, true_x_recon, true_neural, source_layer
+    ):
+        run = getattr(self, "_rank_run", None) or wandb.run
+        layer_names = ["Deep", "Middle", "Superficial"]
+        images = []
+        for i in range(pred_neural.shape[0]):
+            n_layers = pred_neural.shape[1]
+            fig, axes = plt.subplots(1, n_layers, figsize=(8 * n_layers, 8))
+            if n_layers == 1:
+                axes = [axes]
+            for l, ax in enumerate(axes):
+                T = pred_neural.shape[2]
+                t_full = torch.arange(T).float()
+                t_short = torch.arange(T - 1).float()
+                ax.plot(t_full, true_neural[i, l].cpu().float(), label="True x", color="green")
+                ax.plot(
+                    t_full,
+                    pred_neural[i, l].cpu().float(),
+                    label="Pred x (head)",
+                    color="purple",
+                    linestyle="--",
+                )
+                ax.plot(
+                    t_short,
+                    pred_x_recon[i, l].cpu().float(),
+                    label="Pred x (recon from s/f)",
+                    color="orange",
+                    linestyle=":",
+                )
+                ax.plot(
+                    t_short,
+                    true_x_recon[i, l].cpu().float(),
+                    label="True x (recon from s/f)",
+                    color="blue",
+                    linestyle=":",
+                )
+                ax.set_title(f"{layer_names[l]}" + (" [src]" if source_layer[i] == l else ""))
+                ax.legend(fontsize=6)
+            fig.suptitle("x: head vs ODE reconstruction")
+            fig.tight_layout()
+            images.append(wandb.Image(fig))
+            plt.close(fig)
+        if run is not None and images:
+            run.log({"global_step": self.global_step, "media/x_recon": images}, commit=False)
 
     @staticmethod
     def _neural_recovery_metrics(
