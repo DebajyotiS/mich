@@ -15,6 +15,7 @@ Usage:
     python scripts/eval_mich.py --model-type both \
         -c <pinn.ckpt> --supervised-checkpoint <sup.ckpt> --data-dir data/gridsearch/
 """
+
 from __future__ import annotations
 
 import argparse
@@ -22,15 +23,14 @@ import re
 from pathlib import Path
 
 import h5py
+import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from hydra.utils import instantiate
-from omegaconf import OmegaConf
+from omegaconf import DictConfig
 
-import rootutils
 root = rootutils.setup_root(__file__, pythonpath=True, cwd=False)
 
 from src.models.mich import MICH
@@ -44,94 +44,31 @@ from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
 def load_samples(data_path: str, n: int, device: torch.device) -> dict[str, torch.Tensor]:
     with h5py.File(data_path, "r") as h5f:
-        bold    = torch.tensor(h5f["layer_0"]["bold"][:n], dtype=torch.float32)
-        neural  = torch.tensor(h5f["layer_0"]["x"][:n],   dtype=torch.float32)
-        true_s  = torch.tensor(h5f["layer_0"]["s"][:n],   dtype=torch.float32)
-        true_f  = torch.tensor(h5f["layer_0"]["f"][:n],   dtype=torch.float32)
-        true_v  = torch.tensor(h5f["layer_0"]["v"][:n],   dtype=torch.float32)
-        true_q  = torch.tensor(h5f["layer_0"]["q"][:n],   dtype=torch.float32)
+        bold = torch.tensor(h5f["layer_0"]["bold"][:n], dtype=torch.float32)
+        neural = torch.tensor(h5f["layer_0"]["x"][:n], dtype=torch.float32)
+        true_s = torch.tensor(h5f["layer_0"]["s"][:n], dtype=torch.float32)
+        true_f = torch.tensor(h5f["layer_0"]["f"][:n], dtype=torch.float32)
+        true_v = torch.tensor(h5f["layer_0"]["v"][:n], dtype=torch.float32)
+        true_q = torch.tensor(h5f["layer_0"]["q"][:n], dtype=torch.float32)
         src_pos = torch.tensor(h5f["meta"]["source_position"][:n], dtype=torch.long)
 
-    bold    = bold.unsqueeze(1).to(device)
-    neural  = neural.unsqueeze(1).to(device)
-    true_s  = true_s.unsqueeze(1).to(device)
-    true_f  = true_f.unsqueeze(1).to(device)
-    true_v  = true_v.unsqueeze(1).to(device)
-    true_q  = true_q.unsqueeze(1).to(device)
+    bold = bold.unsqueeze(1).to(device)
+    neural = neural.unsqueeze(1).to(device)
+    true_s = true_s.unsqueeze(1).to(device)
+    true_f = true_f.unsqueeze(1).to(device)
+    true_v = true_v.unsqueeze(1).to(device)
+    true_q = true_q.unsqueeze(1).to(device)
     src_pos = src_pos.to(device)
-    return dict(bold=bold, neural=neural, true_s=true_s, true_f=true_f,
-                true_v=true_v, true_q=true_q, src_pos=src_pos)
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def _resize_normaliser_buffers(model, sd):
-    for buf_name in ("running_mean", "running_M2"):
-        key = f"normaliser.{buf_name}"
-        if key in sd:
-            model.normaliser.register_buffer(buf_name, torch.zeros_like(sd[key]))
-
-
-def load_mich(checkpoint_path: str, device: torch.device) -> MICH:
-    raw = OmegaConf.load(root / "config" / "model" / "longfreq.yaml")
-    cfg = OmegaConf.create({"model": raw})
-    model: MICH = instantiate(cfg.model)
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    sd = ckpt["state_dict"]
-    _resize_normaliser_buffers(model, sd)
-    model.load_state_dict(sd)
-    return model.to(device).eval()
-
-
-def load_supervised(checkpoint_path: str, device: torch.device) -> SupervisedMICH:
-    raw = OmegaConf.load(root / "config" / "model" / "supervised.yaml")
-    cfg = OmegaConf.create({"model": raw})
-    model: SupervisedMICH = instantiate(cfg.model)
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    sd = ckpt["state_dict"]
-    _resize_normaliser_buffers(model, sd)
-    model.load_state_dict(sd)
-    return model.to(device).eval()
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def compute_metrics(pred_neural: torch.Tensor, true_neural: torch.Tensor) -> dict[str, float]:
-    """pred/true: [N, L, T] at source voxel."""
-    pred, true = pred_neural.float(), true_neural.float()
-    T = pred.shape[-1]
-    flat_pred = pred.reshape(-1, T)
-    flat_true = true.reshape(-1, T)
-
-    ss_res = ((flat_true - flat_pred) ** 2).sum(dim=-1)
-    ss_tot = ((flat_true - flat_true.mean(dim=-1, keepdim=True)) ** 2).sum(dim=-1)
-    r2 = (1 - ss_res / ss_tot.clamp(min=1e-8)).mean().item()
-
-    p_c = flat_pred - flat_pred.mean(dim=-1, keepdim=True)
-    t_c = flat_true - flat_true.mean(dim=-1, keepdim=True)
-    pearson = (
-        (p_c * t_c).sum(dim=-1)
-        / (p_c.norm(dim=-1) * t_c.norm(dim=-1)).clamp(min=1e-8)
-    ).mean().item()
-
-    xcorr = torch.fft.irfft(
-        torch.fft.rfft(flat_true, n=2 * T) * torch.fft.rfft(flat_pred, n=2 * T).conj(),
-        n=2 * T,
+    return dict(
+        bold=bold,
+        neural=neural,
+        true_s=true_s,
+        true_f=true_f,
+        true_v=true_v,
+        true_q=true_q,
+        src_pos=src_pos,
     )
-    lags = torch.fft.fftfreq(2 * T, d=1.0 / (2 * T)).long().to(xcorr.device)
-    peak_lag = lags[xcorr.argmax(dim=-1)].float().mean().item()
 
-    return {"r2": r2, "pearson": pearson, "lag_samples": peak_lag}
-
-
-# ---------------------------------------------------------------------------
-# Per-model inference
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def infer_mich(model: MICH, bold: torch.Tensor):
@@ -334,6 +271,17 @@ def plot_grid_heatmaps(
 # Main
 # ---------------------------------------------------------------------------
 
+@hydra.main(
+    version_base=None,
+    config_path=str(root / "config"),
+    config_name="evalconfig.yaml",
+)
+def main(cfg: DictConfig) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt_path = Path(cfg.checkpoint)
+
+    if cfg.data.path is not None:
+        h5_files = [Path(cfg.data.path)]
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate MICH / SupervisedMICH on H5 dataset(s)")
     CKPT_DEFAULT = "/media/RCPNAS/Data2/korach/inversion/results_julie/mich-bold-inversion/single-layer_julie/checkpoints/last-v72.ckpt"
@@ -357,14 +305,14 @@ def main() -> None:
     if args.data:
         h5_files = [Path(args.data)]
     else:
-        h5_files = sorted(Path(args.data_dir).glob("*.h5"))
+        h5_files = sorted(Path(cfg.data.data_dir).glob("*.h5"))
         if not h5_files:
-            raise FileNotFoundError(f"No H5 files found in {args.data_dir}")
+            raise FileNotFoundError(f"No H5 files found in {cfg.data.data_dir}")
 
     run_name = args.wandb_run_name or f"eval/{args.model_type}"
     run = wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity or None,
         name=run_name,
         config={"model_type": args.model_type, "n_samples": args.n_samples,
                 "n_files": len(h5_files)},
@@ -414,7 +362,7 @@ def main() -> None:
     for row in all_metrics:
         run.log(row)
     run.finish()
-    print(f"\nDone. {len(h5_files)} files × {args.n_samples} samples logged to W&B: {run.url}")
+    print(f"\nDone. {len(h5_files)} files x {cfg.n_samples} samples logged to W&B: {run.url}")
 
 
 if __name__ == "__main__":
