@@ -101,7 +101,10 @@ def plot_neural_bold_layers(
         ax_bold.set_ylabel("BOLD Signal", fontfamily="monospace")
         ax_neural.set_ylabel("Neural Activity", fontfamily="monospace")
         ax_bold.set_ylim(bold_min - bold_pad, bold_max + bold_pad)
-        ax_neural.set_ylim(neural_min - neural_pad, np.max((pred_neural_np.max(), true_neural_np.max())) + neural_pad)
+        ax_neural.set_ylim(
+            neural_min - neural_pad,
+            np.max((pred_neural_np.max(), true_neural_np.max())) + neural_pad,
+        )
 
         ax_bold.legend(loc="upper left", frameon=False)
         ax_neural.legend(loc="upper right", frameon=False)

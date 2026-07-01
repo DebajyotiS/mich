@@ -3,25 +3,25 @@ Evaluate a trained MICH model on H5 dataset(s).
 
 Usage:
     # Single file:
-    python scripts/eval_mich.py -c <checkpoint.ckpt> -d <data.h5>
+    python scripts/eval_mich.py checkpoint=<path> data.path=<data.h5>
 
-    # Full gridsearch directory:
-    python scripts/eval_mich.py -c <checkpoint.ckpt> --data-dir data/gridsearch/
+    # Gridsearch directory:
+    python scripts/eval_mich.py checkpoint=<path> data.data_dir=data/gridsearch/
 """
+
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 import h5py
+import hydra
 import matplotlib.pyplot as plt
+import rootutils
 import torch
 import torch.nn.functional as F
 import wandb
-from hydra.utils import instantiate
-from omegaconf import OmegaConf
+from omegaconf import DictConfig
 
-import rootutils
 root = rootutils.setup_root(__file__, pythonpath=True, cwd=False)
 
 from src.models.mich import MICH
@@ -30,42 +30,30 @@ from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
 def load_samples(data_path: str, n: int, device: torch.device) -> dict[str, torch.Tensor]:
     with h5py.File(data_path, "r") as h5f:
-        bold    = torch.tensor(h5f["layer_0"]["bold"][:n], dtype=torch.float32)
-        neural  = torch.tensor(h5f["layer_0"]["x"][:n],   dtype=torch.float32)
-        true_s  = torch.tensor(h5f["layer_0"]["s"][:n],   dtype=torch.float32)
-        true_f  = torch.tensor(h5f["layer_0"]["f"][:n],   dtype=torch.float32)
-        true_v  = torch.tensor(h5f["layer_0"]["v"][:n],   dtype=torch.float32)
-        true_q  = torch.tensor(h5f["layer_0"]["q"][:n],   dtype=torch.float32)
+        bold = torch.tensor(h5f["layer_0"]["bold"][:n], dtype=torch.float32)
+        neural = torch.tensor(h5f["layer_0"]["x"][:n], dtype=torch.float32)
+        true_s = torch.tensor(h5f["layer_0"]["s"][:n], dtype=torch.float32)
+        true_f = torch.tensor(h5f["layer_0"]["f"][:n], dtype=torch.float32)
+        true_v = torch.tensor(h5f["layer_0"]["v"][:n], dtype=torch.float32)
+        true_q = torch.tensor(h5f["layer_0"]["q"][:n], dtype=torch.float32)
         src_pos = torch.tensor(h5f["meta"]["source_position"][:n], dtype=torch.long)
 
-    bold    = bold.unsqueeze(1).to(device)
-    neural  = neural.unsqueeze(1).to(device)
-    true_s  = true_s.unsqueeze(1).to(device)
-    true_f  = true_f.unsqueeze(1).to(device)
-    true_v  = true_v.unsqueeze(1).to(device)
-    true_q  = true_q.unsqueeze(1).to(device)
+    bold = bold.unsqueeze(1).to(device)
+    neural = neural.unsqueeze(1).to(device)
+    true_s = true_s.unsqueeze(1).to(device)
+    true_f = true_f.unsqueeze(1).to(device)
+    true_v = true_v.unsqueeze(1).to(device)
+    true_q = true_q.unsqueeze(1).to(device)
     src_pos = src_pos.to(device)
-    return dict(bold=bold, neural=neural, true_s=true_s, true_f=true_f,
-                true_v=true_v, true_q=true_q, src_pos=src_pos)
-
-
-def load_model(checkpoint_path: str, device: torch.device) -> MICH:
-    config_path = root / "config" / "model" / "longfreq.yaml"
-    raw = OmegaConf.load(config_path)
-    cfg = OmegaConf.create({"model": raw})
-    model: MICH = instantiate(cfg.model)
-
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    sd = ckpt["state_dict"]
-
-    for buf_name in ("running_mean", "running_M2"):
-        key = f"normaliser.{buf_name}"
-        if key in sd:
-            model.normaliser.register_buffer(buf_name, torch.zeros_like(sd[key]))
-
-    model.load_state_dict(sd)
-    model.to(device).eval()
-    return model
+    return dict(
+        bold=bold,
+        neural=neural,
+        true_s=true_s,
+        true_f=true_f,
+        true_v=true_v,
+        true_q=true_q,
+        src_pos=src_pos,
+    )
 
 
 @torch.no_grad()
@@ -79,8 +67,8 @@ def run_inference(model: MICH, bold: torch.Tensor) -> torch.Tensor:
 
 def eval_one(model: MICH, data_path: str, n_samples: int, device: torch.device, label: str):
     """Run inference on one H5 file, return (bn_images, lat_images) for wandb."""
-    data    = load_samples(data_path, n_samples, device)
-    bold    = data["bold"]
+    data = load_samples(data_path, n_samples, device)
+    bold = data["bold"]
     src_pos = data["src_pos"]
 
     z_hat = run_inference(model, bold)
@@ -103,7 +91,8 @@ def eval_one(model: MICH, data_path: str, n_samples: int, device: torch.device, 
 
     true_bold = (
         model.normaliser.denormalize(model.normaliser.normalize(bold))
-        if model.normaliser is not None else bold
+        if model.normaliser is not None
+        else bold
     )
 
     bn_images, lat_images = [], []
@@ -117,7 +106,7 @@ def eval_one(model: MICH, data_path: str, n_samples: int, device: torch.device, 
             pred_neural=z_hat[i, MICH._signal_index("x"), :, :, sh, sw],
             true_neural=data["neural"][i, :, :, sh, sw],
             source_layer=torch.zeros(1, dtype=torch.long, device=device),
-            source_pos=src_pos[i:i+1],
+            source_pos=src_pos[i : i + 1],
         )
         bn_images.append(wandb.Image(fig_bn, caption=caption))
         plt.close(fig_bn)
@@ -139,55 +128,49 @@ def eval_one(model: MICH, data_path: str, n_samples: int, device: torch.device, 
     return bn_images, lat_images
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate MICH on H5 dataset(s)")
-    CKPT_DEFAULT = "/media/RCPNAS/Data2/korach/inversion/results_julie/mich-bold-inversion/single-layer_julie/checkpoints/last-v72.ckpt"
+@hydra.main(
+    version_base=None,
+    config_path=str(root / "config"),
+    config_name="evalconfig.yaml",
+)
+def main(cfg: DictConfig) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt_path = Path(cfg.checkpoint)
 
-    parser.add_argument("-c", "--checkpoint",  default=CKPT_DEFAULT)
-    parser.add_argument("-d", "--data",        default=None,
-                        help="Single H5 file to evaluate")
-    parser.add_argument("--data-dir",          default="data/gridsearch",
-                        help="Directory of H5 files (used when -d is not given)")
-    parser.add_argument("-n", "--n-samples",   type=int, default=3)
-    parser.add_argument("--wandb-project",     default="mich-bold-inversion")
-    parser.add_argument("--wandb-entity",      default="julie-korach-epfl")
-    parser.add_argument("--wandb-run-name",    default=None)
-    args = parser.parse_args()
-
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_path = Path(args.checkpoint)
-    run_name  = args.wandb_run_name or f"eval/{ckpt_path.stem}"
-
-    # Collect files to evaluate
-    if args.data:
-        h5_files = [Path(args.data)]
+    if cfg.data.path is not None:
+        h5_files = [Path(cfg.data.path)]
     else:
-        h5_files = sorted(Path(args.data_dir).glob("*.h5"))
+        h5_files = sorted(Path(cfg.data.data_dir).glob("*.h5"))
         if not h5_files:
-            raise FileNotFoundError(f"No H5 files found in {args.data_dir}")
-
-    run = wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=run_name,
-        config={"checkpoint": str(ckpt_path), "n_samples": args.n_samples,
-                "n_files": len(h5_files)},
-    )
+            raise FileNotFoundError(f"No H5 files found in {cfg.data.data_dir}")
 
     print(f"Loading model from {ckpt_path}")
-    model = load_model(str(ckpt_path), device)
+    model = MICH.load_from_checkpoint(str(ckpt_path), map_location="cpu")
+    model.to(device).eval()
+
+    run_name = cfg.wandb.run_name or f"eval/{ckpt_path.stem}"
+    run = wandb.init(
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity or None,
+        name=run_name,
+        config={
+            "checkpoint": str(ckpt_path),
+            "n_samples": cfg.n_samples,
+            "n_files": len(h5_files),
+        },
+    )
 
     all_bn, all_lat = [], []
     for h5_path in h5_files:
-        label = h5_path.stem  # e.g. "kappa1.8404_tau2.5370"
+        label = h5_path.stem
         print(f"  evaluating {label} ...")
-        bn, lat = eval_one(model, str(h5_path), args.n_samples, device, label)
+        bn, lat = eval_one(model, str(h5_path), cfg.n_samples, device, label)
         all_bn.extend(bn)
         all_lat.extend(lat)
 
     run.log({"media/predictions": all_bn, "media/latents": all_lat})
     run.finish()
-    print(f"\nDone. {len(h5_files)} files × {args.n_samples} samples logged to W&B: {run.url}")
+    print(f"\nDone. {len(h5_files)} files x {cfg.n_samples} samples logged to W&B: {run.url}")
 
 
 if __name__ == "__main__":
