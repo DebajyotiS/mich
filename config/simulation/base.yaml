@@ -1,0 +1,46 @@
+# Base simulation config — shared across all variants.
+# Not intended to be used as a primary config directly;
+# variant files (exact/linear/quadratic) compose from this via defaults: [base].
+
+num_simulations: 100
+seed: 42
+output_path: data/simulations.h5
+workers: null          # null -> os.cpu_count(); 1 -> serial
+latent_downsample: 1
+
+# -- Haemodynamic constants ----------------------
+haemodynamic:
+  alpha: 0.32       # Grubb's exponent
+  E0: 0.34          # Resting oxygen extraction fraction
+  V0: 0.5           # Resting blood volume fraction
+  kappa: 0.65       # Vasodilatory signal decay rate (linear overrides to 1.92)
+  gamma: 0.41       # Autoregulatory feedback rate
+
+# -- Acquisition (7T) ----------------------------
+acquisition:
+  TE: 0.25          # Echo time (s)
+  r0: 340           # Intravascular relaxation rate
+  f0: 28.625        # Frequency offset at outer vessel surface
+  eps: 1.0e-32
+
+# -- Simulation ----------------------------------
+simulation:
+  grid_size: [32, 32]
+  dt: 1.0
+  haemo_dt: 0.05
+  time_duration: 100
+  max_pulses: 10
+  isi_min: 5        # jitter window (s) for random onset placement
+  pulse_type: rect
+  neural_SNR: .inf
+  BOLD_SNR: 20.0
+  diffusion_coefficient_inter: 0.0
+  decay_rate: 1.0   # s-1, neural decay timescale
+  tau_d: 1.0
+
+# -- BOLD post-processing ------------------------
+bold:
+  noise_model:
+    field: "7T"
+    V: 8.0
+    TR: 2.0
