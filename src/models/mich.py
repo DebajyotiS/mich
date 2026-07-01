@@ -441,7 +441,7 @@ class MICH(LightningModule):
             target_vdot = f - v / alpha - (1 - alpha) / (2 * alpha**2) * v**2
             f, v, q = f + 1, v + 1, q + 1
         else:
-            raise ValueError(f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}")
+            raise ValueError(f"Expected order to be one of `linear`, `quadratic` or `exact`. But received {order}")
         if has_drain and layer > 0:
             vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             target_vdot += lambda_d * vstar_deeper
