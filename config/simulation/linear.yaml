@@ -1,0 +1,21 @@
+defaults:
+  - base
+  - _self_
+
+num_simulations: 5000
+output_path: data/simulations-linear.h5
+
+haemodynamic:
+  kappa: 1.92
+
+simulation:
+  order: "linear"
+  num_layers: 1
+  grid_size: [10, 10]
+  diffusion_coefficient_intra: 3.0
+  layers:
+    - {tau: 2.66, lambda_d: 0.0}
+
+bold:
+  psf_fwhm: [1.0375]
+  noise_scales: [1.0]
