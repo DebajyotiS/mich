@@ -95,6 +95,13 @@ def main(cfg: DictConfig) -> None:
         log.info(f"Setting matrix precision to {cfg.precision}")
         torch.set_float32_matmul_precision(cfg.precision)
 
+    if getattr(cfg.model.loss_config, "lambda_supervision", 0.0) == 0.0:
+        log.info("lambda_supervision=0, disabling return_latents in datamodule")
+        cfg.datamodule.data.return_latents = False
+
+    log.info("Instantiating datamodule")
+    datamodule = hydra.utils.instantiate(cfg.datamodule)
+
     log.info("Instantiating model")
     model = hydra.utils.instantiate(
         cfg.model,
