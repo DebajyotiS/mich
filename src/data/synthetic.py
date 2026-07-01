@@ -369,3 +369,12 @@ class SyntheticDataModule(pl.LightningDataModule):
 
     def predict_dataloader(self) -> DataLoader:
         return self.test_dataloader()
+
+    @property
+    def sim_config(self) -> dict:
+        import json
+        path = self.data_config.get("path")
+        if path is None:
+            raise ValueError("data.path is not set in datamodule config")
+        with h5py.File(str(path), "r") as f:
+            return json.loads(f["meta"].attrs["config"])

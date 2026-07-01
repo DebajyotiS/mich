@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal, Mapping
 
 import matplotlib.pyplot as plt
-import math
 import torch
 import torch.nn.functional as F
 import wandb
@@ -74,7 +74,7 @@ class MICH(LightningModule):
         psf_fwhm = getattr(self.hparams, "psf_fwhm", None)
         if psf_fwhm is not None:
             self._psf = [PointSpreadFunction(fwhm=f) for f in psf_fwhm]
-            for i, (fwhm, psf) in enumerate(zip(psf_fwhm, self._psf)):
+            for i, (fwhm, psf) in enumerate(zip(psf_fwhm, self._psf, strict=True)):
                 if fwhm is not None and fwhm > 0:
                     kernel = torch.as_tensor(psf.kernel_2d(), dtype=torch.float32)
                 else:
@@ -284,7 +284,7 @@ class MICH(LightningModule):
 
     def _antisteady_loss(
         self,
-        z_hat: torch.Tensor,       # [B, 7, L, T, H, W]
+        z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
         source_position: torch.Tensor,  # [B, 2]
     ) -> torch.Tensor:
         B = z_hat.shape[0]
@@ -297,7 +297,7 @@ class MICH(LightningModule):
         x_var = x_src.var(dim=-1)  # [B, L]
         eps = getattr(self.hparams.loss_config, "antisteady_epsilon", 0.01)
         return F.relu(eps - x_var).mean()
-        
+
     def _data_loss(
         self,
         z_hat: torch.Tensor,
@@ -336,7 +336,9 @@ class MICH(LightningModule):
                 pad = kernel.shape[-1] // 2
                 x = pred_bold[:, i].reshape(B_size * T_size, 1, H_size, W_size)
                 layers_blurred.append(
-                    F.conv2d(x, kernel, padding=pad).reshape(B_size, T_size, H_size, W_size).to(pred_bold.dtype)
+                    F.conv2d(x, kernel, padding=pad)
+                    .reshape(B_size, T_size, H_size, W_size)
+                    .to(pred_bold.dtype)
                 )
             pred_bold = torch.stack(layers_blurred, dim=1)  # [B, L, T, H, W]
 
@@ -441,7 +443,9 @@ class MICH(LightningModule):
             target_vdot = f - v / alpha - (1 - alpha) / (2 * alpha**2) * v**2
             f, v, q = f + 1, v + 1, q + 1
         else:
-            raise ValueError(f"Expected order to be one of `linear`, `quadratic` or `exact`. But received {order}")
+            raise ValueError(
+                f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}"
+            )
         if has_drain and layer > 0:
             vstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             target_vdot += lambda_d * vstar_deeper
@@ -452,20 +456,24 @@ class MICH(LightningModule):
 
         dq_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="q")
         if order == "exact":
-            target_qdot = f * ( 1 - (1 - E0) ** (1 / f) ) / E0 - q * v ** (1 / alpha - 1)
+            target_qdot = f * (1 - (1 - E0) ** (1 / f)) / E0 - q * v ** (1 / alpha - 1)
         elif order == "linear":
             f, v, q = f - 1, v - 1, q - 1
             beta_1 = (1 - E0) * math.log(1 - E0) / E0
-            target_qdot = (1 + beta_1) * f - q - (1/alpha - 1) * v
+            target_qdot = (1 + beta_1) * f - q - (1 / alpha - 1) * v
             f, v, q = f + 1, v + 1, q + 1
         elif order == "quadratic":
             f, v, q = f - 1, v - 1, q - 1
             beta_1 = (1 - E0) * math.log(1 - E0) / E0
             beta_2 = beta_1 * math.log(1 - E0) / 2
-            target_qdot = ( (1 + beta_1) * f - q - (1/alpha - 1) * v
+            target_qdot = (
+                (1 + beta_1) * f
+                - q
+                - (1 / alpha - 1) * v
                 - beta_2 * f**2
-                - (1/alpha - 1) * v * q
-                - (1/2) * (1/alpha - 1) * (1/alpha - 2) * v**2 )
+                - (1 / alpha - 1) * v * q
+                - (1 / 2) * (1 / alpha - 1) * (1 / alpha - 2) * v**2
+            )
             f, v, q = f + 1, v + 1, q + 1
         if has_drain and layer > 0:
             qstar_deeper = MICH._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
@@ -480,24 +488,28 @@ class MICH(LightningModule):
         if has_drain:
             dv_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
             v_star_target = (-v_star + v - 1) / tau
-            losses["vstar"] = self._ode_loss_fn(
-                dv_star_dt[:, burn_in:], v_star_target[:, burn_in:]
-            )
+            losses["vstar"] = self._ode_loss_fn(dv_star_dt[:, burn_in:], v_star_target[:, burn_in:])
             dq_star_dt = MICH._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar")
             q_star_target = (-q_star + q - 1) / tau
-            losses["qstar"] = self._ode_loss_fn(
-                dq_star_dt[:, burn_in:], q_star_target[:, burn_in:]
-            )
+            losses["qstar"] = self._ode_loss_fn(dq_star_dt[:, burn_in:], q_star_target[:, burn_in:])
 
         return losses
 
     # Mapping from z_hat signal name -> batch key
     _SUPERVISION_KEYS_FULL = (
-        ("s", "s"), ("f", "f"), ("v", "v"), ("q", "q"),
-        ("vstar", "v_star"), ("qstar", "q_star"),
+        ("s", "s"),
+        ("f", "f"),
+        ("v", "v"),
+        ("q", "q"),
+        ("vstar", "v_star"),
+        ("qstar", "q_star"),
     )
     _SUPERVISION_KEYS_SINGLE = (
-        ("s", "s"), ("f", "f"), ("v", "v"), ("q", "q"),
+        ("s", "s"),
+        ("f", "f"),
+        ("v", "v"),
+        ("q", "q"),
+        ("x", "neural"), # TODO: Remove this eventually
     )
 
     def _supervision_keys(self, z_hat: torch.Tensor):
@@ -588,7 +600,7 @@ class MICH(LightningModule):
             return lambda_target
         return min(1.0, ramp_step / warmup_steps) * lambda_target
 
-    def _physics_loss( # add a parameter that says whether the loss is linear or nonlinear
+    def _physics_loss(  # add a parameter that says whether the loss is linear or nonlinear
         self,
         z_hat: torch.Tensor,
         dz_hat_dt: torch.Tensor,
@@ -619,7 +631,12 @@ class MICH(LightningModule):
         n_layers = z_hat.shape[2]
         for layer in range(n_layers):
             layer_losses = self._compute_physics_layer_loss(
-                z_hat, dz_hat_dt, idx, layer=layer, burn_in=self.hparams.loss_config.burn_in, order=order
+                z_hat,
+                dz_hat_dt,
+                idx,
+                layer=layer,
+                burn_in=self.hparams.loss_config.burn_in,
+                order=order,
             )
             layer_total = sum(layer_losses.values()).float() / n_eq
             tot_physics_loss = tot_physics_loss + layer_total / n_layers
@@ -637,7 +654,7 @@ class MICH(LightningModule):
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
         bold, neural = batch["bold"], batch["neural"]
         source_position = batch["source_position"]
-        source_layer = batch.get("source_layer", None)
+        _source_layer = batch.get("source_layer", None)
 
         bold_norm = self.normaliser(bold, source_position) if self.normaliser is not None else bold
 
@@ -669,7 +686,11 @@ class MICH(LightningModule):
         )
         if need_grads:
             physics_loss, per_eq_physics = self._physics_loss(
-                z_hat, dz_hat_dt, lambda_smooth=lambda_smooth_eff, source_position=source_position, order=self.hparams.loss_config.order
+                z_hat,
+                dz_hat_dt,
+                lambda_smooth=lambda_smooth_eff,
+                source_position=source_position,
+                order=self.hparams.loss_config.order,
             )
         else:
             physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=torch.float32)
@@ -770,8 +791,16 @@ class MICH(LightningModule):
                 "parameters/lambda_physics": lambda_physics_eff,
                 "parameters/lambda_smooth": lambda_smooth_eff,
                 "parameters/lambda_antisteady": lambda_antisteady_eff,
-                **({"train/loss/antisteady": antisteady_loss.item(),
-                    "train/loss_weighted/antisteady": (antisteady_loss * lambda_antisteady_eff).item()} if antisteady_loss is not None else {}),
+                **(
+                    {
+                        "train/loss/antisteady": antisteady_loss.item(),
+                        "train/loss_weighted/antisteady": (
+                            antisteady_loss * lambda_antisteady_eff
+                        ).item(),
+                    }
+                    if antisteady_loss is not None
+                    else {}
+                ),
                 # ODE residuals — own section
                 **{f"ode/{k}": v.item() for k, v in per_eq_physics.items()},
             }
@@ -888,7 +917,9 @@ class MICH(LightningModule):
                 pad = kernel.shape[-1] // 2
                 x = pred_bold_full[:, i].reshape(B_s * T_s, 1, H_s, W_s)
                 layers_blurred.append(
-                    F.conv2d(x, kernel, padding=pad).reshape(B_s, T_s, H_s, W_s).to(pred_bold_full.dtype)
+                    F.conv2d(x, kernel, padding=pad)
+                    .reshape(B_s, T_s, H_s, W_s)
+                    .to(pred_bold_full.dtype)
                 )
             pred_bold_full = torch.stack(layers_blurred, dim=1)
 
@@ -898,7 +929,48 @@ class MICH(LightningModule):
         subset_true_z_hat = subset_true_z_hat[batch_idx, :, :, :, subset_h, subset_w]
 
         pred_bold = pred_bold_full[batch_idx, :, :, subset_h, subset_w]  # [B, L, T]
+
         pred_neural = subset_z_hat[:, MICH._signal_index("x")]
+        dt = 100.0 / subset_z_hat.shape[3]  # total_time / T -- adjust 100.0 to your actual duration
+        pred_s_src = subset_z_hat[:, MICH._signal_index("s")]  # [B, L, T]
+        pred_f_src = subset_z_hat[:, MICH._signal_index("f")]  # [B, L, T]
+        true_s_src = subset_true_z_hat[:, MICH._signal_index("s")]  # [B, L, T]
+        true_f_src = subset_true_z_hat[:, MICH._signal_index("f")]  # [B, L, T]
+
+        kappa = self.hparams.haemo.kappa
+        gamma = self.hparams.haemo.gamma
+
+        pred_x_recon = (
+            torch.diff(pred_s_src, dim=-1) / dt
+            + kappa * pred_s_src[..., :-1]
+            + gamma * (pred_f_src[..., :-1] - 1)
+        )  # [B, L, T-1]
+        true_x_recon = (
+            torch.diff(true_s_src, dim=-1) / dt
+            + kappa * true_s_src[..., :-1]
+            + gamma * (true_f_src[..., :-1] - 1)
+        )  # [B, L, T-1]
+
+        self._plot_and_log_x_recon(
+            pred_neural=pred_neural,  # [B, L, T]   -- network x head
+            pred_x_recon=pred_x_recon,  # [B, L, T-1] -- x implied by pred s/f
+            true_x_recon=true_x_recon,  # [B, L, T-1] -- x implied by true s/f
+            true_neural=subset_neural,  # [B, L, T]   -- ground truth x
+            source_layer=subset_src_layer,
+        )
+
+        # Neural recovery metrics over the full val set (not just the plot subset)
+        all_src_h = source_position[:, 0].long()
+        all_src_w = source_position[:, 1].long()
+        all_batch = torch.arange(z_hat.shape[0])
+        all_pred_neural = z_hat[all_batch, MICH._signal_index("x"), :, :, all_src_h, all_src_w]  # [B, L, T]
+        all_true_neural = neural[all_batch, :, :, all_src_h, all_src_w]                          # [B, L, T]
+        metrics = MICH._neural_recovery_metrics(all_pred_neural, all_true_neural)
+        run = getattr(self, "_rank_run", None) or wandb.run
+        if run is not None:
+            run.log({"global_step": self.global_step, **metrics})
+        for k, v in metrics.items():
+            self.log(k, v, on_epoch=True, sync_dist=True, logger=True)
 
         # Neural recovery metrics over the full val set (not just the plot subset)
         all_src_h = source_position[:, 0].long()
@@ -1023,20 +1095,30 @@ class MICH(LightningModule):
         for i in range(pred_s.shape[0]):
             if pred_v_star is not None:
                 image = plot_latent_layers(
-                    pred_f=pred_f[i], true_f=true_f[i],
-                    pred_s=pred_s[i], true_s=true_s[i],
-                    pred_v=pred_v[i], true_v=true_v[i],
-                    pred_q=pred_q[i], true_q=true_q[i],
-                    pred_v_star=pred_v_star[i], true_v_star=true_v_star[i],
-                    pred_q_star=pred_q_star[i], true_q_star=true_q_star[i],
+                    pred_f=pred_f[i],
+                    true_f=true_f[i],
+                    pred_s=pred_s[i],
+                    true_s=true_s[i],
+                    pred_v=pred_v[i],
+                    true_v=true_v[i],
+                    pred_q=pred_q[i],
+                    true_q=true_q[i],
+                    pred_v_star=pred_v_star[i],
+                    true_v_star=true_v_star[i],
+                    pred_q_star=pred_q_star[i],
+                    true_q_star=true_q_star[i],
                     title="Latent States",
                 )
             else:
                 image = plot_latent_layers(
-                    pred_f=pred_f[i], true_f=true_f[i],
-                    pred_s=pred_s[i], true_s=true_s[i],
-                    pred_v=pred_v[i], true_v=true_v[i],
-                    pred_q=pred_q[i], true_q=true_q[i],
+                    pred_f=pred_f[i],
+                    true_f=true_f[i],
+                    pred_s=pred_s[i],
+                    true_s=true_s[i],
+                    pred_v=pred_v[i],
+                    true_v=true_v[i],
+                    pred_q=pred_q[i],
+                    true_q=true_q[i],
                     title="Latent States",
                 )
             images.append(wandb.Image(image))

@@ -1,12 +1,12 @@
 import logging
-import subprocess
 import os
+import subprocess
 
 import hydra
 import pytorch_lightning as pl
 import rootutils
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from src.utils.hydra_utils import (
     instantiate_collection,
@@ -20,6 +20,45 @@ root = rootutils.setup_root(__file__, pythonpath=True, cwd=False)
 log = logging.getLogger(__name__)
 
 
+def _inject_sim_physics(cfg: DictConfig, sim_cfg: dict) -> None:
+    """Overwrite model physics constants with values from the simulation HDF5.
+
+    Derives k1/k2/k3 from the raw acquisition + haemodynamic parameters so the
+    model always trains with constants that match the data it was generated from.
+    """
+    ac = sim_cfg["acquisition"]
+    hc = sim_cfg["haemodynamic"]
+    layers = sim_cfg["simulation"]["layers"]
+
+    k1 = 4.3 * ac["f0"] * hc["E0"] * ac["TE"]
+    k2 = ac["eps"] * ac["r0"] * hc["E0"] * ac["TE"]
+    k3 = 1.0 - ac["eps"]
+
+    # lambda_d for layer > 0 (deep layer drain is always 0, guarded in physics loss)
+    lambda_d = layers[1]["lambda_d"] if len(layers) > 1 else layers[0]["lambda_d"]
+
+    with open_dict(cfg):
+        cfg.model.haemo = {
+            "kappa": hc["kappa"],
+            "gamma": hc["gamma"],
+            "alpha": hc["alpha"],
+            "tau": layers[0]["tau"],
+            "lambda_d": lambda_d,
+        }
+        cfg.model.acquisition = {
+            "f0": ac["f0"],
+            "E0": hc["E0"],
+            "TE": ac["TE"],
+            "r0": ac["r0"],
+            "eps": ac["eps"],
+            "k1": k1,
+            "k2": k2,
+            "k3": k3,
+        }
+        cfg.model.V0 = hc["V0"]
+        cfg.model.psf_fwhm = sim_cfg["bold"]["psf_fwhm"]
+
+
 @hydra.main(
     version_base=None,
     config_path=str(root / "config"),
@@ -30,7 +69,17 @@ def main(cfg: DictConfig) -> None:
     if cfg.resume.state:
         log.info("Reloading original config and resuming training")
         cfg = reload_original_config(cfg, reload_states=False)  # type: ignore
-    else:
+
+    if cfg.model.loss_config.lambda_supervision == 0.0:
+        log.info("lambda_supervision=0, disabling return_latents in datamodule")
+        cfg.datamodule.data.return_latents = False
+
+    log.info("Instantiating datamodule")
+    datamodule = hydra.utils.instantiate(cfg.datamodule)
+
+    if not cfg.resume.state:
+        log.info("Injecting physics constants from simulation HDF5")
+        _inject_sim_physics(cfg, datamodule.sim_config)
         log.info("Saving configuration")
         save_config(cfg)
 
@@ -105,9 +154,7 @@ if __name__ == "__main__":
             )
             if result.returncode == 0:
                 rows = [
-                    line.split(",")
-                    for line in result.stdout.strip().split("\n")
-                    if line.strip()
+                    line.split(",") for line in result.stdout.strip().split("\n") if line.strip()
                 ]
                 best = min(rows, key=lambda r: int(r[1]))
                 selected = best[0].strip()

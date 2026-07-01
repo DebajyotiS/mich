@@ -106,7 +106,7 @@ class TestForwardEval:
         norm.eval()
         bold = torch.zeros(1, 1, 1, 8, 8) + 5.0
         out = norm(bold)
-        # mean=0, std=1 → (bold - 0) / 1 = bold; within clamp range
+        # mean=0, std=1 -> (bold - 0) / 1 = bold; within clamp range
         assert torch.allclose(out, bold, atol=1e-5)
 
     def test_eval_output_clamped_at_plus_minus_10(self):
@@ -189,7 +189,7 @@ class TestForwardTrain:
         norm.train()
         bold, pos = _bold_and_pos()
         norm(bold, source_position=pos)
-        # step starts at 0, freeze_after=0 → already frozen → no update
+        # step starts at 0, freeze_after=0 -> already frozen -> no update
         assert norm.step.item() == 0
         assert norm.running_count.item() == 0
 
@@ -270,7 +270,7 @@ class TestGatherNeighbourhood:
         B, L, T, H, W, r = 1, 1, 1, 8, 8, 3
         norm = _make_norm(H=H, W=W, radius=r)
         bold = torch.randn(B, L, T, H, W)
-        pos = torch.tensor([[0, 0]], dtype=torch.long)  # corner; offsets go negative → clamped
+        pos = torch.tensor([[0, 0]], dtype=torch.long)  # corner; offsets go negative -> clamped
         out = norm._gather_neighbourhood(bold, pos)
         assert torch.isfinite(out).all()
 
