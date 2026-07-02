@@ -29,13 +29,59 @@ from src.data.signals import Noise, Pulse, Sources
 # Maps pulse_type -> ordered extra parameter names (following amplitude and onset).
 _PULSE_EXTRA_PARAMS: dict[str, list[str]] = {
     "rect": ["width"],
-    "gaussian": ["width"],
-    "sinc": ["width", "cycles"],
     "exp_decay": ["decay_rate"],
-    "alpha": ["alpha", "beta"],
 }
-# For these types the first extra param ("width") also defines the neural overlap window.
-_WIDTH_BOUNDED = frozenset({"rect", "gaussian", "sinc"})
+
+
+def _draw_pulse_signal(
+    rng: np.random.Generator,
+    pulse_type: str,
+    max_pulses: int,
+    amp_range: tuple[float, float],
+    width_range: tuple[float, float],
+    isi_min: int,
+    time_duration: int,
+    dt: float,
+    baseline_mode: str,
+) -> tuple[list[list[float]], np.ndarray]:
+    """Draw a random pulse train for one source and generate its signal waveform."""
+    num_pulses = int(rng.integers(1, max_pulses + 1))
+    amplitudes = rng.uniform(*amp_range, size=num_pulses)
+    if pulse_type == "rect":
+        widths = rng.uniform(*width_range, size=num_pulses)
+
+    init_time_gap: int = 10
+    onset_times: list[float] = []
+    valid_widths: list[float] = []
+
+    for i in range(num_pulses):
+        time = float(rng.uniform(init_time_gap, init_time_gap + isi_min))
+        pulse_width = float(widths[i]) if pulse_type == "rect" else float(rng.uniform(0.1, 1.0))
+        pulse_end_time = time + pulse_width
+
+        if pulse_end_time > time_duration:
+            break
+
+        onset_times.append(time)
+        valid_widths.append(pulse_width)
+
+        init_time_gap = pulse_end_time + isi_min
+        if init_time_gap > time_duration:
+            break
+
+    pulse_list = [
+        [float(amplitudes[k]), onset_times[k], valid_widths[k]] for k in range(len(onset_times))
+    ]
+
+    pulse = Pulse(
+        pulse_type=pulse_type,
+        peaks=pulse_list,
+        duration=time_duration,
+        dt=dt,
+        baseline=baseline_mode,
+        rng=rng,
+    )
+    return pulse_list, pulse.generate()[1]
 
 
 def _derive_acquisition(cfg: dict) -> AcquisitionConstants:
@@ -58,17 +104,31 @@ def _derive_haemo(cfg: dict) -> HaemodynamicConstants:
     )
 
 
+def _derive_psf_fwhm(bold_cfg: dict, num_layers: int) -> list[float]:
+    """Interpolate per-layer PSF FWHM (grid units) from physical parameters.
+
+    bold.psf_fwhm_mm is [deepest, most_superficial] FWHM in mm; intermediate
+    layers are linearly interpolated by normalized cortical depth. Dividing by
+    bold.voxel_mm (the fixed physical pixel size, independent of grid_size)
+    converts to the grid units PointSpreadFunction expects.
+    """
+    voxel_mm: float = bold_cfg["voxel_mm"]
+    deep_mm, sup_mm = bold_cfg["psf_fwhm_mm"]
+    if num_layers == 1:
+        fwhm_mm = [deep_mm]
+    else:
+        fwhm_mm = [deep_mm + (i / (num_layers - 1)) * (sup_mm - deep_mm) for i in range(num_layers)]
+    return [f / voxel_mm for f in fwhm_mm]
+
+
 def _run_neural(
     cfg: dict,
     rng: np.random.Generator,
     sim_params: NeuralSimulatorParams,
     steps: int,
     seed: int | None,
-) -> tuple[list, list, int, tuple, int]:
-    """Generate stimuli, place sources, and run layered neural diffusion.
-
-    Returns (x_inputs, pulse_list, source_layer, source_pos, num_pulses).
-    """
+) -> tuple[list, list, list[int], list[tuple], int]:
+    """Generate stimuli, place sources based on structural config boundaries, and run neural diffusion."""
     sc = cfg["simulation"]
     num_layers: int = sc["num_layers"]
     grid_size = tuple(sc["grid_size"])
@@ -77,67 +137,105 @@ def _run_neural(
     max_pulses: int = sc["max_pulses"]
     isi_min: int = sc.get("isi_min", 20)
     pulse_type: str = sc.get("pulse_type", "rect")
-    pulse_cfg: dict = sc.get("pulse", {})
 
-    if pulse_type not in _PULSE_EXTRA_PARAMS:
-        raise ValueError(f"Unknown pulse_type {pulse_type!r}. Known: {list(_PULSE_EXTRA_PARAMS)}")
-    extra_names = _PULSE_EXTRA_PARAMS[pulse_type]
+    # Extract clean boundaries with safe fallbacks mimicking legacy behavior [1 layer, 1 source]
+    placement_cfg = sc.get("source_placement", {})
+    src_per_layer_range = placement_cfg.get("sources_per_layer", [1, 1])
+    shared_position: bool = placement_cfg.get("shared_position", False)
+    shared_pulse: bool = placement_cfg.get("shared_pulse", False)
+    if shared_position and tuple(src_per_layer_range) != (1, 1):
+        raise ValueError(
+            "source_placement.shared_position requires sources_per_layer == [1, 1] "
+            f"(got {src_per_layer_range}); a shared column position only makes sense "
+            "with exactly one source per active layer"
+        )
+    if shared_pulse and not shared_position:
+        raise ValueError(
+            "source_placement.shared_pulse requires source_placement.shared_position "
+            "to also be true -- a shared pulse only makes sense when layers also share a position"
+        )
 
-    num_pulses = int(rng.integers(1, max_pulses + 1))
-    amp_range: list[float] = pulse_cfg.get("amplitude", [0.3, 1.0])
-    amplitudes = rng.uniform(*amp_range, size=num_pulses)
+    amp_range: tuple[float, float] = tuple(sc.get("amp_range", (0.1, 1.0)))
+    width_range: tuple[float, float] = tuple(sc.get("width_range", (2.0, 10.0)))
+    baseline_mode: str = sc.get("baseline_mode", "random")
 
-    # Sample type-specific extra params from config ranges.
-    params_cfg: dict = pulse_cfg.get("params", {})
-    param_defaults = {"width": [2.0, 10.0]}  # rect/gaussian/sinc backward-compat default
-    extra_samples: dict[str, np.ndarray] = {}
-    for name in extra_names:
-        rng_vals = params_cfg.get(name) or param_defaults.get(name)
-        if rng_vals is None:
-            raise ValueError(
-                f"pulse.params.{name} must be specified in config for pulse_type={pulse_type!r}"
-            )
-        extra_samples[name] = rng.uniform(*rng_vals, size=num_pulses)
+    if pulse_type not in ["rect", "exp_decay"]:
+        raise ValueError(f"Unknown pulse_type {pulse_type!r}. Must be 'rect' or 'exp_decay'.")
 
-    # Effective neural duration used for non-overlap onset spacing.
-    # For width-bounded types (rect/gaussian/sinc) this equals the sampled width.
-    # For unbounded types (alpha/exp_decay) an explicit effective_duration range is required.
-    if pulse_type in _WIDTH_BOUNDED:
-        effective_durations = extra_samples["width"]
-    else:
-        eff_range = pulse_cfg.get("effective_duration")
-        if eff_range is None:
-            raise ValueError(
-                f"pulse.effective_duration must be specified in config for pulse_type={pulse_type!r}"
-            )
-        effective_durations = rng.uniform(*eff_range, size=num_pulses)
+    # Dynamically evaluate active layers based on constraints
+    min_active_layers: int = sc.get("min_active_layers", 1)
+    max_active_layers: int = sc.get("max_active_layers", 1)
+    lo = max(1, min(min_active_layers, num_layers))
+    hi = min(max_active_layers, num_layers)
+    if lo > hi:
+        raise ValueError(
+            f"min_active_layers ({min_active_layers}) must be <= max_active_layers ({max_active_layers})"
+        )
+    num_active_layers = int(rng.integers(lo, hi + 1))
+    chosen_layers = rng.choice(num_layers, size=num_active_layers, replace=False).tolist()
 
-    # Non-overlapping onsets: neural pulses never overlap,
-    # but BOLD responses may (haemodynamic overlap is fine).
-    onsets: list[int] = []
-    t_min = 10
-    for k in range(num_pulses):
-        onset = t_min + int(rng.integers(0, isi_min))
-        onsets.append(onset)
-        t_min = onset + int(np.ceil(effective_durations[k])) + 1  # +1 s gap: no neural overlap
+    # When shared_position is set, every active layer's (single) source sits at the
+    # same (x, y) -- a cortical column -- instead of each layer drawing its own position.
+    shared_pos: tuple[int, int] | None = None
+    if shared_position:
+        shared_pos = tuple(rng.integers(0, grid_size[0], size=2).tolist())
 
-    # pulse_list rows: [amplitude, onset, *extra_params_in_type_order]
-    pulse_list = [
-        [float(amplitudes[k]), float(onsets[k])] + [float(extra_samples[n][k]) for n in extra_names]
-        for k in range(num_pulses)
-    ]
-    pulse = Pulse(
-        pulse_type=pulse_type,
-        peaks=pulse_list,
-        duration=time_duration,
-        dt=dt,
-    )
+    # When shared_pulse is set, every active layer's source also reuses the exact same
+    # pulse train/waveform, drawn once here, instead of each layer drawing its own.
+    shared_pulse_data: tuple[list[list[float]], np.ndarray] | None = None
+    if shared_pulse:
+        shared_pulse_data = _draw_pulse_signal(
+            rng,
+            pulse_type,
+            max_pulses,
+            amp_range,
+            width_range,
+            isi_min,
+            time_duration,
+            dt,
+            baseline_mode,
+        )
 
     sources = Sources()
-    source_layer = int(rng.integers(0, num_layers))
-    source_pos = tuple(rng.integers(0, grid_size[0], size=2).tolist())
-    sources.add_source(layer=source_layer, position=source_pos, signal=pulse.generate()[1])
+    all_pulse_lists = []
+    active_layers = []
+    active_positions = []
+    total_pulses_count = 0
 
+    for layer in chosen_layers:
+        # Evaluate how many discrete coordinates to spawn in this specific layer plane
+        num_positions = int(rng.integers(src_per_layer_range[0], src_per_layer_range[1] + 1))
+
+        for _ in range(num_positions):
+            pos = (
+                shared_pos
+                if shared_position
+                else tuple(rng.integers(0, grid_size[0], size=2).tolist())
+            )
+
+            if shared_pulse_data is not None:
+                pulse_list, signal = shared_pulse_data
+            else:
+                pulse_list, signal = _draw_pulse_signal(
+                    rng,
+                    pulse_type,
+                    max_pulses,
+                    amp_range,
+                    width_range,
+                    isi_min,
+                    time_duration,
+                    dt,
+                    baseline_mode,
+                )
+
+            sources.add_source(layer=layer, position=pos, signal=signal)
+
+            all_pulse_lists.append(pulse_list)
+            active_layers.append(layer)
+            active_positions.append(pos)
+            total_pulses_count += len(pulse_list)
+
+    # Run execution loop through the coupled simulator framework
     neural_noise = Noise(type="pink", seed=seed, domain="both")
     simulator = LayeredDiffusionSimulator(sim_params)
     history = simulator.simulate(
@@ -148,7 +246,7 @@ def _run_neural(
     )
 
     x_inputs = [history[:, i, ...] for i in range(num_layers)]
-    return x_inputs, pulse_list, source_layer, source_pos, num_pulses
+    return x_inputs, all_pulse_lists, active_layers, active_positions, total_pulses_count
 
 
 def _run_haemo_and_bold(
@@ -319,24 +417,13 @@ TRAIN_KEYS = ("x", "bold")
 LATENT_KEYS = ("s", "f", "v", "q", "v_star", "q_star")
 
 
-def init_h5(h5f: h5py.File, cfg: dict, num_sims: int, latent_downsample: int = 10) -> None:
-    """
-    Pre-allocate all datasets for *num_sims* simulations.
+def init_h5(
+    h5f: h5py.File,
+    cfg: dict,
+    num_sims: int,
+    latent_downsample: int = 10,
+) -> None:
 
-    Training keys (x, bold):
-        Shape  : (N, T, H, W)  at full resolution
-        Chunks : (1, T, H, W)  -- one sim per chunk, contiguous in time
-
-    Latent keys (s, f, v, q, v_star, q_star):
-        Shape  : (N, T//latent_downsample, H, W)  at reduced resolution
-        Chunks : (1, T//latent_downsample, H, W)
-
-    Args:
-        latent_downsample : int, store one latent frame every k timesteps.
-                            At dt=0.5s and k=10, that is one frame every 5s --
-                            sufficient to inspect haemodynamic dynamics whose
-                            timescale is 5-30s.
-    """
     if not isinstance(latent_downsample, int) or latent_downsample < 1:
         raise ValueError(f"latent_downsample must be a positive int, got {latent_downsample!r}")
 
@@ -345,7 +432,10 @@ def init_h5(h5f: h5py.File, cfg: dict, num_sims: int, latent_downsample: int = 1
     grid_size = tuple(sc["grid_size"])
     T = int(sc["time_duration"] / sc["dt"])
     T_lat = T // latent_downsample
+
     max_pulses = sc["max_pulses"]
+    placement_cfg = sc["source_placement"]
+    max_sources = num_layers * placement_cfg["sources_per_layer"][1]
 
     full_shape = (num_sims, T, *grid_size)
     latent_shape = (num_sims, T_lat, *grid_size)
@@ -357,42 +447,85 @@ def init_h5(h5f: h5py.File, cfg: dict, num_sims: int, latent_downsample: int = 1
 
         for key in TRAIN_KEYS:
             lg.create_dataset(
-                key, shape=full_shape, dtype=np.float16, chunks=full_chunk, compression="lzf"
+                key,
+                shape=full_shape,
+                dtype=np.float16,
+                chunks=full_chunk,
+                compression="lzf",
             )
 
         for key in LATENT_KEYS:
             lg.create_dataset(
-                key, shape=latent_shape, dtype=np.float16, chunks=latent_chunk, compression="lzf"
+                key,
+                shape=latent_shape,
+                dtype=np.float16,
+                chunks=latent_chunk,
+                compression="lzf",
             )
 
     meta = h5f.create_group("meta")
     meta.attrs["config"] = json.dumps(cfg)
-    meta.attrs["latent_downsample"] = latent_downsample  # int, readable by write_sim
+    meta.attrs["latent_downsample"] = latent_downsample
     meta.attrs["T_full"] = T
     meta.attrs["T_latent"] = T_lat
 
-    # pulses: keep float64 -- onset times need sub-TR precision
     pulse_type = sc.get("pulse_type", "rect")
-    n_pulse_params = 2 + len(
-        _PULSE_EXTRA_PARAMS.get(pulse_type, ["width"])
-    )  # amplitude + onset + extras
-    meta.create_dataset(
-        "pulses", shape=(num_sims, max_pulses, n_pulse_params), dtype=np.float64, fillvalue=np.nan
+    n_pulse_params = 2 + len(_PULSE_EXTRA_PARAMS.get(pulse_type, ["width"]))
+
+    sources = meta.create_group("sources")
+
+    sources.create_dataset(
+        "layer",
+        shape=(num_sims, max_sources),
+        dtype=np.int32,
+        fillvalue=-1,
     )
-    meta.create_dataset("num_pulses", shape=(num_sims,), dtype=np.int32)
-    meta.create_dataset("source_layer", shape=(num_sims,), dtype=np.int32)
-    meta.create_dataset("source_position", shape=(num_sims, 2), dtype=np.int32)
-    meta.create_dataset("seed", shape=(num_sims,), dtype=np.int64)
+
+    sources.create_dataset(
+        "position",
+        shape=(num_sims, max_sources, 2),
+        dtype=np.int32,
+        fillvalue=-1,
+    )
+
+    sources.create_dataset(
+        "num_pulses",
+        shape=(num_sims, max_sources),
+        dtype=np.int32,
+        fillvalue=0,
+    )
+
+    sources.create_dataset(
+        "pulses",
+        shape=(
+            num_sims,
+            max_sources,
+            max_pulses,
+            n_pulse_params,
+        ),
+        dtype=np.float64,
+        fillvalue=np.nan,
+    )
+
+    meta.create_dataset(
+        "num_sources",
+        shape=(num_sims,),
+        dtype=np.int32,
+    )
+
+    meta.create_dataset(
+        "seed",
+        shape=(num_sims,),
+        dtype=np.int64,
+    )
 
 
 def write_sim(h5f: h5py.File, idx: int, results: dict) -> None:
     """
-    Write simulation *idx* into the pre-allocated datasets.
-
-    Latent keys are downsampled along the time axis on write so no extra
-    memory is needed relative to what run_simulation already allocated.
+    Write simulation idx into the preallocated HDF5 file.
     """
-    k = int(h5f["meta"].attrs["latent_downsample"])  # type: ignore
+
+    k = int(h5f["meta"].attrs["latent_downsample"])
 
     for layer_idx, layer_data in results["layers"].items():
         lg = h5f[f"layer_{layer_idx}"]
@@ -400,21 +533,33 @@ def write_sim(h5f: h5py.File, idx: int, results: dict) -> None:
         for key in TRAIN_KEYS:
             arr = layer_data.get(key)
             if arr is not None:
-                lg[key][idx] = np.asarray(arr, dtype=np.float16)  # type: ignore
+                lg[key][idx] = np.asarray(arr, dtype=np.float16)
 
         for key in LATENT_KEYS:
             arr = layer_data.get(key)
             if arr is not None:
-                lg[key][idx] = np.asarray(arr[::k], dtype=np.float16)  # type: ignore
+                lg[key][idx] = np.asarray(arr[::k], dtype=np.float16)
 
     meta = h5f["meta"]
+    sources = meta["sources"]
     m = results["meta"]
-    pulses = np.asarray(m["pulses"], dtype=np.float64)
-    meta["pulses"][idx, : len(pulses)] = pulses  # type: ignore
-    meta["num_pulses"][idx] = m["num_pulses"]  # type: ignore
-    meta["source_layer"][idx] = m["source_layer"]  # type: ignore
-    meta["source_position"][idx] = m["source_position"]  # type: ignore
-    meta["seed"][idx] = m["seed"]  # type: ignore
+
+    num_sources = len(m["source_layer"])
+
+    meta["num_sources"][idx] = num_sources
+    meta["seed"][idx] = m["seed"]
+
+    sources["layer"][idx, :num_sources] = m["source_layer"]
+    sources["position"][idx, :num_sources] = m["source_position"]
+
+    for s, pulse_list in enumerate(m["pulses"]):
+        pulse_array = np.asarray(pulse_list, dtype=np.float64)
+        n = len(pulse_array)
+
+        sources["num_pulses"][idx, s] = n
+
+        if n > 0:
+            sources["pulses"][idx, s, :n] = pulse_array
 
 
 def _run_one(args: tuple[int, dict, int | None]) -> tuple[int, dict]:
@@ -426,11 +571,18 @@ def _run_one(args: tuple[int, dict, int | None]) -> tuple[int, dict]:
 @hydra.main(
     version_base=None,
     config_path=str(_ROOT / "config" / "simulation"),
-    config_name="exact",
+    config_name="linear",
 )
 def main(cfg: DictConfig) -> None:
     # Convert to a plain dict once so all downstream functions receive native Python types.
     cfg_dict: dict = OmegaConf.to_container(cfg, resolve=True)  # type: ignore
+
+    # Resolve physical PSF settings (bold.voxel_mm, bold.psf_fwhm_mm) into the
+    # per-layer grid-unit list consumed by simulate/train code and stored in the
+    # HDF5 meta config (see _derive_psf_fwhm).
+    cfg_dict["bold"]["psf_fwhm"] = _derive_psf_fwhm(
+        cfg_dict["bold"], cfg_dict["simulation"]["num_layers"]
+    )
 
     num_sims: int = cfg_dict.get("num_simulations", 1)
     output_path: str = cfg_dict.get("output_path", "simulations.h5")
