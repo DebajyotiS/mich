@@ -1,21 +1,26 @@
+# "Linear" Balloon-Windkessel variant: first-order Taylor expansion of the
+# volume/dHb ODEs around steady state (src/data/balloon.py, order == "linear").
+# Single-layer cortex (no drainage) on a small grid for fast iteration — overrides
+# every structural key that depends on num_layers/grid_size; bold.voxel_mm and
+# psf_fwhm_mm are unchanged from base (a single layer just uses the deep_mm value).
 defaults:
   - base
   - _self_
 
-num_simulations: 5000
 output_path: data/simulations-linear.h5
 
 haemodynamic:
-  kappa: 1.92
+  kappa: 1.92       # linear expansion is stable/calibrated at this vasodilatory decay rate
 
 simulation:
   order: "linear"
   num_layers: 1
+  source_placement:
+    sources_per_layer: [1, 5]
   grid_size: [10, 10]
-  diffusion_coefficient_intra: 3.0
+  diffusion_coefficient_intra: 2.0
   layers:
-    - {tau: 2.66, lambda_d: 0.0}
+    - {tau: "${simulation.layer_tau}", lambda_d: 0.0}  # deep — no drain source
 
 bold:
-  psf_fwhm: [1.0375]
-  noise_scales: [1.0]
+  noise_scales: [1.0]   # single layer

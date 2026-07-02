@@ -1,3 +1,6 @@
+# "Quadratic" Balloon-Windkessel variant: second-order Taylor expansion of the
+# volume/dHb ODEs around steady state (src/data/balloon.py, order == "quadratic").
+# Otherwise identical to base.yaml (3-layer cortex, 32x32 grid).
 defaults:
   - base
   - _self_
@@ -6,14 +9,3 @@ output_path: data/simulations-quadratic.h5
 
 simulation:
   order: "quadratic"
-  num_layers: 3
-  grid_size: [32, 32]
-  diffusion_coefficient_intra: 12.0
-  layers:
-    - {tau: 2.66, lambda_d: 0.0}  # deep  — no drain source
-    - {tau: 2.66, lambda_d: 0.5}  # mid   — drains from deep
-    - {tau: 2.66, lambda_d: 0.5}  # sup   — drains from mid
-
-bold:
-  psf_fwhm: [18.0, 27.675, 40.05]
-  noise_scales: [1.0, 1.23, 1.16]
