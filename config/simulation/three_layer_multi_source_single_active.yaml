@@ -1,0 +1,13 @@
+# Scenario 4: 3-layer cortex, exactly one active layer (chosen at random per
+# simulation from the 3), with multiple simultaneous active sources in it.
+defaults:
+  - base
+  - _self_
+
+output_path: data/simulations-three_layer_multi_source_single_active.h5
+
+simulation:
+  min_active_layers: 1
+  max_active_layers: 1
+  source_placement:
+    sources_per_layer: [2, 4]   # >=2 guarantees genuinely multiple sources

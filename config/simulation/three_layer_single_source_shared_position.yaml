@@ -1,0 +1,16 @@
+# Scenario 6: 3-layer cortex, "cortical column" -- 2 or 3 active layers (chosen at
+# random per simulation), each with exactly one source, all sharing the same (x, y)
+# grid position. Pulse timing/amplitude/width are still drawn independently per
+# layer; only the spatial position is shared.
+defaults:
+  - base
+  - _self_
+
+output_path: data/simulations-three_layer_single_source_shared_position.h5
+
+simulation:
+  min_active_layers: 2   # guarantees >=2 of the 3 layers share the column
+  max_active_layers: 3
+  source_placement:
+    sources_per_layer: [1, 1]   # exactly one source per active layer (required for shared_position)
+    shared_position: true

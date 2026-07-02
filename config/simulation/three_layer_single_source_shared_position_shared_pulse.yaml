@@ -1,0 +1,19 @@
+# Scenario 7: 3-layer cortex, "cortical column" with identical drive -- 2 or 3
+# active layers (chosen at random per simulation), each with exactly one source, all
+# sharing the same (x, y) grid position AND the exact same pulse train/waveform.
+# Unlike scenario 6 (three_layer_single_source_shared_position), where each layer's
+# pulse timing/amplitude/width is drawn independently, here the identical neural
+# drive is replicated straight through the column.
+defaults:
+  - base
+  - _self_
+
+output_path: data/simulations-three_layer_single_source_shared_position_shared_pulse.h5
+
+simulation:
+  min_active_layers: 2   # guarantees >=2 of the 3 layers share the column
+  max_active_layers: 3
+  source_placement:
+    sources_per_layer: [1, 1]   # exactly one source per active layer (required for shared_position)
+    shared_position: true
+    shared_pulse: true
