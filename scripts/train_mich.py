@@ -34,7 +34,7 @@ def _inject_sim_physics(cfg: DictConfig, sim_cfg: dict) -> None:
     k2 = ac["eps"] * ac["r0"] * hc["E0"] * ac["TE"]
     k3 = 1.0 - ac["eps"]
 
-    # lambda_d for layer > 0 (deep layer drain is always 0, guarded in physics loss)
+    # lambda_d for layer > 0 (deep layer drain is always 0)
     lambda_d = layers[1]["lambda_d"] if len(layers) > 1 else layers[0]["lambda_d"]
 
     with open_dict(cfg):
@@ -119,8 +119,6 @@ def main(cfg: DictConfig) -> None:
     callbacks = instantiate_collection(cfg.callbacks)
 
     log.info("Instantiating loggers")
-    # Only initiate on main rank
-
     loggers = instantiate_collection(cfg.loggers)
 
     log.info("Instantiating trainer")
