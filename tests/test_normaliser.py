@@ -26,10 +26,11 @@ def _make_norm(
 
 def _bold_and_pos(
     B: int = 2, L: int = 3, T: int = 4, H: int = 8, W: int = 8
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bold = torch.randn(B, L, T, H, W)
-    pos = torch.tensor([[H // 2, W // 2]] * B, dtype=torch.long)
-    return bold, pos
+    pos = torch.tensor([[[H // 2, W // 2]]] * B, dtype=torch.long)  # [B, S=1, 2]
+    num_sources = torch.ones(B, dtype=torch.long)
+    return bold, pos, num_sources
 
 
 # -------------------------
@@ -152,43 +153,50 @@ class TestForwardTrain:
         norm = _make_norm()
         norm.train()
         bold = torch.randn(2, 3, 4, 8, 8)
-        with pytest.raises(ValueError, match="source_position required"):
-            norm(bold, source_position=None)
+        with pytest.raises(ValueError, match="source_position and num_sources are required"):
+            norm(bold, source_position=None, num_sources=None)
+
+    def test_training_without_num_sources_raises(self):
+        norm = _make_norm()
+        norm.train()
+        bold, pos, _ = _bold_and_pos()
+        with pytest.raises(ValueError, match="source_position and num_sources are required"):
+            norm(bold, source_position=pos, num_sources=None)
 
     def test_training_increments_step(self):
         norm = _make_norm()
         norm.train()
-        bold, pos = _bold_and_pos()
-        norm(bold, source_position=pos)
+        bold, pos, num_sources = _bold_and_pos()
+        norm(bold, source_position=pos, num_sources=num_sources)
         assert norm.step.item() == 1
 
     def test_training_increments_running_count(self):
         norm = _make_norm()
         norm.train()
-        bold, pos = _bold_and_pos()
-        norm(bold, source_position=pos)
+        bold, pos, num_sources = _bold_and_pos()
+        norm(bold, source_position=pos, num_sources=num_sources)
         assert norm.running_count.item() > 0
 
     def test_training_output_finite(self):
         norm = _make_norm()
         norm.train()
-        bold, pos = _bold_and_pos()
-        out = norm(bold, source_position=pos)
+        bold, pos, num_sources = _bold_and_pos()
+        out = norm(bold, source_position=pos, num_sources=num_sources)
         assert torch.isfinite(out).all()
 
     def test_pause_update_skips_welford_and_step(self):
         norm = _make_norm()
         norm.train()
-        bold, pos = _bold_and_pos()
-        norm(bold, source_position=pos, pause_update=True)
+        bold, pos, num_sources = _bold_and_pos()
+        norm(bold, source_position=pos, num_sources=num_sources, pause_update=True)
         assert norm.step.item() == 0
         assert norm.running_count.item() == 0
 
     def test_frozen_training_skips_update(self):
         norm = _make_norm(freeze_after=0)
         norm.train()
-        bold, pos = _bold_and_pos()
-        norm(bold, source_position=pos)
+        bold, pos, num_sources = _bold_and_pos()
+        norm(bold, source_position=pos, num_sources=num_sources)
         # step starts at 0, freeze_after=0 -> already frozen -> no update
         assert norm.step.item() == 0
         assert norm.running_count.item() == 0
@@ -199,9 +207,10 @@ class TestForwardTrain:
         norm.train()
         target = 3.0
         bold = torch.full((4, 2, 4, 8, 8), target)
-        pos = torch.tensor([[4, 4]] * 4, dtype=torch.long)
+        pos = torch.tensor([[[4, 4]]] * 4, dtype=torch.long)
+        num_sources = torch.ones(4, dtype=torch.long)
         for _ in range(20):
-            norm(bold, source_position=pos)
+            norm(bold, source_position=pos, num_sources=num_sources)
         assert abs(norm.running_mean.item() - target) < 0.5
 
 
@@ -257,21 +266,33 @@ class TestNormalizeAndDenormalize:
 
 
 class TestGatherNeighbourhood:
-    def test_output_shape_is_b_l_t_n(self):
+    def test_output_shape_is_m_l_t_n(self):
         B, L, T, H, W, r = 3, 4, 5, 10, 10, 2
         norm = _make_norm(H=H, W=W, radius=r)
         bold = torch.randn(B, L, T, H, W)
-        pos = torch.tensor([[5, 5], [3, 3], [7, 7]], dtype=torch.long)
-        out = norm._gather_neighbourhood(bold, pos)
+        pos = torch.tensor([[[5, 5]], [[3, 3]], [[7, 7]]], dtype=torch.long)  # [B, S=1, 2]
+        mask = torch.ones(B, 1, dtype=torch.bool)
+        out = norm._gather_neighbourhood(bold, pos, mask)
         N = (2 * r + 1) ** 2
         assert out.shape == (B, L, T, N)
+
+    def test_masked_out_sources_are_excluded(self):
+        B, S, L, T, H, W, r = 2, 3, 1, 1, 8, 8, 1
+        norm = _make_norm(H=H, W=W, radius=r)
+        bold = torch.randn(B, L, T, H, W)
+        pos = torch.randint(0, H, (B, S, 2), dtype=torch.long)
+        num_sources = torch.tensor([1, 3])
+        mask = norm._source_mask(num_sources, S)
+        out = norm._gather_neighbourhood(bold, pos, mask)
+        assert out.shape[0] == int(mask.sum().item())
 
     def test_out_of_bounds_position_does_not_raise(self):
         B, L, T, H, W, r = 1, 1, 1, 8, 8, 3
         norm = _make_norm(H=H, W=W, radius=r)
         bold = torch.randn(B, L, T, H, W)
-        pos = torch.tensor([[0, 0]], dtype=torch.long)  # corner; offsets go negative -> clamped
-        out = norm._gather_neighbourhood(bold, pos)
+        pos = torch.tensor([[[0, 0]]], dtype=torch.long)  # corner; offsets go negative -> clamped
+        mask = torch.ones(B, 1, dtype=torch.bool)
+        out = norm._gather_neighbourhood(bold, pos, mask)
         assert torch.isfinite(out).all()
 
     def test_neighbourhood_at_center_contains_known_value(self):
@@ -281,6 +302,7 @@ class TestGatherNeighbourhood:
         bold = torch.zeros(B, L, T, H, W)
         center_h, center_w = 4, 4
         bold[0, 0, 0, center_h, center_w] = 99.0
-        pos = torch.tensor([[center_h, center_w]], dtype=torch.long)
-        out = norm._gather_neighbourhood(bold, pos)
+        pos = torch.tensor([[[center_h, center_w]]], dtype=torch.long)
+        mask = torch.ones(B, 1, dtype=torch.bool)
+        out = norm._gather_neighbourhood(bold, pos, mask)
         assert (out == 99.0).any()

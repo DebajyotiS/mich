@@ -141,20 +141,25 @@ def _make_mich(*, L: int = _L) -> MICH:
     )
 
 
-def _make_batch(*, B: int = _B, L: int = _L, T: int = _T, H: int = _H, W: int = _W) -> dict:
-    """Minimal training batch (bold + neural + source_position)."""
+def _make_batch(
+    *, B: int = _B, L: int = _L, T: int = _T, H: int = _H, W: int = _W, S: int = 1
+) -> dict:
+    """Minimal training batch (bold + neural + source_position/source_layer/num_sources)."""
     return {
         "bold": torch.randn(B, L, T, H, W),
         "neural": torch.randn(B, L, T, H, W),
-        "source_position": torch.randint(0, min(H, W), (B, 2)),
+        "source_position": torch.randint(0, min(H, W), (B, S, 2)),
+        "source_layer": torch.randint(0, L, (B, S)),
+        "num_sources": torch.randint(1, S + 1, (B,)),
     }
 
 
-def _make_full_batch(*, B: int = _B, L: int = _L, T: int = _T, H: int = _H, W: int = _W) -> dict:
+def _make_full_batch(
+    *, B: int = _B, L: int = _L, T: int = _T, H: int = _H, W: int = _W, S: int = 1
+) -> dict:
     """Validation batch: training keys plus all meta and latent keys."""
-    batch = _make_batch(B=B, L=L, T=T, H=H, W=W)
-    batch["num_pulses"] = torch.randint(1, 4, (B,))
-    batch["source_layer"] = torch.randint(0, L, (B,))
+    batch = _make_batch(B=B, L=L, T=T, H=H, W=W, S=S)
+    batch["num_pulses"] = torch.randint(1, 4, (B, S))
     for key in ("s", "f", "v", "q", "v_star", "q_star"):
         batch[key] = torch.randn(B, L, T, H, W)
     return batch
@@ -168,6 +173,7 @@ def _make_h5_fixture(
     t: int = _T,
     h: int = _H,
     w: int = _W,
+    max_sources: int = 2,
 ) -> None:
     """Write a minimal HDF5 file understood by SyntheticDataModule."""
     rng = np.random.default_rng(0)
@@ -179,15 +185,22 @@ def _make_h5_fixture(
             for key in ("s", "f", "v", "q", "v_star", "q_star"):
                 grp.create_dataset(key, data=rng.standard_normal((n, t, h, w)).astype(np.float32))
         meta = f.require_group("meta")
-        meta.create_dataset("num_pulses", data=rng.integers(1, 4, size=n).astype(np.int32))
-        meta.create_dataset(
-            "source_layer",
-            data=rng.integers(0, len(layers), size=n).astype(np.int32),
-        )
-        meta.create_dataset(
-            "source_position",
-            data=rng.integers(0, min(h, w), size=(n, 2)).astype(np.int32),
-        )
+        num_sources = rng.integers(1, max_sources + 1, size=n).astype(np.int32)
+        meta.create_dataset("num_sources", data=num_sources)
+
+        source_layer = np.full((n, max_sources), -1, dtype=np.int32)
+        source_position = np.full((n, max_sources, 2), -1, dtype=np.int32)
+        source_num_pulses = np.zeros((n, max_sources), dtype=np.int32)
+        for i in range(n):
+            k = int(num_sources[i])
+            source_layer[i, :k] = rng.integers(0, len(layers), size=k)
+            source_position[i, :k] = rng.integers(0, min(h, w), size=(k, 2))
+            source_num_pulses[i, :k] = rng.integers(1, 4, size=k)
+
+        sources = meta.create_group("sources")
+        sources.create_dataset("layer", data=source_layer)
+        sources.create_dataset("position", data=source_position)
+        sources.create_dataset("num_pulses", data=source_num_pulses)
 
 
 def _make_datamodule(h5_path: str, *, layers: tuple = _LAYERS_3) -> SyntheticDataModule:
@@ -261,8 +274,9 @@ class TestMICHLosses:
         bold = torch.randn(_B, _L, _T, _H, _W)
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
         z_hat = model(bold, time).z_hat
-        src_pos = torch.randint(0, min(_H, _W), (_B, 2))
-        loss, _, _ = model._data_loss(z_hat, bold, source_position=src_pos)
+        src_pos = torch.randint(0, min(_H, _W), (_B, 1, 2))
+        num_sources = torch.ones(_B, dtype=torch.long)
+        loss, _, _ = model._data_loss(z_hat, bold, source_position=src_pos, num_sources=num_sources)
         assert loss.ndim == 0
         assert torch.isfinite(loss)
 
@@ -273,8 +287,15 @@ class TestMICHLosses:
         bold = torch.randn(_B, _L, _T, _H, _W)
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
         manifest = model(bold, time, return_gradients=True)
-        src_pos = torch.randint(0, min(_H, _W), (_B, 2))
-        loss, _ = model._physics_loss(manifest.z_hat, manifest.grads, source_position=src_pos)
+        src_pos = torch.randint(0, min(_H, _W), (_B, 1, 2))
+        num_sources = torch.ones(_B, dtype=torch.long)
+        loss, _ = model._physics_loss(
+            manifest.z_hat,
+            manifest.grads,
+            order="linear",
+            source_position=src_pos,
+            num_sources=num_sources,
+        )
         assert loss.ndim == 0
         assert torch.isfinite(loss)
 
@@ -285,7 +306,13 @@ class TestMICHLosses:
         bold = torch.randn(_B, _L, _T, _H, _W)
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
         manifest = model(bold, time, return_gradients=True)
-        loss, _ = model._physics_loss(manifest.z_hat, manifest.grads, source_position=None)
+        loss, _ = model._physics_loss(
+            manifest.z_hat,
+            manifest.grads,
+            order="linear",
+            source_position=None,
+            num_sources=None,
+        )
         assert torch.isfinite(loss)
 
     def test_total_loss_backward_propagates_finite_gradients(self):
@@ -294,11 +321,18 @@ class TestMICHLosses:
         model.train()
         bold = torch.randn(_B, _L, _T, _H, _W)
         time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
-        src_pos = torch.randint(0, min(_H, _W), (_B, 2))
+        src_pos = torch.randint(0, min(_H, _W), (_B, 1, 2))
+        num_sources = torch.ones(_B, dtype=torch.long)
         manifest = model(bold, time, return_gradients=True)
-        data_loss, _, _ = model._data_loss(manifest.z_hat, bold, source_position=src_pos)
+        data_loss, _, _ = model._data_loss(
+            manifest.z_hat, bold, source_position=src_pos, num_sources=num_sources
+        )
         physics_loss, _ = model._physics_loss(
-            manifest.z_hat, manifest.grads, source_position=src_pos
+            manifest.z_hat,
+            manifest.grads,
+            order="linear",
+            source_position=src_pos,
+            num_sources=num_sources,
         )
         (data_loss + physics_loss).backward()
         grads_with_value = [p.grad for p in model.parameters() if p.grad is not None]

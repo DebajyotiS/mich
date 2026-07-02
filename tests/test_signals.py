@@ -4,7 +4,7 @@ import pytest
 from src.data.signals import (
     AlphaPulse,
     ExpDecayPulse,
-    GaussianPulse,
+    TriangularPulse,
     Noise,
     Pulse,
     RectPulse,
@@ -54,12 +54,12 @@ def test_gaussian_pulse_generate_triangle_shape_and_zero_width_returns_zero():
     t = _t_grid(1.0, 0.1)
 
     # width=0 should return all zeros (division-by-zero guard path)
-    p0 = GaussianPulse(amplitude=1.0, t_peak=0.5, width=0.0)
+    p0 = TriangularPulse(amplitude=1.0, t_peak=0.5, width=0.0)
     y0 = p0.generate(t)
     assert np.all(y0 == 0.0)
 
     # nonzero width: piecewise linear ramp up/down
-    p = GaussianPulse(amplitude=2.0, t_peak=0.5, width=0.4)
+    p = TriangularPulse(amplitude=2.0, t_peak=0.5, width=0.4)
     y = p.generate(t)
 
     t_start = 0.5 - 0.2
@@ -120,7 +120,7 @@ def test_alpha_pulse_generate_basic():
     [
         ("exp_decay", [1.0, 0.2, 2.0], ExpDecayPulse),
         ("rect", [1.0, 0.2, 0.3], RectPulse),
-        ("gaussian", [1.0, 0.5, 0.4], GaussianPulse),
+        ("gaussian", [1.0, 0.5, 0.4], TriangularPulse),
         ("sinc", [1.0, 0.5, 0.4, 3.0], SincPulse),
         ("alpha", [1.0, 0.2, 2.0, 3.0], AlphaPulse),
     ],
