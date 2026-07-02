@@ -68,6 +68,7 @@ class MICH(LightningModule):
         self.bold_buffer = []
         self.source_layer_buffer = []
         self.source_position_buffer = []
+        self.num_sources_buffer = []
         self.true_z_hat_buffer = []
 
         # Build PSF objects and register 2D kernels as buffers so they move with the device.
@@ -214,6 +215,7 @@ class MICH(LightningModule):
         n_space: int,
         device: torch.device,
         source_position: torch.Tensor,
+        num_sources: torch.Tensor | None = None,
         dense_spatial_radius: int = 5,
         dense_spatial_frac: float = 0.8,
         dense_time_frac: float = 0.8,
@@ -236,9 +238,21 @@ class MICH(LightningModule):
         n_uniform_s = n_space - n_dense_s
 
         if n_dense_s > 0:
+            if num_sources is None:
+                raise ValueError("num_sources is required when source_position is provided")
             B = source_position.shape[0]
-            src_h = source_position[:, 0].long()
-            src_w = source_position[:, 1].long()
+            k = num_sources.clamp(min=1)  # [B]
+
+            # Round-robin each dense draw across the sample's active sources so every
+            # source gets (near-)equal collocation coverage, rather than an expected
+            # share under random per-point source choice.
+            n_dense_total = n_times * n_dense_s
+            draw_idx = torch.arange(n_dense_total, device=device)
+            src_choice = (draw_idx[None, :] % k[:, None]).view(B, n_times, n_dense_s)
+
+            b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, n_times, n_dense_s)
+            src_h = source_position[b_idx, src_choice, 0].long()  # [B, n_times, n_dense_s]
+            src_w = source_position[b_idx, src_choice, 1].long()
 
             off_h = torch.randint(
                 -dense_spatial_radius,
@@ -253,8 +267,8 @@ class MICH(LightningModule):
                 device=device,
             )
 
-            h_dense = (src_h[:, None, None] + off_h).clamp(0, H - 1)
-            w_dense = (src_w[:, None, None] + off_w).clamp(0, W - 1)
+            h_dense = (src_h + off_h).clamp(0, H - 1)
+            w_dense = (src_w + off_w).clamp(0, W - 1)
 
             h_uniform = torch.randint(0, H, (B, n_times, n_uniform_s), device=device)
             w_uniform = torch.randint(0, W, (B, n_times, n_uniform_s), device=device)
@@ -285,24 +299,57 @@ class MICH(LightningModule):
     def _antisteady_loss(
         self,
         z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
-        source_position: torch.Tensor,  # [B, 2]
+        source_position: torch.Tensor,  # [B, S, 2]
+        source_layer: torch.Tensor,  # [B, S]
+        num_sources: torch.Tensor,  # [B]
     ) -> torch.Tensor:
-        B = z_hat.shape[0]
-        b_idx = torch.arange(B, device=z_hat.device)
-        src_h = source_position[:, 0].long()
-        src_w = source_position[:, 1].long()
+        """Two-sided variance penalty at each source voxel.
+
+        Positive term: at a source's own (layer, h, w), x should show real
+        dynamics over time (not settle to steady state).
+        Negative term: at that SAME (h, w) in every OTHER layer, there is no
+        neural source -- so despite possible BOLD drainage from the source
+        layer, x should stay flat. This teaches the model that BOLD can
+        exist without co-located neural activity (venous drainage) rather
+        than hallucinating neural signal wherever BOLD moves.
+        """
+        B, _, L = z_hat.shape[:3]
+        S = source_position.shape[1]
+        device = z_hat.device
+
+        mask = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
+        b_idx = torch.arange(B, device=device)[:, None].expand(B, S)  # [B, S]
+        src_h = source_position[..., 0].long()  # [B, S]
+        src_w = source_position[..., 1].long()  # [B, S]
+        src_l = source_layer.clamp(min=0, max=L - 1).long()  # [B, S], padding clamped, masked below
+
         x_idx = MICH._signal_index("x")
-        # x at source voxel: [B, L, T]
-        x_src = z_hat[b_idx, x_idx, :, :, src_h, src_w]
-        x_var = x_src.var(dim=-1)  # [B, L]
         eps = getattr(self.hparams.loss_config, "antisteady_epsilon", 0.01)
-        return F.relu(eps - x_var).mean()
+
+        # x at each source's own voxel/layer: [B, S, T]
+        x_src = z_hat[b_idx, x_idx, src_l, :, src_h, src_w]
+        x_var = x_src.var(dim=-1)  # [B, S]
+        pos_term = F.relu(eps - x_var)
+        pos_loss = (pos_term * mask).sum() / mask.sum().clamp(min=1)
+
+        # x at the same (h, w) across every OTHER layer: [B, S, L, T]
+        x_all_layers = z_hat[b_idx, x_idx, :, :, src_h, src_w]
+        x_var_other = x_all_layers.var(dim=-1)  # [B, S, L]
+        other_layer_mask = torch.arange(L, device=device)[None, None, :] != src_l[:, :, None]
+        other_mask = mask[:, :, None] & other_layer_mask  # [B, S, L]
+        eps_neg = getattr(self.hparams.loss_config, "antisteady_neg_epsilon", eps)
+        neg_term = F.relu(x_var_other - eps_neg)
+        neg_loss = (neg_term * other_mask).sum() / other_mask.sum().clamp(min=1)
+
+        lambda_neg = getattr(self.hparams.loss_config, "lambda_antisteady_neg", 1.0)
+        return pos_loss + lambda_neg * neg_loss
 
     def _data_loss(
         self,
         z_hat: torch.Tensor,
         bold_norm: torch.Tensor,
         source_position: torch.Tensor | None = None,
+        num_sources: torch.Tensor | None = None,
     ) -> torch.Tensor:
         collocation = MICH._sample_collocation_indices(
             T=bold_norm.shape[2],
@@ -312,6 +359,7 @@ class MICH(LightningModule):
             n_space=self.hparams.loss_config.n_space,
             device=z_hat.device,
             source_position=source_position,
+            num_sources=num_sources,
             dense_spatial_frac=self.hparams.loss_config.dense_spatial_frac,
             dense_spatial_radius=self.hparams.loss_config.dense_spatial_radius,
             dense_time_frac=self.hparams.loss_config.dense_time_frac,
@@ -357,13 +405,20 @@ class MICH(LightningModule):
             ]
         ).mean()
 
-        # Source voxel loss -- full T, all layers, per sample; shape per layer: [B, T]; Pearson over T (dim=1)
+        # Source voxel loss -- full T, all layers, per valid source; shape per layer:
+        # [M, T] where M = total valid sources across the batch; Pearson over T (dim=1)
         B = pred_bold.shape[0]
-        b_idx = torch.arange(B, device=pred_bold.device)
-        src_h = source_position[:, 0].long()
-        src_w = source_position[:, 1].long()
-        pred_bold_src = pred_bold[b_idx, :, :, src_h, src_w]  # [B, L, T]
-        true_bold_src = true_bold[b_idx, :, :, src_h, src_w]  # [B, L, T]
+        S = source_position.shape[1]
+        b_idx = torch.arange(B, device=pred_bold.device)[:, None].expand(B, S)
+        src_h = source_position[..., 0].long()  # [B, S]
+        src_w = source_position[..., 1].long()
+        pred_bold_src = pred_bold[b_idx, :, :, src_h, src_w]  # [B, S, L, T]
+        true_bold_src = true_bold[b_idx, :, :, src_h, src_w]  # [B, S, L, T]
+        T_src = pred_bold_src.shape[-1]
+
+        mask = torch.arange(S, device=pred_bold.device)[None, :] < num_sources[:, None]  # [B, S]
+        pred_bold_src = pred_bold_src.reshape(B * S, L, T_src)[mask.reshape(-1)]  # [M, L, T]
+        true_bold_src = true_bold_src.reshape(B * S, L, T_src)[mask.reshape(-1)]
         src_loss = torch.stack(
             [
                 self._bold_loss_fn(pred_bold_src[:, layer], true_bold_src[:, layer])
@@ -510,7 +565,7 @@ class MICH(LightningModule):
         ("f", "f"),
         ("v", "v"),
         ("q", "q"),
-        ("x", "neural"), # TODO: Remove this eventually
+        ("x", "neural"),  # TODO: Remove this eventually
     )
 
     def _supervision_keys(self, z_hat: torch.Tensor):
@@ -521,6 +576,7 @@ class MICH(LightningModule):
         z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
         batch: dict,
         source_position: torch.Tensor | None = None,
+        num_sources: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """MSE between predicted and ground-truth latent states at collocation points."""
         # Use T_min so collocation indices are valid for both z_hat and true latents.
@@ -535,6 +591,7 @@ class MICH(LightningModule):
             n_space=lc.n_space,
             device=z_hat.device,
             source_position=source_position,
+            num_sources=num_sources,
             dense_spatial_frac=lc.dense_spatial_frac,
             dense_spatial_radius=lc.dense_spatial_radius,
             dense_time_frac=lc.dense_time_frac,
@@ -561,13 +618,17 @@ class MICH(LightningModule):
         self,
         z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
         batch: dict,
-        source_position: torch.Tensor,
+        source_position: torch.Tensor,  # [B, S, 2]
+        num_sources: torch.Tensor,  # [B]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """MSE between predicted and ground-truth latent states at the source voxel across all T."""
+        """MSE between predicted and ground-truth latent states at each valid source voxel, across all T."""
         B = z_hat.shape[0]
-        b_idx = torch.arange(B, device=z_hat.device)
-        src_h = source_position[:, 0].long()
-        src_w = source_position[:, 1].long()
+        S = source_position.shape[1]
+        device = z_hat.device
+        b_idx = torch.arange(B, device=device)[:, None].expand(B, S)
+        src_h = source_position[..., 0].long()  # [B, S]
+        src_w = source_position[..., 1].long()
+        mask = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
         T_latent = batch["s"].shape[2]
         T_pred = z_hat.shape[3]
         T_min = min(T_pred, T_latent)
@@ -576,9 +637,11 @@ class MICH(LightningModule):
         for sig, bk in self._supervision_keys(z_hat):
             true = batch[bk].float()  # [B, L, T_latent, H, W]
             pred = z_hat[:, MICH._signal_index(sig)].float()  # [B, L, T, H, W]
-            pred_src = pred[b_idx, :, :T_min, src_h, src_w]  # [B, L, T_min]
-            true_src = true[b_idx, :, :T_min, src_h, src_w]  # [B, L, T_min]
-            L = pred_src.shape[1]
+            pred_src = pred[b_idx, :, :T_min, src_h, src_w]  # [B, S, L, T_min]
+            true_src = true[b_idx, :, :T_min, src_h, src_w]  # [B, S, L, T_min]
+            L = pred_src.shape[2]
+            pred_src = pred_src.reshape(B * S, L, T_min)[mask.reshape(-1)]  # [M, L, T_min]
+            true_src = true_src.reshape(B * S, L, T_min)[mask.reshape(-1)]
             per_sig[sig] = torch.stack(
                 [
                     self._supervision_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
@@ -608,6 +671,7 @@ class MICH(LightningModule):
         order: str,
         lambda_smooth: float = 0.0,
         source_position: torch.Tensor | None = None,
+        num_sources: torch.Tensor | None = None,
     ) -> torch.Tensor:
         idx = MICH._sample_collocation_indices(
             T=z_hat.shape[3],
@@ -617,6 +681,7 @@ class MICH(LightningModule):
             n_space=self.hparams.loss_config.n_space,
             device=z_hat.device,
             source_position=source_position,
+            num_sources=num_sources,
             dense_spatial_frac=self.hparams.loss_config.dense_spatial_frac,
             dense_spatial_radius=self.hparams.loss_config.dense_spatial_radius,
             dense_time_frac=self.hparams.loss_config.dense_time_frac,
@@ -654,10 +719,15 @@ class MICH(LightningModule):
 
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
         bold, neural = batch["bold"], batch["neural"]
-        source_position = batch["source_position"]
-        _source_layer = batch.get("source_layer", None)
+        source_position = batch["source_position"]  # [B, S, 2]
+        source_layer = batch["source_layer"]  # [B, S]
+        num_sources = batch["num_sources"]  # [B]
 
-        bold_norm = self.normaliser(bold, source_position) if self.normaliser is not None else bold
+        bold_norm = (
+            self.normaliser(bold, source_position, num_sources)
+            if self.normaliser is not None
+            else bold
+        )
 
         lc = self.hparams.loss_config
         lambda_physics_eff = self._get_scheduled_lambda(
@@ -683,7 +753,7 @@ class MICH(LightningModule):
         dz_hat_dt = sd_manifest.grads  # None when need_grads=False
 
         data_loss, _colloc_loss, src_loss = self._data_loss(
-            z_hat, bold_norm, source_position=source_position
+            z_hat, bold_norm, source_position=source_position, num_sources=num_sources
         )
         if need_grads:
             physics_loss, per_eq_physics = self._physics_loss(
@@ -691,6 +761,7 @@ class MICH(LightningModule):
                 dz_hat_dt,
                 lambda_smooth=lambda_smooth_eff,
                 source_position=source_position,
+                num_sources=num_sources,
                 order=self.hparams.loss_config.order,
             )
         else:
@@ -705,7 +776,9 @@ class MICH(LightningModule):
         )
 
         if lambda_antisteady_eff > 0.0:
-            antisteady_loss = self._antisteady_loss(z_hat, source_position)
+            antisteady_loss = self._antisteady_loss(
+                z_hat, source_position, source_layer, num_sources
+            )
             total_loss = total_loss + lambda_antisteady_eff * antisteady_loss
         else:
             antisteady_loss = None
@@ -721,7 +794,7 @@ class MICH(LightningModule):
             )
             if lambda_supervision_eff > 0:
                 supervision_loss, per_sig_supervision = self._source_supervision_loss(
-                    z_hat, batch, source_position
+                    z_hat, batch, source_position, num_sources
                 )
                 total_loss = total_loss + lambda_supervision_eff * supervision_loss
 
@@ -844,10 +917,10 @@ class MICH(LightningModule):
         return self._shared_step(batch, stage="train").total_loss
 
     def validation_step(self, batch, batch_idx):
-        _num_pulses, _source_layer, source_position = (
-            batch["num_pulses"],
+        source_layer, source_position, num_sources = (
             batch["source_layer"],
             batch["source_position"],
+            batch["num_sources"],
         )
 
         manifest = self._shared_step(batch, stage="val")
@@ -868,7 +941,8 @@ class MICH(LightningModule):
             self.bold_buffer.append(manifest.bold.detach().cpu())
             self.neural_buffer.append(manifest.neural.detach().cpu())
             self.source_position_buffer.append(source_position.detach().cpu())
-            self.source_layer_buffer.append(_source_layer.detach().cpu())
+            self.source_layer_buffer.append(source_layer.detach().cpu())
+            self.num_sources_buffer.append(num_sources.detach().cpu())
             self.true_z_hat_buffer.append(true_z_hat.detach().cpu())
 
         return manifest.total_loss
@@ -879,6 +953,7 @@ class MICH(LightningModule):
         z_hat = torch.cat(self.pred_buffer, dim=0)
         source_position = torch.cat(self.source_position_buffer, dim=0)
         source_layer = torch.cat(self.source_layer_buffer, dim=0)
+        num_sources = torch.cat(self.num_sources_buffer, dim=0)
         true_zhat = (
             torch.cat(self.true_z_hat_buffer, dim=0) if hasattr(self, "true_z_hat_buffer") else None
         )
@@ -888,6 +963,7 @@ class MICH(LightningModule):
         self.neural_buffer.clear()
         self.source_position_buffer.clear()
         self.source_layer_buffer.clear()
+        self.num_sources_buffer.clear()
         self.true_z_hat_buffer.clear()
 
         # Each rank logs its own plots to its own W&B run -- no gather needed.
@@ -897,10 +973,14 @@ class MICH(LightningModule):
         subset_neural = neural[random_indices]
         subset_true_z_hat = true_zhat[random_indices] if true_zhat is not None else None
         subset_z_hat = z_hat[random_indices]
-        subset_src_pos = source_position[random_indices]
-        subset_src_layer = source_layer[random_indices]
-        subset_h = subset_src_pos[..., 0]
-        subset_w = subset_src_pos[..., 1]
+        subset_src_pos = source_position[random_indices]  # [B, S, 2]
+        subset_src_layer = source_layer[random_indices]  # [B, S]
+        subset_num_sources = num_sources[random_indices]  # [B]
+        # Trace-extraction below shows one representative voxel per sample (not per
+        # source) to keep the existing single-voxel plot layout; slot 0 is always a
+        # valid source since num_sources >= 1 for every sample.
+        subset_h = subset_src_pos[:, 0, 0]
+        subset_w = subset_src_pos[:, 0, 1]
         batch_idx = torch.arange(subset_bold.shape[0])
 
         # Compute pred_bold at full spatial resolution so PSF can be applied before indexing.
@@ -958,6 +1038,7 @@ class MICH(LightningModule):
             true_x_recon=true_x_recon,  # [B, L, T-1] -- x implied by true s/f
             true_neural=subset_neural,  # [B, L, T]   -- ground truth x
             source_layer=subset_src_layer,
+            num_sources=subset_num_sources,
         )
 
         # Neural recovery metrics over the full val set (not just the plot subset)
@@ -980,6 +1061,7 @@ class MICH(LightningModule):
             true_neural=subset_neural,
             source_layer=subset_src_layer,
             source_pos=subset_src_pos,
+            num_sources=subset_num_sources,
         )
         has_drain = subset_z_hat.shape[1] > 5
         if has_drain:
@@ -1010,13 +1092,14 @@ class MICH(LightningModule):
             )
 
     def _plot_and_log_x_recon(
-        self, pred_neural, pred_x_recon, true_x_recon, true_neural, source_layer
+        self, pred_neural, pred_x_recon, true_x_recon, true_neural, source_layer, num_sources
     ):
         run = getattr(self, "_rank_run", None) or wandb.run
         layer_names = ["Deep", "Middle", "Superficial"]
         images = []
         for i in range(pred_neural.shape[0]):
             n_layers = pred_neural.shape[1]
+            valid_layers = source_layer[i, : int(num_sources[i])]
             fig, axes = plt.subplots(1, n_layers, figsize=(8 * n_layers, 8))
             if n_layers == 1:
                 axes = [axes]
@@ -1046,7 +1129,10 @@ class MICH(LightningModule):
                     color="blue",
                     linestyle=":",
                 )
-                ax.set_title(f"{layer_names[l]}" + (" [src]" if source_layer[i] == l else ""))
+                n_src_here = int((valid_layers == l).sum())
+                ax.set_title(
+                    f"{layer_names[l]}" + (f" [{n_src_here} src]" if n_src_here > 0 else "")
+                )
                 ax.legend(fontsize=6)
             fig.suptitle("x: head vs ODE reconstruction")
             fig.tight_layout()
@@ -1091,7 +1177,14 @@ class MICH(LightningModule):
         return {"val/neural/r2": r2, "val/neural/pearson": pearson, "val/neural/lag_samples": peak_lag}
 
     def _plot_and_log_predictions(
-        self, pred_bold, true_bold, pred_neural, true_neural, source_layer, source_pos
+        self,
+        pred_bold,
+        true_bold,
+        pred_neural,
+        true_neural,
+        source_layer,
+        source_pos,
+        num_sources,
     ):
         run = getattr(self, "_rank_run", None) or wandb.run
         images = []
@@ -1103,6 +1196,7 @@ class MICH(LightningModule):
                 true_neural=true_neural[i],
                 source_layer=source_layer[i],
                 source_pos=source_pos[i],
+                num_sources=num_sources[i],
             )
             images.append(wandb.Image(image))
             plt.close(image)
