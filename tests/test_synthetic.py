@@ -35,6 +35,7 @@ def _make_h5(
     include_meta: bool = True,
     include_latents: bool = True,
     latent_t: int | None = None,
+    max_sources: int = 3,
 ) -> None:
     """Write a minimal valid HDF5 file understood by SyntheticH5Dataset."""
     lt = latent_t if latent_t is not None else t
@@ -48,14 +49,22 @@ def _make_h5(
                 grp.create_dataset(key, data=rng.standard_normal((n, lt, h, w)).astype(np.float32))
         if include_meta:
             meta = f.require_group("meta")
-            meta.create_dataset("num_pulses", data=rng.integers(1, 4, size=n).astype(np.int32))
-            meta.create_dataset(
-                "source_layer", data=rng.integers(0, len(layers), size=n).astype(np.int32)
-            )
-            meta.create_dataset(
-                "source_position",
-                data=rng.integers(0, min(h, w), size=(n, 2)).astype(np.int32),
-            )
+            num_sources = rng.integers(1, max_sources + 1, size=n).astype(np.int32)
+            meta.create_dataset("num_sources", data=num_sources)
+
+            source_layer = np.full((n, max_sources), -1, dtype=np.int32)
+            source_position = np.full((n, max_sources, 2), -1, dtype=np.int32)
+            source_num_pulses = np.zeros((n, max_sources), dtype=np.int32)
+            for i in range(n):
+                k = int(num_sources[i])
+                source_layer[i, :k] = rng.integers(0, len(layers), size=k)
+                source_position[i, :k] = rng.integers(0, min(h, w), size=(k, 2))
+                source_num_pulses[i, :k] = rng.integers(1, 4, size=k)
+
+            sources = meta.create_group("sources")
+            sources.create_dataset("layer", data=source_layer)
+            sources.create_dataset("position", data=source_position)
+            sources.create_dataset("num_pulses", data=source_num_pulses)
 
 
 # -------------------------
@@ -237,21 +246,23 @@ def test_dataset_return_meta_false_excludes_meta_keys(tmp_path):
     _make_h5(p, n=3, include_meta=True)
     ds = SyntheticH5Dataset(p, cache_cfg=_CACHE_CFG, return_meta=False, layers=_LAYERS_2)
     item = ds[0]
-    for key in ("num_pulses", "source_layer", "source_position"):
+    for key in ("num_sources", "num_pulses", "source_layer", "source_position"):
         assert key not in item
 
 
 def test_dataset_return_meta_true_includes_meta_keys(tmp_path):
     p = str(tmp_path / "d.h5")
-    _make_h5(p, n=3, include_meta=True)
+    _make_h5(p, n=3, include_meta=True, max_sources=3)
     ds = SyntheticH5Dataset(p, cache_cfg=_CACHE_CFG, return_meta=True, layers=_LAYERS_2)
     item = ds[0]
+    assert "num_sources" in item
     assert "num_pulses" in item
     assert "source_layer" in item
     assert "source_position" in item
-    assert isinstance(item["num_pulses"], int)
-    assert isinstance(item["source_layer"], int)
-    assert item["source_position"].ndim == 1  # per-sample 2-vector
+    assert isinstance(item["num_sources"], int)
+    assert item["source_layer"].shape == (3,)  # [max_sources]
+    assert item["source_position"].shape == (3, 2)  # [max_sources, 2]
+    assert item["num_pulses"].shape == (3,)  # [max_sources]
 
 
 def test_dataset_return_latents_true_includes_latent_keys(tmp_path):
@@ -414,6 +425,7 @@ class TestSyntheticDataModule:
             "bold",
             "neural",
             "source_position",
+            "num_sources",
             "num_pulses",
             "source_layer",
             "s",
