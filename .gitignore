@@ -62,9 +62,9 @@ config/private/private.yaml
 # --------------------------------------------------
 notebooks/*.mp4
 notebooks/*.py
-data/
 notebooks/*gif
-notebooks/*txt
+data/
+notebooks/commands.txt
 
 # --------------------------------------------------
 # AI
