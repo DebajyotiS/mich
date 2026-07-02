@@ -136,9 +136,10 @@ class SyntheticH5Dataset(Dataset):
         self._h5: Optional[h5py.File] = None
         self._bold_ds: Optional[list[h5py.Dataset]] = None
         self._x_ds: Optional[list[h5py.Dataset]] = None
-        self._m_num_pulses: Optional[h5py.Dataset] = None
+        self._m_num_sources: Optional[h5py.Dataset] = None
         self._m_source_layer: Optional[h5py.Dataset] = None
         self._m_source_position: Optional[h5py.Dataset] = None
+        self._m_source_num_pulses: Optional[h5py.Dataset] = None
         self._m_latent_s: Optional[list[h5py.Dataset]] = None
         self._m_latent_f: Optional[list[h5py.Dataset]] = None
         self._m_latent_v: Optional[list[h5py.Dataset]] = None
@@ -163,9 +164,10 @@ class SyntheticH5Dataset(Dataset):
             "_h5",
             "_bold_ds",
             "_x_ds",
-            "_m_num_pulses",
+            "_m_num_sources",
             "_m_source_layer",
             "_m_source_position",
+            "_m_source_num_pulses",
             "_m_latent_s",
             "_m_latent_f",
             "_m_latent_v",
@@ -191,9 +193,10 @@ class SyntheticH5Dataset(Dataset):
         self._bold_ds = [self._h5[lyr]["bold"] for lyr in self.layers]
         self._x_ds = [self._h5[lyr]["x"] for lyr in self.layers]
         if self.return_meta:
-            self._m_num_pulses = self._h5["meta"]["num_pulses"]
-            self._m_source_layer = self._h5["meta"]["source_layer"]
-            self._m_source_position = self._h5["meta"]["source_position"]
+            self._m_num_sources = self._h5["meta"]["num_sources"]
+            self._m_source_layer = self._h5["meta"]["sources"]["layer"]
+            self._m_source_position = self._h5["meta"]["sources"]["position"]
+            self._m_source_num_pulses = self._h5["meta"]["sources"]["num_pulses"]
         if self.return_latents:
             self._m_latent_s = [self._h5[lyr]["s"] for lyr in self.layers]
             self._m_latent_f = [self._h5[lyr]["f"] for lyr in self.layers]
@@ -225,9 +228,11 @@ class SyntheticH5Dataset(Dataset):
         if self.return_meta:
             out.update(
                 {
-                    "num_pulses": int(self._m_num_pulses[idx]),
-                    "source_layer": int(self._m_source_layer[idx]),
-                    "source_position": self._m_source_position[idx],
+                    # padded to max_sources; only the first `num_sources` entries are valid
+                    "num_sources": int(self._m_num_sources[idx]),
+                    "source_layer": self._m_source_layer[idx],  # [max_sources]
+                    "source_position": self._m_source_position[idx],  # [max_sources, 2]
+                    "num_pulses": self._m_source_num_pulses[idx],  # [max_sources]
                 }
             )
 
