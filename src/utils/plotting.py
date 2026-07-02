@@ -25,6 +25,7 @@ def plot_neural_bold_layers(
     true_neural: torch.Tensor,
     source_layer: torch.Tensor,
     source_pos: torch.Tensor,
+    num_sources: int | torch.Tensor = 1,
     tr: float = 1.0,
 ) -> Figure:
     """
@@ -35,9 +36,11 @@ def plot_neural_bold_layers(
         true_bold:    [L, T]
         pred_neural:  [L, T]
         true_neural:  [L, T]
-        source_layer: [L]
-        source_pos:   [L, 2]
-        tr:           repetition time in seconds (default 0.1s)
+        source_layer: [S]     per-source layer index, padded past num_sources
+        source_pos:   [S, 2]  per-source (h, w), same padding
+        num_sources:  number of valid entries in source_layer/source_pos
+                      (S=1, num_sources=1 for single-source data)
+        tr:           repetition time in seconds (default 1.0s)
     """
     n_layers = pred_bold.shape[0]
     times = np.arange(pred_bold.shape[-1]) * tr
@@ -46,8 +49,9 @@ def plot_neural_bold_layers(
     true_bold_np = true_bold.cpu().numpy()
     pred_neural_np = pred_neural.cpu().numpy()
     true_neural_np = true_neural.cpu().numpy()
-    source_layer = source_layer.cpu().numpy()
-    source_pos = source_pos.cpu().numpy()
+    num_sources = int(num_sources.item() if torch.is_tensor(num_sources) else num_sources)
+    source_layer = source_layer.cpu().numpy()[:num_sources]
+    source_pos = source_pos.cpu().numpy()[:num_sources]
 
     bold_min, bold_max = true_bold_np.min(), true_bold_np.max()
     bold_pad = (bold_max - bold_min) * 0.05
@@ -59,6 +63,7 @@ def plot_neural_bold_layers(
         axes = [axes]
 
     for i in range(n_layers):
+        layer_idx = n_layers - i - 1
         ax_bold = axes[i]
         ax_neural = ax_bold.twinx()
 
@@ -96,7 +101,12 @@ def plot_neural_bold_layers(
             alpha=0.8,
         )
 
-        ax_bold.set_title(LAYER_NAMES[n_layers - i - 1], fontfamily="monospace")
+        layer_sources = source_pos[source_layer == layer_idx]
+        title = LAYER_NAMES[i]
+        if len(layer_sources) > 0:
+            pos_str = ", ".join(f"({h},{w})" for h, w in layer_sources)
+            title += f"  [{len(layer_sources)} src @ {pos_str}]"
+        ax_bold.set_title(title, fontfamily="monospace")
         ax_bold.set_xlabel("Time (s)", fontfamily="monospace")
         ax_bold.set_ylabel("BOLD Signal", fontfamily="monospace")
         ax_neural.set_ylabel("Neural Activity", fontfamily="monospace")

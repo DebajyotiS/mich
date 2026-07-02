@@ -8,11 +8,11 @@ class LayerwiseBOLDNormalizer(nn.Module):
     Welford online algorithm for running mean/variance.
 
     Statistics are computed from a spatial neighbourhood of radius
-    `neighbourhood_radius` around each sample's source voxel, reducing over
-    (B, L, T, N) to a single shared scalar. This excludes the mostly-silent
-    background which would otherwise dominate the variance estimate, while
-    preserving inter-layer amplitude ratios (all layers divided by the same
-    scale factor).
+    `neighbourhood_radius` around each sample's active source voxels,
+    reducing over (valid sources, L, T, N) to a single shared scalar. This
+    excludes the mostly-silent background which would otherwise dominate
+    the variance estimate, while preserving inter-layer amplitude ratios
+    (all layers divided by the same scale factor).
     """
 
     def __init__(
@@ -45,17 +45,25 @@ class LayerwiseBOLDNormalizer(nn.Module):
             return torch.ones_like(self.running_M2)
         return self.running_M2 / (self.running_count - 1)
 
+    @staticmethod
+    def _source_mask(num_sources: torch.Tensor, S: int) -> torch.Tensor:
+        """[B] valid-source counts -> [B, S] boolean mask (arange trick, not a padding-value check)."""
+        arange_s = torch.arange(S, device=num_sources.device)
+        return arange_s[None, :] < num_sources[:, None]
+
     def _gather_neighbourhood(
-        self, bold: torch.Tensor, source_position: torch.Tensor
+        self, bold: torch.Tensor, source_position: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:
         """
-        Gather voxels within a square neighbourhood around each sample's source.
+        Gather voxels within a square neighbourhood around each valid source.
 
         bold:            [B, L, T, H, W]
-        source_position: [B, 2]  (h, w)
-        returns:         [B, L, T, N]  where N = (2r+1)^2
+        source_position: [B, S, 2]  (h, w) -- padded rows may hold garbage, excluded via `mask`
+        mask:            [B, S]     bool, True where that source slot is valid
+        returns:         [M, L, T, N]  where N = (2r+1)^2, M = mask.sum()
         """
         B, L, T, H, W = bold.shape
+        S = source_position.shape[1]
         r = self.neighbourhood_radius
         device = bold.device
 
@@ -64,29 +72,30 @@ class LayerwiseBOLDNormalizer(nn.Module):
         oh = oh.reshape(-1)  # [N]
         ow = ow.reshape(-1)  # [N]
 
-        src_h = source_position[:, 0].long()  # [B]
-        src_w = source_position[:, 1].long()  # [B]
+        src_h = source_position[..., 0].long()  # [B, S]
+        src_w = source_position[..., 1].long()  # [B, S]
 
-        nh = (src_h[:, None] + oh[None]).clamp(0, H - 1)  # [B, N]
-        nw = (src_w[:, None] + ow[None]).clamp(0, W - 1)  # [B, N]
+        nh = (src_h[..., None] + oh[None, None]).clamp(0, H - 1)  # [B, S, N]
+        nw = (src_w[..., None] + ow[None, None]).clamp(0, W - 1)  # [B, S, N]
 
-        return bold[
-            torch.arange(B, device=device)[:, None, None, None],
-            torch.arange(L, device=device)[None, :, None, None],
-            torch.arange(T, device=device)[None, None, :, None],
-            nh[:, None, None, :],
-            nw[:, None, None, :],
-        ]  # [B, L, T, N]
+        b_idx = torch.arange(B, device=device).view(B, 1, 1, 1, 1)
+        l_idx = torch.arange(L, device=device).view(1, 1, L, 1, 1)
+        t_idx = torch.arange(T, device=device).view(1, 1, 1, T, 1)
+        nh_ = nh.view(B, S, 1, 1, -1)
+        nw_ = nw.view(B, S, 1, 1, -1)
+
+        neighbourhood = bold[b_idx, l_idx, t_idx, nh_, nw_]  # [B, S, L, T, N]
+        neighbourhood = neighbourhood.reshape(B * S, L, T, -1)
+        return neighbourhood[mask.reshape(-1)]  # [M, L, T, N]
 
     def _welford_update(
-        self, bold: torch.Tensor, source_position: torch.Tensor
+        self, bold: torch.Tensor, source_position: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bold = bold.detach().float()
-        B, L, T, H, W = bold.shape
 
-        neighbourhood = self._gather_neighbourhood(bold, source_position)  # [B, L, T, N]
+        neighbourhood = self._gather_neighbourhood(bold, source_position, mask)  # [M, L, T, N]
 
-        # Reduce over all of (B, L, T, N) -- shared scalar preserves inter-layer ratios
+        # Reduce over all of (M, L, T, N) -- shared scalar preserves inter-layer ratios
         n_new = neighbourhood.numel()
         batch_mean = neighbourhood.mean().reshape(1, 1, 1, 1, 1)
         batch_var = neighbourhood.var(unbiased=False).reshape(1, 1, 1, 1, 1)
@@ -119,17 +128,20 @@ class LayerwiseBOLDNormalizer(nn.Module):
         self,
         bold: torch.Tensor,
         source_position: torch.Tensor | None = None,
+        num_sources: torch.Tensor | None = None,
         pause_update: bool = False,
     ) -> torch.Tensor:
         input_dtype = bold.dtype
         bold_f32 = bold.float()
 
         if self.training and (not self.frozen) and (not pause_update):
-            if source_position is None:
+            if source_position is None or num_sources is None:
                 raise ValueError(
-                    "source_position required during training for neighbourhood normalisation"
+                    "source_position and num_sources are required during training "
+                    "for neighbourhood normalisation"
                 )
-            batch_mean, batch_var = self._welford_update(bold, source_position)
+            mask = self._source_mask(num_sources, source_position.shape[1])
+            batch_mean, batch_var = self._welford_update(bold, source_position, mask)
             mean = batch_mean
             std = batch_var.sqrt().clamp(min=1e-3)
         else:
