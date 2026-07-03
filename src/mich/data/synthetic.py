@@ -31,6 +31,18 @@ def _np_dtype(torch_dtype: torch.dtype) -> np.dtype:
     raise ValueError(f"Unsupported torch dtype: {torch_dtype}")
 
 
+def discover_layers(path: str) -> Tuple[str, ...]:
+    """Auto-discover layer_* groups in a simulation HDF5 file, sorted by index."""
+    with h5py.File(str(path), "r") as f:
+        names = sorted(
+            (k for k in f.keys() if k.startswith("layer_")),
+            key=lambda s: int(s.split("_")[1]),
+        )
+    if not names:
+        raise ValueError(f"No layer_* groups found in {path}")
+    return tuple(names)
+
+
 def _open_h5(path: str, cache_cfg: Mapping[str, Any]) -> h5py.File:
     """
     Notes:
@@ -58,7 +70,7 @@ def _compute_split_counts(n: int, split: Mapping[str, Any]) -> Tuple[int, int, i
     val_count = split.get("val_count", None)
     test_count = split.get("test_count", None)
 
-    # --- counts take precedence if any count is set ---
+    # counts take precedence if any count is set
     if train_count is not None or val_count is not None or test_count is not None:
         tr = int(train_count or 0)
         va = int(val_count or 0)
@@ -70,7 +82,6 @@ def _compute_split_counts(n: int, split: Mapping[str, Any]) -> Tuple[int, int, i
             tr = n - (va + te)
         return tr, va, te
 
-    # --- fraction-based ---
     # allow either train_frac+val_frac+test_frac or just val/test
     tf = split.get("test_frac", 0.1)
     vf = split.get("val_frac", 0.1)
@@ -132,7 +143,7 @@ class SyntheticH5Dataset(Dataset):
         self.return_latents = bool(return_latents)
         self.cache_cfg = dict(cache_cfg)
 
-        # worker-local handles — never pickled
+        # worker-local handles
         self._h5: Optional[h5py.File] = None
         self._bold_ds: Optional[list[h5py.Dataset]] = None
         self._x_ds: Optional[list[h5py.Dataset]] = None
@@ -202,8 +213,7 @@ class SyntheticH5Dataset(Dataset):
             self._m_latent_f = [self._h5[lyr]["f"] for lyr in self.layers]
             self._m_latent_v = [self._h5[lyr]["v"] for lyr in self.layers]
             self._m_latent_q = [self._h5[lyr]["q"] for lyr in self.layers]
-            # v_star/q_star only exist in multi-layer datasets
-            if "v_star" in self._h5[self.layers[0]]:
+            if len(self.layers) > 1:
                 self._m_latent_v_star = [self._h5[lyr]["v_star"] for lyr in self.layers]
                 self._m_latent_q_star = [self._h5[lyr]["q_star"] for lyr in self.layers]
 
@@ -295,8 +305,11 @@ class SyntheticDataModule(pl.LightningDataModule):
         data_path = cfg.get("path")
         if data_path is None:
             raise ValueError("data.path must be set")
-        layers_val = cfg.get("layers", ("layer_0",))
-        layers = tuple(layers_val) if layers_val is not None else ("layer_0",)
+        layers_val = cfg.get("layers", "auto")
+        if layers_val is None or layers_val == "auto":
+            layers = discover_layers(data_path)
+        else:
+            layers = tuple(layers_val)
         return SyntheticH5Dataset(
             path=str(data_path),
             layers=layers,

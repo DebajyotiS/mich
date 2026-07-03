@@ -10,9 +10,8 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
-_ROOT = Path(__file__).parent.parent
-
-from src.data.balloon import (
+from mich import CONFIG_DIR
+from mich.data.balloon import (
     AcquisitionConstants,
     BoldPostProcessingConfig,
     CortexLayer,
@@ -23,8 +22,8 @@ from src.data.balloon import (
     get_bold_from_state,
     simulate_cortex,
 )
-from src.data.neuronal import LayeredDiffusionSimulator, NeuralSimulatorParams
-from src.data.signals import Noise, Pulse, Sources
+from mich.data.neuronal import LayeredDiffusionSimulator, NeuralSimulatorParams
+from mich.data.signals import Noise, Pulse, Sources
 
 # Maps pulse_type -> ordered extra parameter names (following amplitude and onset).
 _PULSE_EXTRA_PARAMS: dict[str, list[str]] = {
@@ -570,7 +569,7 @@ def _run_one(args: tuple[int, dict, int | None]) -> tuple[int, dict]:
 
 @hydra.main(
     version_base=None,
-    config_path=str(_ROOT / "config" / "simulation"),
+    config_path=str(CONFIG_DIR / "simulation"),
     config_name="linear",
 )
 def main(cfg: DictConfig) -> None:

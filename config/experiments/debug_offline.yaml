@@ -41,7 +41,7 @@ model:
 # ── Loss — data-only, no physics warmup stall ─────────────────────────────────
   loss_config:
     lambda_data: 1.0
-    lambda_physics: 0.0     # off while debugging forward pass
+    lambda_physics: 1.0     # off while debugging forward pass
     lambda_src: 0.0
     lambda_smooth: 0.0
     lambda_supervision: 1.0

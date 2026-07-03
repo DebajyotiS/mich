@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.data.signals import (
+from mich.data.signals import (
     AlphaPulse,
     ExpDecayPulse,
     TriangularPulse,

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.data.synthetic import (
+from mich.data.synthetic import (
     SyntheticDataModule,
     SyntheticH5Dataset,
     _compute_split_counts,

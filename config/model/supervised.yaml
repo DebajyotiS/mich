@@ -1,4 +1,4 @@
-_target_: src.models.supervised.SupervisedMICH
+_target_: mich.models.supervised.SupervisedMICH
 
 L: 1
 C: 32
@@ -8,7 +8,7 @@ spatial_radius: 2
 grid_size: 10
 
 net:
-  _target_: src.models.blocks.FullySupervisedNet
+  _target_: mich.models.blocks.FullySupervisedNet
   c_enc: ${model.c_enc}
 
   layer_mixing_config:
@@ -59,7 +59,7 @@ net:
       activation: silu
 
 normaliser:
-  _target_: src.models.normaliser.LayerwiseBOLDNormalizer
+  _target_: mich.models.normaliser.LayerwiseBOLDNormalizer
   H: ${model.grid_size}
   W: ${model.grid_size}
   eps: 1.0e-6
@@ -68,8 +68,6 @@ normaliser:
 
 loss_config:
   lambda_pearson: 1.0
-
-use_muon: true
 
 optimizer:
   _target_: torch.optim.AdamW

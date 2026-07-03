@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.data.balloon import (  # noqa: F401
+from mich.data.balloon import (  # noqa: F401
     AcquisitionConstants,
     BoldPostProcessingConfig,
     CortexLayer,

@@ -23,24 +23,21 @@ import re
 from pathlib import Path
 
 import h5py
-import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from omegaconf import DictConfig
 
-root = rootutils.setup_root(__file__, pythonpath=True, cwd=False)
-
-from src.models.mich import MICH
-from src.models.supervised import SupervisedMICH
-from src.utils.plotting import plot_latent_layers, plot_neural_bold_layers
+from mich.models.mich import MICH
+from mich.models.supervised import SupervisedMICH
+from mich.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
 
 def load_samples(data_path: str, n: int, device: torch.device) -> dict[str, torch.Tensor]:
     with h5py.File(data_path, "r") as h5f:
@@ -74,8 +71,9 @@ def load_samples(data_path: str, n: int, device: torch.device) -> dict[str, torc
 def infer_mich(model: MICH, bold: torch.Tensor):
     """Returns (pred_neural [N,L,T,H,W], pred_bold [N,L,T,H,W])."""
     bold_norm = model.normaliser.normalize(bold) if model.normaliser is not None else bold
-    time_grid = model._make_time_grid(B=bold.shape[0], T=bold.shape[2],
-                                      device=bold.device, dtype=bold.dtype)
+    time_grid = model._make_time_grid(
+        B=bold.shape[0], T=bold.shape[2], device=bold.device, dtype=bold.dtype
+    )
     z_hat = model(bold_norm, time_grid, return_gradients=False).z_hat
 
     pred_bold = MICH._compute_bold(
@@ -109,13 +107,17 @@ def infer_supervised(model: SupervisedMICH, bold: torch.Tensor):
 # Eval one file
 # ---------------------------------------------------------------------------
 
+
 def eval_one_mich(model: MICH, data: dict, n_samples: int, label: str, prefix: str):
-    bold    = data["bold"]
+    bold = data["bold"]
     src_pos = data["src_pos"]
     pred_neural, pred_bold, z_hat = infer_mich(model, bold)
 
-    true_bold = (model.normaliser.denormalize(model.normaliser.normalize(bold))
-                 if model.normaliser is not None else bold)
+    true_bold = (
+        model.normaliser.denormalize(model.normaliser.normalize(bold))
+        if model.normaliser is not None
+        else bold
+    )
 
     N = src_pos.shape[0]
     b_idx = torch.arange(N)
@@ -137,7 +139,7 @@ def eval_one_mich(model: MICH, data: dict, n_samples: int, label: str, prefix: s
             pred_neural=pred_neural[i, :, :, s_h, s_w].float(),
             true_neural=data["neural"][i, :, :, s_h, s_w].float(),
             source_layer=torch.zeros(1, dtype=torch.long),
-            source_pos=src_pos[i:i+1],
+            source_pos=src_pos[i : i + 1],
         )
         bn_images.append(wandb.Image(fig_bn, caption=caption))
         plt.close(fig_bn)
@@ -160,7 +162,7 @@ def eval_one_mich(model: MICH, data: dict, n_samples: int, label: str, prefix: s
 
 
 def eval_one_supervised(model: SupervisedMICH, data: dict, n_samples: int, label: str, prefix: str):
-    bold    = data["bold"]
+    bold = data["bold"]
     src_pos = data["src_pos"]
     pred_neural = infer_supervised(model, bold)
 
@@ -171,7 +173,7 @@ def eval_one_supervised(model: SupervisedMICH, data: dict, n_samples: int, label
 
     pred_neural_src = pred_neural[b_idx, :, :, sh, sw].float()
     true_neural_src = data["neural"][b_idx, :, :, sh, sw].float()
-    true_bold_src   = bold[b_idx, :, :, sh, sw].float()
+    true_bold_src = bold[b_idx, :, :, sh, sw].float()
     metrics = compute_metrics(pred_neural_src, true_neural_src)
 
     images = []
@@ -184,7 +186,7 @@ def eval_one_supervised(model: SupervisedMICH, data: dict, n_samples: int, label
             pred_neural=pred_neural[i, :, :, s_h, s_w].float(),
             true_neural=data["neural"][i, :, :, s_h, s_w].float(),
             source_layer=torch.zeros(1, dtype=torch.long),
-            source_pos=src_pos[i:i+1],
+            source_pos=src_pos[i : i + 1],
         )
         images.append(wandb.Image(fig, caption=caption))
         plt.close(fig)
@@ -195,6 +197,7 @@ def eval_one_supervised(model: SupervisedMICH, data: dict, n_samples: int, label
 # ---------------------------------------------------------------------------
 # Heatmap
 # ---------------------------------------------------------------------------
+
 
 def _parse_kappa_tau(stem: str):
     """Extract (kappa, tau) from filenames like 'kappa1.9155_tau2.6645'."""
@@ -219,9 +222,9 @@ def plot_grid_heatmaps(
         return None
 
     kappas = sorted(set(e[0] for e in entries))
-    taus   = sorted(set(e[1] for e in entries))
-    k_idx  = {k: i for i, k in enumerate(kappas)}
-    t_idx  = {t: i for i, t in enumerate(taus)}
+    taus = sorted(set(e[1] for e in entries))
+    k_idx = {k: i for i, k in enumerate(kappas)}
+    t_idx = {t: i for i, t in enumerate(taus)}
 
     models = [p for p in ("pinn", "supervised") if any(f"{p}/{metric}" in v for _, _, v in entries)]
     if not models:
@@ -246,8 +249,7 @@ def plot_grid_heatmaps(
 
     for ax, prefix in zip(axes, models):
         grid = grids[prefix]
-        im = ax.imshow(grid, aspect="auto", origin="lower",
-                       vmin=vmin, vmax=vmax, cmap="RdYlGn")
+        im = ax.imshow(grid, aspect="auto", origin="lower", vmin=vmin, vmax=vmax, cmap="RdYlGn")
         ax.set_xticks(range(len(taus)))
         ax.set_xticklabels([f"{t:.2f}" for t in taus], fontsize=8)
         ax.set_yticks(range(len(kappas)))
@@ -260,8 +262,15 @@ def plot_grid_heatmaps(
             for ti in range(len(taus)):
                 v = grid[ki, ti]
                 if np.isfinite(v):
-                    ax.text(ti, ki, f"{v:.2f}", ha="center", va="center", fontsize=7,
-                            color="black" if 0.2 < v < 0.85 else "white")
+                    ax.text(
+                        ti,
+                        ki,
+                        f"{v:.2f}",
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                        color="black" if 0.2 < v < 0.85 else "white",
+                    )
 
     fig.suptitle(f"Neural recovery {metric} across haemodynamic grid", fontsize=12)
     return fig
@@ -271,33 +280,29 @@ def plot_grid_heatmaps(
 # Main
 # ---------------------------------------------------------------------------
 
-@hydra.main(
-    version_base=None,
-    config_path=str(root / "config"),
-    config_name="evalconfig.yaml",
-)
-def main(cfg: DictConfig) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_path = Path(cfg.checkpoint)
 
-    if cfg.data.path is not None:
-        h5_files = [Path(cfg.data.path)]
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate MICH / SupervisedMICH on H5 dataset(s)")
     CKPT_DEFAULT = "/media/RCPNAS/Data2/korach/inversion/results_julie/mich-bold-inversion/single-layer_julie/checkpoints/last-v72.ckpt"
 
-    parser.add_argument("--model-type", default="pinn", choices=["pinn", "supervised", "both"],
-                        help="Which model(s) to evaluate")
-    parser.add_argument("-c", "--checkpoint",             default=CKPT_DEFAULT,
-                        help="PINN checkpoint path")
-    parser.add_argument("--supervised-checkpoint",        default=None,
-                        help="SupervisedMICH checkpoint path (required when --model-type supervised/both)")
-    parser.add_argument("-d", "--data",                   default=None)
-    parser.add_argument("--data-dir",                     default="data/gridsearch")
-    parser.add_argument("-n", "--n-samples",              type=int, default=3)
-    parser.add_argument("--wandb-project",                default="mich-bold-inversion")
-    parser.add_argument("--wandb-entity",                 default="julie-korach-epfl")
-    parser.add_argument("--wandb-run-name",               default=None)
+    parser.add_argument(
+        "--model-type",
+        default="pinn",
+        choices=["pinn", "supervised", "both"],
+        help="Which model(s) to evaluate",
+    )
+    parser.add_argument("-c", "--checkpoint", default=CKPT_DEFAULT, help="PINN checkpoint path")
+    parser.add_argument(
+        "--supervised-checkpoint",
+        default=None,
+        help="SupervisedMICH checkpoint path (required when --model-type supervised/both)",
+    )
+    parser.add_argument("-d", "--data", default=None)
+    parser.add_argument("--data-dir", default="data/gridsearch")
+    parser.add_argument("-n", "--n-samples", type=int, default=3)
+    parser.add_argument("--wandb-project", default="mich-bold-inversion")
+    parser.add_argument("--wandb-entity", default="julie-korach-epfl")
+    parser.add_argument("--wandb-run-name", default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -314,8 +319,11 @@ def main() -> None:
         project=cfg.wandb.project,
         entity=cfg.wandb.entity or None,
         name=run_name,
-        config={"model_type": args.model_type, "n_samples": args.n_samples,
-                "n_files": len(h5_files)},
+        config={
+            "model_type": args.model_type,
+            "n_samples": args.n_samples,
+            "n_files": len(h5_files),
+        },
     )
 
     mich_model, sup_model = None, None
@@ -339,14 +347,18 @@ def main() -> None:
         grid_metrics[label] = {}
 
         if mich_model is not None:
-            bn_imgs, lat_imgs, metrics = eval_one_mich(mich_model, data, args.n_samples, label, prefix="pinn")
+            bn_imgs, lat_imgs, metrics = eval_one_mich(
+                mich_model, data, args.n_samples, label, prefix="pinn"
+            )
             all_media.setdefault("pinn/predictions", []).extend(bn_imgs)
-            all_media.setdefault("pinn/latents",     []).extend(lat_imgs)
+            all_media.setdefault("pinn/latents", []).extend(lat_imgs)
             all_metrics.append({"file": label, **metrics})
             grid_metrics[label].update(metrics)
 
         if sup_model is not None:
-            imgs, metrics = eval_one_supervised(sup_model, data, args.n_samples, label, prefix="supervised")
+            imgs, metrics = eval_one_supervised(
+                sup_model, data, args.n_samples, label, prefix="supervised"
+            )
             all_media.setdefault("supervised/predictions", []).extend(imgs)
             all_metrics.append({"file": label, **metrics})
             grid_metrics[label].update(metrics)

@@ -36,7 +36,7 @@ acquisition:
 # -- Simulation ----------------------------------
 simulation:
   order: "exact"    # Balloon-Windkessel approximation; see src/data/balloon.py
-  grid_size: [32, 32]
+  grid_size: [10, 10]
   dt: 1.0
   haemo_dt: 0.05
   time_duration: 100

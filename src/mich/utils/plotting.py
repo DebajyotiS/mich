@@ -85,14 +85,14 @@ def plot_neural_bold_layers(
         )
 
         # Neural on right axis
-        ax_neural.plot(
+        ax_neural.step(
             times,
             true_neural_np[n_layers - i - 1],
             color=COLOR_HEX[SIGNALS_LIST.index("x")],
             label="True Neural",
             ls="-",
         )
-        ax_neural.plot(
+        ax_neural.step(
             times,
             pred_neural_np[n_layers - i - 1],
             color=COLOR_HEX[SIGNALS_LIST.index("x")],
@@ -181,7 +181,9 @@ def plot_latent_layers(
         lo, hi = true_arr.min(), true_arr.max()
         pad = (hi - lo) * 0.05
         lo, hi = lo - pad, hi + pad
-        sig_ylims.append((lo, hi) if (np.isfinite(lo) and np.isfinite(hi) and lo < hi) else (None, None))
+        sig_ylims.append(
+            (lo, hi) if (np.isfinite(lo) and np.isfinite(hi) and lo < hi) else (None, None)
+        )
 
     fig, axes = plt.subplots(
         nrows=n_layers,

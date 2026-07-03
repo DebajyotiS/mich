@@ -1,4 +1,4 @@
-_target_: src.models.mich.MICH
+_target_: mich.models.mich.MICH
 
 L: 3
 C: 32
@@ -14,10 +14,11 @@ spatial_radius: 2
 grid_size: 10 # this was 32
 
 embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
-out_channels: 21
+out_channels: 7 # must equal len(signals) (7 with drainage, 5 without) -- NOT multiplied by L;
+                # SpatioTemporalDecoder builds len(signals)*L output heads internally using L separately
 
 heinzle_net:
-  _target_: src.models.blocks.HeinzleNet
+  _target_: mich.models.blocks.HeinzleNet
 
   layer_mixing_config:
     L: ${model.L}
@@ -88,7 +89,7 @@ heinzle_net:
     layer_embed_dim: 8
 
 normaliser:
-  _target_: src.models.normaliser.LayerwiseBOLDNormalizer
+  _target_: mich.models.normaliser.LayerwiseBOLDNormalizer
   H: ${model.grid_size}
   W: ${model.grid_size}
   eps: 1.0e-6
@@ -97,10 +98,10 @@ normaliser:
 
 loss_config:
   order: linear # choose between linear, quadratic, exact
-  lambda_data: 1.0
+  lambda_data: 100.0
   lambda_physics: 1000.0
-  warmup_steps_physics: 20
-  delay_steps_physics: 10
+  warmup_steps_physics: 100
+  delay_steps_physics: 50
   lambda_src: 10.0
   lambda_smooth: 0.0
   warmup_steps_smooth: 0
@@ -109,7 +110,7 @@ loss_config:
   antisteady_epsilon: 0.01      # variance threshold (hinge)
   warmup_steps_antisteady: 0    # optional warm-up
   delay_steps_antisteady: 0
-  lambda_supervision: 0.0
+  lambda_supervision: 100.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
   n_space: 100 # colocation points
@@ -137,6 +138,18 @@ loss_config:
 
 # haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
 # HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
+
+# Set any of these to true to make that physiological constant a learnable parameter
+# (initialized from the simulation-injected value above, optimized in log-space so it
+# can't go non-positive) instead of a fixed constant. lambda_d and tau_d are not yet
+# supported here. k1/k2/k3 are recomputed from E0 each forward pass when E0 is learnable.
+learnable_physio:
+  kappa: false
+  gamma: false
+  alpha: false
+  tau: false
+  V0: false
+  E0: false
 
 optimizer:
   _target_: torch.optim.AdamW

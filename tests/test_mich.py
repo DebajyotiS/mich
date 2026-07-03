@@ -22,9 +22,9 @@ import torch.optim.lr_scheduler
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import Callback
 
-from src.data.synthetic import SyntheticDataModule
-from src.models.blocks import HeinzleNet
-from src.models.mich import MICH
+from mich.data.synthetic import SyntheticDataModule
+from mich.models.blocks import HeinzleNet
+from mich.models.mich import MICH
 
 # -------------------------
 # Module-level constants
