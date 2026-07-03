@@ -15,7 +15,7 @@
 num_simulations: 10
 seed: 42
 output_path: data/simulations.h5
-workers: null          # null -> os.cpu_count(); 1 -> serial
+workers: 40          # null -> os.cpu_count(); 1 -> serial
 latent_downsample: 1   # downsample factor for stored latent states (s/f/v/q/v*/q*); x/bold always stored at full T
 
 # -- Haemodynamic constants ----------------------
@@ -23,7 +23,7 @@ haemodynamic:
   alpha: 0.32       # Grubb's exponent
   E0: 0.34          # Resting oxygen extraction fraction
   V0: 0.05           # Resting blood volume fraction
-  kappa: 0.65       # Vasodilatory signal decay rate (linear overrides to 1.92)
+  kappa: 1.92       # Vasodilatory signal decay rate; exp(mu0=0.65) from the paper's log-normal prior over kappa
   gamma: 0.41       # Autoregulatory feedback rate
 
 # -- Acquisition (7T) ----------------------------
@@ -70,8 +70,8 @@ simulation:
   # Must have exactly num_layers entries.
   layers:
     - {tau: "${simulation.layer_tau}", lambda_d: 0.0}  # deep  — no drain source
-    - {tau: "${simulation.layer_tau}", lambda_d: 0.5}  # mid   — drains from deep
-    - {tau: "${simulation.layer_tau}", lambda_d: 0.5}  # sup   — drains from mid
+    - {tau: "${simulation.layer_tau}", lambda_d: 1.0}  # mid   — drains from deep
+    - {tau: "${simulation.layer_tau}", lambda_d: 1.0}  # sup   — drains from mid
 
 # -- BOLD post-processing ------------------------
 bold:
