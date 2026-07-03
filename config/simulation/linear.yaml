@@ -9,9 +9,6 @@ defaults:
 
 output_path: data/simulations-linear.h5
 
-haemodynamic:
-  kappa: 1.92       # linear expansion is stable/calibrated at this vasodilatory decay rate
-
 simulation:
   order: "linear"
   num_layers: 1
