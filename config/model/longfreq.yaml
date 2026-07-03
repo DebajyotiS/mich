@@ -1,4 +1,4 @@
-_target_: src.models.mich.MICH
+_target_: mich.models.mich.MICH
 
 L: 1
 C: 32
@@ -17,7 +17,7 @@ embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
 out_channels: 5
 
 heinzle_net:
-  _target_: src.models.blocks.HeinzleNet
+  _target_: mich.models.blocks.HeinzleNet
 
   layer_mixing_config:
     L: ${model.L}
@@ -89,7 +89,7 @@ heinzle_net:
     signals: [x, s, f, v, q]
 
 normaliser:
-  _target_: src.models.normaliser.LayerwiseBOLDNormalizer
+  _target_: mich.models.normaliser.LayerwiseBOLDNormalizer
   H: ${model.grid_size}
   W: ${model.grid_size}
   eps: 1.0e-6
@@ -135,7 +135,17 @@ loss_config:
 # haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
 # HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
 
-use_muon: true
+# Set any of these to true to make that physiological constant a learnable parameter
+# (initialized from the simulation-injected value above, optimized in log-space so it
+# can't go non-positive) instead of a fixed constant. lambda_d and tau_d are not yet
+# supported here. k1/k2/k3 are recomputed from E0 each forward pass when E0 is learnable.
+learnable_physio:
+  kappa: false
+  gamma: false
+  alpha: false
+  tau: false
+  V0: false
+  E0: false
 
 optimizer:
   _target_: torch.optim.AdamW

@@ -1,4 +1,5 @@
 """Fully supervised baseline: BOLD → neural, no physics constraints."""
+
 from __future__ import annotations
 
 from typing import Any, Mapping
@@ -8,9 +9,8 @@ import torch.nn.functional as F
 import wandb
 from pytorch_lightning import LightningModule
 
-from src.models.blocks import FullySupervisedNet
-from src.models.muon import MuonSingleGPU
-from src.utils.plotting import plot_neural_bold_layers
+from mich.models.blocks import FullySupervisedNet
+from mich.utils.plotting import plot_neural_bold_layers
 
 
 class SupervisedMICH(LightningModule):
@@ -29,7 +29,6 @@ class SupervisedMICH(LightningModule):
         optimizer=None,
         scheduler=None,
         lightning=None,
-        use_muon: bool = False,
         **kwargs,  # absorb scalar keys (L, C, c_enc, …) from yaml
     ):
         super().__init__()
@@ -63,9 +62,7 @@ class SupervisedMICH(LightningModule):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _neural_recovery_metrics(
-        pred: torch.Tensor, true: torch.Tensor
-    ) -> dict[str, float]:
+    def _neural_recovery_metrics(pred: torch.Tensor, true: torch.Tensor) -> dict[str, float]:
         pred, true = pred.float(), true.float()
         T = pred.shape[-1]
         flat_pred = pred.reshape(-1, T)
@@ -78,19 +75,23 @@ class SupervisedMICH(LightningModule):
         p_c = flat_pred - flat_pred.mean(dim=-1, keepdim=True)
         t_c = flat_true - flat_true.mean(dim=-1, keepdim=True)
         pearson = (
-            (p_c * t_c).sum(dim=-1)
-            / (p_c.norm(dim=-1) * t_c.norm(dim=-1)).clamp(min=1e-8)
-        ).mean().item()
+            ((p_c * t_c).sum(dim=-1) / (p_c.norm(dim=-1) * t_c.norm(dim=-1)).clamp(min=1e-8))
+            .mean()
+            .item()
+        )
 
         xcorr = torch.fft.irfft(
-            torch.fft.rfft(flat_true, n=2 * T)
-            * torch.fft.rfft(flat_pred, n=2 * T).conj(),
+            torch.fft.rfft(flat_true, n=2 * T) * torch.fft.rfft(flat_pred, n=2 * T).conj(),
             n=2 * T,
         )
         lags = torch.fft.fftfreq(2 * T, d=1.0 / (2 * T)).long().to(xcorr.device)
         peak_lag = lags[xcorr.argmax(dim=-1)].float().mean().item()
 
-        return {"val/neural/r2": r2, "val/neural/pearson": pearson, "val/neural/lag_samples": peak_lag}
+        return {
+            "val/neural/r2": r2,
+            "val/neural/pearson": pearson,
+            "val/neural/lag_samples": peak_lag,
+        }
 
     # ------------------------------------------------------------------
     # Forward / shared step
@@ -117,9 +118,15 @@ class SupervisedMICH(LightningModule):
 
         loss = self._loss(pred_src, true_src)
 
-        self.log(f"{stage}/loss/total", loss, on_step=(stage == "train"),
-                 on_epoch=(stage == "val"), prog_bar=True, sync_dist=True,
-                 logger=(stage == "val"))
+        self.log(
+            f"{stage}/loss/total",
+            loss,
+            on_step=(stage == "train"),
+            on_epoch=(stage == "val"),
+            prog_bar=True,
+            sync_dist=True,
+            logger=(stage == "val"),
+        )
 
         if stage == "val":
             self._pred_buffer.append(pred_neural.detach().cpu())
@@ -143,7 +150,7 @@ class SupervisedMICH(LightningModule):
         if not self._pred_buffer:
             return
 
-        pred = torch.cat(self._pred_buffer, dim=0)    # [N, L, T, H, W]
+        pred = torch.cat(self._pred_buffer, dim=0)  # [N, L, T, H, W]
         neural = torch.cat(self._neural_buffer, dim=0)
         bold = torch.cat(self._bold_buffer, dim=0)
         src_pos = torch.cat(self._src_pos_buffer, dim=0)
@@ -158,7 +165,7 @@ class SupervisedMICH(LightningModule):
         src_h = src_pos[:, 0].long()
         src_w = src_pos[:, 1].long()
 
-        pred_src   = pred[b_idx, :, :, src_h, src_w]    # [N, L, T]
+        pred_src = pred[b_idx, :, :, src_h, src_w]  # [N, L, T]
         neural_src = neural[b_idx, :, :, src_h, src_w]  # [N, L, T]
 
         metrics = self._neural_recovery_metrics(pred_src, neural_src)
@@ -171,7 +178,7 @@ class SupervisedMICH(LightningModule):
         # Plot a few samples
         subset = min(10, N)
         idx = torch.randperm(N)[:subset]
-        bold_src  = bold[idx, :, :, src_h[idx], src_w[idx]].float()
+        bold_src = bold[idx, :, :, src_h[idx], src_w[idx]].float()
         pred_plot = pred_src[idx].float()
         true_plot = neural_src[idx].float()
 
@@ -186,10 +193,11 @@ class SupervisedMICH(LightningModule):
                 pred_neural=pred_plot[i],
                 true_neural=true_plot[i],
                 source_layer=torch.zeros(1, dtype=torch.long),
-                source_pos=src_pos[idx[i]:idx[i]+1],
+                source_pos=src_pos[idx[i] : idx[i] + 1],
             )
             images.append(wandb.Image(fig, caption=f"val sample {i}"))
             import matplotlib.pyplot as plt
+
             plt.close(fig)
         run.log({"global_step": self.global_step, "val/predictions": images})
 
@@ -198,15 +206,6 @@ class SupervisedMICH(LightningModule):
     # ------------------------------------------------------------------
 
     def configure_optimizers(self):
-        use_muon = getattr(self.hparams, "use_muon", False)
-        if use_muon:
-            lr = self.hparams.optimizer.keywords.get("lr", 3e-4)
-            wd = self.hparams.optimizer.keywords.get("weight_decay", 1e-5)
-            optim = MuonSingleGPU(
-                [p for p in self.parameters() if p.requires_grad],
-                lr=lr, momentum=0.95, adamw_lr=lr, adamw_wd=wd,
-            )
-        else:
-            optim = self.hparams.optimizer(self.parameters())
+        optim = self.hparams.optimizer(self.parameters())
         sched = self.hparams.scheduler(optim)
         return {"optimizer": optim, "lr_scheduler": {"scheduler": sched, **self.hparams.lightning}}

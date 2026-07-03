@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
 
-from src.data.signals import Noise
+from mich.data.signals import Noise
 
 Timecourse: TypeAlias = np.ndarray | torch.Tensor
 

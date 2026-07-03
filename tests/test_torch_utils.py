@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from src.utils.torch_utils import get_activation, get_normalisation
+from mich.utils.torch_utils import get_activation, get_normalisation
 
 # -------------------------
 # get_activation

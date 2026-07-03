@@ -4,11 +4,13 @@ import subprocess
 
 import hydra
 import pytorch_lightning as pl
-import rootutils
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 
-from src.utils.hydra_utils import (
+from mich import CONFIG_DIR
+from mich.data.synthetic import discover_layers
+from mich.models.blocks import HEINZLE_SIGNALS, HEINZLE_SIGNALS_SINGLE
+from mich.utils.hydra_utils import (
     instantiate_collection,
     log_hyperparameters,
     print_config,
@@ -16,15 +18,27 @@ from src.utils.hydra_utils import (
     save_config,
 )
 
-root = rootutils.setup_root(__file__, pythonpath=True, cwd=False)
 log = logging.getLogger(__name__)
 
 
+def _resolve_data_layers(cfg: DictConfig) -> tuple[str, ...]:
+    """Mirror SyntheticDataModule._make_dataset's layer resolution without instantiating it."""
+    layers_val = cfg.datamodule.data.get("layers", "auto")
+    if layers_val is None or layers_val == "auto":
+        return discover_layers(cfg.datamodule.data.path)
+    return tuple(layers_val)
+
+
 def _inject_sim_physics(cfg: DictConfig, sim_cfg: dict) -> None:
-    """Overwrite model physics constants with values from the simulation HDF5.
+    """Overwrite model physics constants AND structural shape with values derived from
+    the simulation HDF5, so the model architecture always matches the data it's pointed at.
 
     Derives k1/k2/k3 from the raw acquisition + haemodynamic parameters so the
     model always trains with constants that match the data it was generated from.
+    Also derives L (number of cortical layers actually loaded by the datamodule),
+    out_channels, and the Heinzle signal set (5 signals for single-layer/no-drainage
+    data, 7 for multi-layer/drainage data) -- this is what lets a single model config
+    work against any scenario file without hand-editing L/out_channels per run.
     """
     ac = sim_cfg["acquisition"]
     hc = sim_cfg["haemodynamic"]
@@ -37,6 +51,10 @@ def _inject_sim_physics(cfg: DictConfig, sim_cfg: dict) -> None:
     # lambda_d for layer > 0 (deep layer drain is always 0)
     lambda_d = layers[1]["lambda_d"] if len(layers) > 1 else layers[0]["lambda_d"]
 
+    num_layers = len(_resolve_data_layers(cfg))
+    has_drain = num_layers > 1
+    signals = HEINZLE_SIGNALS if has_drain else HEINZLE_SIGNALS_SINGLE
+
     with open_dict(cfg):
         cfg.model.haemo = {
             "kappa": hc["kappa"],
@@ -44,6 +62,7 @@ def _inject_sim_physics(cfg: DictConfig, sim_cfg: dict) -> None:
             "alpha": hc["alpha"],
             "tau": layers[0]["tau"],
             "lambda_d": lambda_d,
+            "tau_d": sim_cfg["simulation"]["tau_d"],
         }
         cfg.model.acquisition = {
             "f0": ac["f0"],
@@ -57,11 +76,19 @@ def _inject_sim_physics(cfg: DictConfig, sim_cfg: dict) -> None:
         }
         cfg.model.V0 = hc["V0"]
         cfg.model.psf_fwhm = sim_cfg["bold"]["psf_fwhm"]
+        # Physics-loss residual must use the same Balloon-Windkessel approximation the
+        # data was actually generated with, or the physics loss evaluates the wrong ODE.
+        cfg.model.loss_config.order = sim_cfg["simulation"]["order"]
+        cfg.model.L = num_layers
+        # out_channels == len(signals), NOT multiplied by L -- SpatioTemporalDecoder
+        # builds len(signals)*L output heads internally, using L separately (blocks.py).
+        cfg.model.out_channels = len(signals)
+        cfg.model.heinzle_net.spatial_decoder_config.signals = list(signals)
 
 
 @hydra.main(
     version_base=None,
-    config_path=str(root / "config"),
+    config_path=str(CONFIG_DIR),
     config_name="mainconfig.yaml",
 )
 def main(cfg: DictConfig) -> None:

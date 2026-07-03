@@ -11,7 +11,7 @@ defaults:
   - loggers: default.yaml
   - hydra: default.yaml
   - callbacks: default.yaml
-  - experiment: null
+  - experiments: null
 
 seed: null # For reproducibility, remove it for generative models.
 project_name: mich-bold-inversion # Determines output directory path and wandb project

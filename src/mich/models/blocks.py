@@ -7,7 +7,7 @@ from torch.func import jacrev, vmap
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from src.utils.torch_utils import (
+from mich.utils.torch_utils import (
     _softplus_deriv,
     get_activation,
 )
@@ -666,12 +666,12 @@ class FullySupervisedNet(nn.Module):
         Returns:
             neural: predicted neural activity [B, L, T, H, W]
         """
-        xmix = self.layer_mixing(x)        # [B, T, L, C, H, W]
+        xmix = self.layer_mixing(x)  # [B, T, L, C, H, W]
         xenc = self.spatial_encoder(xmix)  # [B, T, L, C', H, W]
         xmix = self.temporal_mixing(xenc)  # [B, T, L, C', H, W]
         B, T, L, C, H, W = xmix.shape
         out = xmix.reshape(B * T * L, C, H, W)
-        out = self.head(out)               # [B*T*L, 1, H, W]
+        out = self.head(out)  # [B*T*L, 1, H, W]
         return out.reshape(B, L, T, H, W)
 
 
