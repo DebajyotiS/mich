@@ -1,8 +1,8 @@
 latest_model_checkpoint:
   _target_: pytorch_lightning.callbacks.ModelCheckpoint
   dirpath: ${paths.full_path}/checkpoints
-  every_n_train_steps: 25
-  save_on_train_epoch_end: True
+  every_n_train_steps: 100
+  save_on_train_epoch_end: true
   filename: last
 
 best_model_checkpoint:
@@ -11,7 +11,7 @@ best_model_checkpoint:
   monitor: val/loss/total
   mode: min
   save_weights_only: false
-  save_last: False
+  save_last: false
   auto_insert_metric_name: False
   filename: best
 

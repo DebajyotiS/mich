@@ -6,12 +6,12 @@ c_enc: 64
 c_dec: 64
 c_film: 32           # FiLM bottleneck per signal (~c_dec / 7, rounded up for groups)
 signal_embed_dim: 8
-num_freqs: 10
-min_freq: 5.0
-max_freq: 20.0
+num_freqs: 20
+min_freq: 2.0
+max_freq: 40.0
 tcn_kernel: 3
 spatial_radius: 2
-grid_size: 10 # this was 32
+grid_size: 10
 
 embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
 out_channels: 7 # must equal len(signals) (7 with drainage, 5 without) -- NOT multiplied by L;
@@ -93,7 +93,7 @@ normaliser:
   H: ${model.grid_size}
   W: ${model.grid_size}
   eps: 1.0e-6
-  freeze_after_steps: 5000
+  freeze_after_steps: 320  # ~20 epochs of coverage at 16 steps/epoch (batch=128, n_train=2100)
   neighbourhood_radius: ${model.spatial_radius}
 
 loss_config:
@@ -113,6 +113,24 @@ loss_config:
   lambda_supervision: 100.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
+  supervise_x: false # TEMPORARY ablation switch -- adds direct MSE+Pearson supervision on
+                      # x against batch["neural"]. Not part of the normal objective (x is
+                      # meant to be recovered purely via physics consistency with s, since
+                      # real fMRI has no ground-truth neural signal). Only for diagnosing
+                      # whether varying-amplitude neural blocks are an identifiability
+                      # issue vs. an architecture-capacity issue.
+  supervise_dsdt: true # MSE/huber between the network's analytic
+                      # dz_hat/dt and a finite-difference derivative of the ground-truth
+                      # latents (see dsdt_supervision_signals), at each source voxel.
+                      # Unlike value-only supervision_loss, this is sharply sensitive to
+                      # timing/phase, since x is only ever recovered via ds/dt through the
+                      # physics residual and has no direct ground-truth check. Uses the
+                      # same ground-truth latents already used by supervision_loss
+                      # (s/f/v/q), not x itself, so it stays applicable without ground-truth x.
+  lambda_dsdt_supervision: 100.0 # weight applied when supervise_dsdt=true
+  warmup_steps_dsdt_supervision: 0
+  delay_steps_dsdt_supervision: 0
+  dsdt_supervision_signals: ["s", "f", "v", "q"]
   n_space: 100 # colocation points
   dense_spatial_frac: 0.95
   dense_spatial_radius: ${model.spatial_radius}
@@ -135,6 +153,11 @@ loss_config:
   ode_loss:
     type: "mse"
     huber_delta: 0.1 #used if type is "huber"
+  dsdt_loss:
+    type: "huber" # huber, not mse -- ds/dt at a sharp transition is an outlier relative
+                   # to the near-flat per-index differences elsewhere; squared error over-
+                   # weights it, huber caps its influence past huber_delta.
+    huber_delta: 0.1
 
 # haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
 # HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
@@ -154,13 +177,14 @@ learnable_physio:
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 3.0e-4
+  lr: 6.0e-4        # 3e-4 * sqrt(128/32)
   weight_decay: 1.0e-5
 
 scheduler:
   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
   _partial_: true
-  T_max: 125000
+  T_max: null       # auto-computed by train_mich.py from dataset size, split, batch size, and
+                     # max_epochs (see _inject_scheduler_steps); set an explicit int to override
   eta_min: 1.0e-6
 
 lightning:
