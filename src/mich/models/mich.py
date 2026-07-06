@@ -50,6 +50,7 @@ class MICH(
         self._bold_loss_fn = self._make_loss_fn(getattr(lc, "bold_loss", None))
         self._ode_loss_fn = self._make_loss_fn(getattr(lc, "ode_loss", None))
         self._supervision_loss_fn = self._make_loss_fn(getattr(lc, "supervision_loss", None))
+        self._dsdt_loss_fn = self._make_loss_fn(getattr(lc, "dsdt_loss", None))
         self.pred_buffer = []
         self.neural_buffer = []
         self.bold_buffer = []
@@ -98,7 +99,9 @@ class MICH(
             getattr(lc, "warmup_steps_smooth", 0),
             getattr(lc, "delay_steps_smooth", 0),
         )
-        need_grads = (lambda_physics_eff > 0.0) or (stage == "val")
+        need_grads = (
+            (lambda_physics_eff > 0.0) or (stage == "val") or getattr(lc, "supervise_dsdt", False)
+        )
         sd_manifest = self(
             bold_norm,
             self._make_time_grid(
@@ -156,6 +159,21 @@ class MICH(
                 )
                 total_loss = total_loss + lambda_supervision_eff * supervision_loss
 
+        dsdt_supervision_loss = None
+        lambda_dsdt_eff = 0.0
+        per_sig_dsdt: dict = {}
+        if batch.get("s") is not None and getattr(lc, "supervise_dsdt", False):
+            lambda_dsdt_eff = self._get_scheduled_lambda(
+                lc.lambda_dsdt_supervision,
+                getattr(lc, "warmup_steps_dsdt_supervision", 0),
+                getattr(lc, "delay_steps_dsdt_supervision", 0),
+            )
+            if lambda_dsdt_eff > 0:
+                dsdt_supervision_loss, per_sig_dsdt = self._derivative_supervision_loss(
+                    dz_hat_dt, batch, source_position, num_sources
+                )
+                total_loss = total_loss + lambda_dsdt_eff * dsdt_supervision_loss
+
         # Lightning logger (progress bar + val checkpointing)
         # Train: logger=False —> W&B sink is direct run.log() below.
         # Val: logger=True —> ModelCheckpoint reads from PL logger.
@@ -194,6 +212,16 @@ class MICH(
             self.log(
                 f"{stage}/loss/supervision",
                 supervision_loss,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=False,
+                sync_dist=True,
+                logger=_to_logger,
+            )
+        if dsdt_supervision_loss is not None:
+            self.log(
+                f"{stage}/loss/dsdt_supervision",
+                dsdt_supervision_loss,
                 on_step=on_step,
                 on_epoch=on_epoch,
                 prog_bar=False,
@@ -247,6 +275,16 @@ class MICH(
                         **{
                             f"supervision/src_{k}": v.item() for k, v in per_sig_supervision.items()
                         },
+                    }
+                )
+            if dsdt_supervision_loss is not None:
+                log_dict.update(
+                    {
+                        "train/loss/dsdt_supervision": dsdt_supervision_loss.item(),
+                        "train/loss_weighted/dsdt_supervision": (
+                            dsdt_supervision_loss * lambda_dsdt_eff
+                        ).item(),
+                        **{f"dsdt_supervision/src_{k}": v.item() for k, v in per_sig_dsdt.items()},
                     }
                 )
             _direct_run.log(log_dict)

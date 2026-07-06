@@ -65,7 +65,12 @@ _IDENTITY = ChannelActivation(
 )
 
 HEINZLE_ACTIVATIONS: dict[HeinzleSignal, ChannelActivation] = {
-    "x": ChannelActivation(fn=F.softplus, dfn_dx=_softplus_deriv),
+    # identity, not softplus -- the neural-baseline generator (signals.py Pulse.generate,
+    # baseline="random") injects signed offsets into the inter-pulse rest periods, and
+    # nothing downstream requires x >= 0 (_sanitise_states clamps x to [-1e3, 1e3], the
+    # same branch as s/vstar/qstar, not the f/v/q non-negative branch). softplus made
+    # negative baselines architecturally unreachable.
+    "x": _IDENTITY,
     "s": _IDENTITY,
     "f": ChannelActivation(fn=F.softplus, dfn_dx=_softplus_deriv),
     "v": ChannelActivation(fn=F.softplus, dfn_dx=_softplus_deriv),
@@ -409,11 +414,12 @@ class SpatioTemporalDecoder(nn.Module):
                 for layer_idx in range(L):
                     head = self.out_heads[sig_idx * L + layer_idx]
                     nn.init.zeros_(head.weight)
-                    if sig == "x":
-                        head.bias.fill_(-3.0)
-                    elif sig in ("f", "v", "q"):
+                    if sig in ("f", "v", "q"):
                         head.bias.fill_(0.5413)
                     else:
+                        # x is now identity-activated (see HEINZLE_ACTIVATIONS), so a
+                        # zero bias is an exact zero baseline with constant gradient=1
+                        # -- no vanishing-gradient region to bootstrap out of.
                         nn.init.zeros_(head.bias)
 
         self.time_embedding = FourierTimeEmbedding(**temporal_embedding_config)

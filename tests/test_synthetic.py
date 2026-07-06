@@ -12,7 +12,7 @@ import torch
 from mich.data.synthetic import (
     SyntheticDataModule,
     SyntheticH5Dataset,
-    _compute_split_counts,
+    compute_split_counts,
     _np_dtype,
     _torch_dtype,
 )
@@ -113,17 +113,17 @@ def test_np_dtype_unsupported_raises():
 
 
 # -------------------------
-# _compute_split_counts — fraction-based
+# compute_split_counts — fraction-based
 # -------------------------
 
 
 def test_split_fracs_default_sums_to_n():
-    tr, va, te = _compute_split_counts(100, {})
+    tr, va, te = compute_split_counts(100, {})
     assert tr + va + te == 100
 
 
 def test_split_fracs_explicit_splits_correct():
-    tr, va, te = _compute_split_counts(100, {"val_frac": 0.1, "test_frac": 0.2})
+    tr, va, te = compute_split_counts(100, {"val_frac": 0.1, "test_frac": 0.2})
     assert va == 10
     assert te == 20
     assert tr == 70
@@ -132,16 +132,16 @@ def test_split_fracs_explicit_splits_correct():
 
 def test_split_fracs_sum_gt_one_raises():
     with pytest.raises(ValueError, match="val_frac.*test_frac|test_frac.*val_frac"):
-        _compute_split_counts(100, {"val_frac": 0.6, "test_frac": 0.6})
+        compute_split_counts(100, {"val_frac": 0.6, "test_frac": 0.6})
 
 
 def test_split_fracs_negative_raises():
     with pytest.raises(ValueError, match="non-negative"):
-        _compute_split_counts(100, {"val_frac": -0.1, "test_frac": 0.1})
+        compute_split_counts(100, {"val_frac": -0.1, "test_frac": 0.1})
 
 
 def test_split_train_frac_explicit_sums_to_n():
-    tr, va, te = _compute_split_counts(100, {"train_frac": 0.8, "val_frac": 0.1, "test_frac": 0.1})
+    tr, va, te = compute_split_counts(100, {"train_frac": 0.8, "val_frac": 0.1, "test_frac": 0.1})
     assert tr + va + te == 100
     assert tr == 80
     assert va == 10
@@ -149,22 +149,22 @@ def test_split_train_frac_explicit_sums_to_n():
 
 def test_split_train_frac_not_sum_to_one_raises():
     with pytest.raises(ValueError, match="sum to 1"):
-        _compute_split_counts(100, {"train_frac": 0.7, "val_frac": 0.1, "test_frac": 0.1})
+        compute_split_counts(100, {"train_frac": 0.7, "val_frac": 0.1, "test_frac": 0.1})
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 10])
 def test_split_fracs_small_n_sums_to_n(n):
-    tr, va, te = _compute_split_counts(n, {"val_frac": 0.2, "test_frac": 0.2})
+    tr, va, te = compute_split_counts(n, {"val_frac": 0.2, "test_frac": 0.2})
     assert tr + va + te == n
 
 
 # -------------------------
-# _compute_split_counts — count-based
+# compute_split_counts — count-based
 # -------------------------
 
 
 def test_split_counts_explicit_values():
-    tr, va, te = _compute_split_counts(100, {"train_count": 70, "val_count": 20, "test_count": 10})
+    tr, va, te = compute_split_counts(100, {"train_count": 70, "val_count": 20, "test_count": 10})
     assert tr == 70
     assert va == 20
     assert te == 10
@@ -172,11 +172,11 @@ def test_split_counts_explicit_values():
 
 def test_split_counts_exceed_n_raises():
     with pytest.raises(ValueError, match="exceed dataset size"):
-        _compute_split_counts(100, {"train_count": 80, "val_count": 15, "test_count": 10})
+        compute_split_counts(100, {"train_count": 80, "val_count": 15, "test_count": 10})
 
 
 def test_split_counts_missing_train_allocates_remainder():
-    tr, va, te = _compute_split_counts(100, {"val_count": 20, "test_count": 10})
+    tr, va, te = compute_split_counts(100, {"val_count": 20, "test_count": 10})
     assert va == 20
     assert te == 10
     assert tr == 70
@@ -184,7 +184,7 @@ def test_split_counts_missing_train_allocates_remainder():
 
 def test_split_counts_take_precedence_over_fracs():
     # Fraction would give val=50, but explicit count overrides
-    tr, va, te = _compute_split_counts(
+    tr, va, te = compute_split_counts(
         100,
         {"train_count": 60, "val_count": 10, "test_count": 5, "val_frac": 0.5},
     )
