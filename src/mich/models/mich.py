@@ -220,7 +220,7 @@ class MICH(
             )
         if dsdt_supervision_loss is not None:
             self.log(
-                f"{stage}/loss/dsdt_supervision",
+                f"{stage}/loss/dzdt_supervision",
                 dsdt_supervision_loss,
                 on_step=on_step,
                 on_epoch=on_epoch,
@@ -280,11 +280,11 @@ class MICH(
             if dsdt_supervision_loss is not None:
                 log_dict.update(
                     {
-                        "train/loss/dsdt_supervision": dsdt_supervision_loss.item(),
-                        "train/loss_weighted/dsdt_supervision": (
+                        "train/loss/dzdt_supervision": dsdt_supervision_loss.item(),
+                        "train/loss_weighted/dzdt_supervision": (
                             dsdt_supervision_loss * lambda_dsdt_eff
                         ).item(),
-                        **{f"dsdt_supervision/src_{k}": v.item() for k, v in per_sig_dsdt.items()},
+                        **{f"dzdt_supervision/src_{k}": v.item() for k, v in per_sig_dsdt.items()},
                     }
                 )
             _direct_run.log(log_dict)
