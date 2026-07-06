@@ -2,13 +2,14 @@ import logging
 import os
 import subprocess
 
+import h5py
 import hydra
 import pytorch_lightning as pl
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from mich import CONFIG_DIR
-from mich.data.synthetic import discover_layers
+from mich.data.synthetic import compute_split_counts, discover_layers
 from mich.models.blocks import HEINZLE_SIGNALS, HEINZLE_SIGNALS_SINGLE
 from mich.utils.hydra_utils import (
     instantiate_collection,
@@ -27,6 +28,31 @@ def _resolve_data_layers(cfg: DictConfig) -> tuple[str, ...]:
     if layers_val is None or layers_val == "auto":
         return discover_layers(cfg.datamodule.data.path)
     return tuple(layers_val)
+
+
+def _resolve_total_steps(cfg: DictConfig) -> int:
+    """Mirror SyntheticDataModule's train-split + drop_last dataloader math, without
+    instantiating the dataset, so scheduler.T_max can auto-track dataset size, split
+    fraction, batch size, and max_epochs instead of needing to be hand-recomputed."""
+    layers = _resolve_data_layers(cfg)
+    with h5py.File(cfg.datamodule.data.path, "r") as f:
+        n = int(f[layers[0]]["bold"].shape[0])
+    n_train, _, _ = compute_split_counts(n, dict(cfg.datamodule.split))
+    batch_size = int(cfg.datamodule.loader.batch_size)
+    drop_last = bool(cfg.datamodule.loader.get("drop_last", True))
+    steps_per_epoch = n_train // batch_size if drop_last else -(-n_train // batch_size)
+    return steps_per_epoch * int(cfg.trainer.max_epochs)
+
+
+def _inject_scheduler_steps(cfg: DictConfig) -> None:
+    """Auto-set scheduler.T_max from the actual dataset/split/batch/epoch config, unless
+    the user has pinned an explicit value (e.g. for a deliberately shorter warm-restart)."""
+    if cfg.model.scheduler.get("T_max") is not None:
+        return
+    total_steps = _resolve_total_steps(cfg)
+    with open_dict(cfg):
+        cfg.model.scheduler.T_max = total_steps
+    log.info(f"Auto-set scheduler.T_max = {total_steps} (from dataset size/split/batch/epochs)")
 
 
 def _inject_sim_physics(cfg: DictConfig, sim_cfg: dict) -> None:
@@ -107,6 +133,7 @@ def main(cfg: DictConfig) -> None:
     if not cfg.resume.state:
         log.info("Injecting physics constants from simulation HDF5")
         _inject_sim_physics(cfg, datamodule.sim_config)
+        _inject_scheduler_steps(cfg)
         log.info("Saving configuration")
         save_config(cfg)
 

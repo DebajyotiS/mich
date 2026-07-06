@@ -60,7 +60,7 @@ def _open_h5(path: str, cache_cfg: Mapping[str, Any]) -> h5py.File:
     )
 
 
-def _compute_split_counts(n: int, split: Mapping[str, Any]) -> Tuple[int, int, int]:
+def compute_split_counts(n: int, split: Mapping[str, Any]) -> Tuple[int, int, int]:
     """
     Supports either explicit counts (train_count/val_count/test_count)
     OR fraction-based (train_frac/val_frac/test_frac). If both are present,
@@ -325,7 +325,7 @@ class SyntheticDataModule(pl.LightningDataModule):
         _tmp = self._make_dataset(base_cfg)
         n = len(_tmp)
 
-        n_train, n_val, n_test = _compute_split_counts(n, self.split_config)
+        n_train, n_val, n_test = compute_split_counts(n, self.split_config)
 
         seed = int(self.split_config.get("seed", 42))
         shuffle = bool(self.split_config.get("shuffle", True))

@@ -471,7 +471,16 @@ class MICHLossMixin:
     # ------------------------------------------------------------------
 
     def _supervision_keys(self, z_hat: torch.Tensor):
-        return self._SUPERVISION_KEYS_SINGLE if z_hat.shape[1] <= 5 else self._SUPERVISION_KEYS_FULL
+        keys = self._SUPERVISION_KEYS_SINGLE if z_hat.shape[1] <= 5 else self._SUPERVISION_KEYS_FULL
+        # TEMPORARY ablation switch: direct supervision on x (batch["neural"]) is not
+        # part of the normal MICH objective (x is meant to be recovered purely via the
+        # physics residual against the well-supervised s-trajectory, since real fMRI has
+        # no ground-truth neural signal to supervise against). Only enable to diagnose
+        # whether varying block-amplitude neural signals are an identifiability/training
+        # issue vs. an architecture-capacity issue.
+        if getattr(self.hparams.loss_config, "supervise_x", False):
+            keys = (("x", "neural"), *keys)
+        return keys
 
     def _supervision_loss(
         self,
@@ -547,6 +556,77 @@ class MICHLossMixin:
             per_sig[sig] = torch.stack(
                 [
                     self._supervision_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
+                    for layer_idx in range(L)
+                ]
+            ).mean()
+
+        total = sum(per_sig.values()) / len(per_sig)
+        return total, per_sig
+
+    # ------------------------------------------------------------------
+    # Derivative (ds/dt) supervision loss -- TEMPORARY ablation
+    # ------------------------------------------------------------------
+
+    _DSDT_BATCH_KEY = {"s": "s", "f": "f", "v": "v", "q": "q", "vstar": "v_star", "qstar": "q_star"}
+
+    def _derivative_supervision_loss(
+        self,
+        dz_hat_dt: torch.Tensor,  # [B, 7, L, T, H, W]
+        batch: dict,
+        source_position: torch.Tensor,  # [B, S, 2]
+        num_sources: torch.Tensor,  # [B]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """MSE between the network's analytic dz_hat/dt and a finite-difference estimate
+        of the same derivative from ground-truth latents, at each valid source voxel
+        across all T.
+
+        Motivation: value-only supervision (_source_supervision_loss) barely penalises a
+        small timing/phase error -- a slightly-lagged copy of a smooth curve has near
+        identical MSE/Pearson. x is only ever recovered via ds/dt through the physics
+        residual (there's no ground truth to check it against directly), so any phase lag
+        in the learned s(t) propagates straight into x with nothing to correct it.
+        Matching ds/dt directly is sharply sensitive to timing, unlike value-matching.
+
+        Compared in per-index units (i.e. per stored sample, not per unit of the model's
+        normalised [0, 1] time grid): dz_hat_dt is d(z_hat)/d(t_norm), so it's divided by
+        (T_min - 1) to undo that normalisation rather than scaling the (small, O(1))
+        ground-truth finite difference up to match it -- avoids inflating the loss target
+        to ~(T_min - 1) times every other signal's scale at sharp transitions, which
+        previously produced squared-error gradients large enough to destabilise training.
+        """
+        lc = self.hparams.loss_config
+        signals = tuple(getattr(lc, "dsdt_supervision_signals", ("s",)))
+        B = dz_hat_dt.shape[0]
+        S = source_position.shape[1]
+        device = dz_hat_dt.device
+        b_idx = torch.arange(B, device=device)[:, None].expand(B, S)
+        src_h = source_position[..., 0].long()  # [B, S]
+        src_w = source_position[..., 1].long()
+        mask = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
+
+        per_sig: dict[str, torch.Tensor] = {}
+        for sig in signals:
+            bk = self._DSDT_BATCH_KEY[sig]
+            true = batch[bk].float()  # [B, L, T_latent, H, W]
+            pred = dz_hat_dt[:, self._signal_index(sig)].float()  # [B, L, T, H, W]
+            T_min = min(pred.shape[2], true.shape[2])
+            true = true[:, :, :T_min]
+            # Per-index finite difference (NOT rescaled to the model's per-normalised-time
+            # convention) -- rescaling the *target* up by (T_min - 1) (~= 100 for this
+            # simulation's dt=1.0/time_duration=100) inflates it far past every other
+            # signal's O(1) scale, so squared error against it dwarfs the rest of the loss
+            # and blows up training. Instead bring the *prediction* down to the same
+            # per-index scale below; identical constraint, ~(T_min-1)^2 smaller gradient.
+            true_dt = torch.gradient(true, dim=2)[0]
+
+            pred_src = pred[b_idx, :, :T_min, src_h, src_w] / (T_min - 1)  # [B, S, L, T_min]
+            true_src = true_dt[b_idx, :, :T_min, src_h, src_w]  # [B, S, L, T_min]
+            L = pred_src.shape[2]
+            pred_src = pred_src.reshape(B * S, L, T_min)[mask.reshape(-1)]  # [M, L, T_min]
+            true_src = true_src.reshape(B * S, L, T_min)[mask.reshape(-1)]
+            per_sig[sig] = torch.stack(
+                [
+                    self._dsdt_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
                     for layer_idx in range(L)
                 ]
             ).mean()
