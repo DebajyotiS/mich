@@ -65,35 +65,35 @@ class MICHLoggingMixin:
             fig, axes = plt.subplots(1, n_layers, figsize=(8 * n_layers, 8))
             if n_layers == 1:
                 axes = [axes]
-            for l, ax in enumerate(axes):
+            for layer_index, ax in enumerate(axes):
                 T = pred_neural.shape[2]
                 t_full = torch.arange(T).float()
                 t_short = torch.arange(T - 1).float()
-                ax.plot(t_full, true_neural[i, l].cpu().float(), label="True x", color="green")
+                ax.plot(t_full, true_neural[i, layer_index].cpu().float(), label="True x", color="green")
                 ax.plot(
                     t_full,
-                    pred_neural[i, l].cpu().float(),
+                    pred_neural[i, layer_index].cpu().float(),
                     label="Pred x (head)",
                     color="purple",
                     linestyle="--",
                 )
                 ax.plot(
                     t_short,
-                    pred_x_recon[i, l].cpu().float(),
+                    pred_x_recon[i, layer_index].cpu().float(),
                     label="Pred x (recon from s/f)",
                     color="orange",
                     linestyle=":",
                 )
                 ax.plot(
                     t_short,
-                    true_x_recon[i, l].cpu().float(),
+                    true_x_recon[i, layer_index].cpu().float(),
                     label="True x (recon from s/f)",
                     color="blue",
                     linestyle=":",
                 )
-                n_src_here = int((valid_layers == l).sum())
+                n_src_here = int((valid_layers == layer_index).sum())
                 ax.set_title(
-                    f"{layer_names[l]}" + (f" [{n_src_here} src]" if n_src_here > 0 else "")
+                    f"{layer_names[layer_index]}" + (f" [{n_src_here} src]" if n_src_here > 0 else "")
                 )
                 ax.legend(fontsize=6)
             fig.suptitle("x: head vs ODE reconstruction")
