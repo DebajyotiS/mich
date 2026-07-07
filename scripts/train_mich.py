@@ -6,7 +6,7 @@ import h5py
 import hydra
 import pytorch_lightning as pl
 import torch
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, open_dict
 
 from mich import CONFIG_DIR
 from mich.data.synthetic import compute_split_counts, discover_layers

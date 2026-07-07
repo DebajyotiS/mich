@@ -8,7 +8,7 @@ c_film: 32           # FiLM bottleneck per signal (~c_dec / 7, rounded up for gr
 signal_embed_dim: 8
 num_freqs: 20
 min_freq: 2.0
-max_freq: 40.0
+max_freq: 45.0
 tcn_kernel: 3
 spatial_radius: 2
 grid_size: 10
@@ -119,18 +119,18 @@ loss_config:
                       # real fMRI has no ground-truth neural signal). Only for diagnosing
                       # whether varying-amplitude neural blocks are an identifiability
                       # issue vs. an architecture-capacity issue.
-  supervise_dsdt: true # MSE/huber between the network's analytic
+  supervise_dzdt: true # MSE/huber between the network's analytic
                       # dz_hat/dt and a finite-difference derivative of the ground-truth
-                      # latents (see dsdt_supervision_signals), at each source voxel.
+                      # latents (see dzdt_supervision_signals), at each source voxel.
                       # Unlike value-only supervision_loss, this is sharply sensitive to
-                      # timing/phase, since x is only ever recovered via ds/dt through the
+                      # timing/phase, since x is only ever recovered via dz/dt through the
                       # physics residual and has no direct ground-truth check. Uses the
                       # same ground-truth latents already used by supervision_loss
                       # (s/f/v/q), not x itself, so it stays applicable without ground-truth x.
-  lambda_dsdt_supervision: 100.0 # weight applied when supervise_dsdt=true
-  warmup_steps_dsdt_supervision: 0
-  delay_steps_dsdt_supervision: 0
-  dsdt_supervision_signals: ["s", "f", "v", "q"]
+  lambda_dzdt_supervision: 100.0 # weight applied when supervise_dzdt=true
+  warmup_steps_dzdt_supervision: 0
+  delay_steps_dzdt_supervision: 0
+  dzdt_supervision_signals: ["s", "f", "v", "q"] # which signals to compute dz/dt supervision loss on; must be a subset of the signals in the dataset
   n_space: 100 # colocation points
   dense_spatial_frac: 0.95
   dense_spatial_radius: ${model.spatial_radius}
@@ -153,7 +153,7 @@ loss_config:
   ode_loss:
     type: "mse"
     huber_delta: 0.1 #used if type is "huber"
-  dsdt_loss:
+  dzdt_loss:
     type: "huber" # huber, not mse -- ds/dt at a sharp transition is an outlier relative
                    # to the near-flat per-index differences elsewhere; squared error over-
                    # weights it, huber caps its influence past huber_delta.
@@ -177,14 +177,13 @@ learnable_physio:
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 6.0e-4        # 3e-4 * sqrt(128/32)
+  lr: 3.0e-4
   weight_decay: 1.0e-5
 
 scheduler:
   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
   _partial_: true
-  T_max: null       # auto-computed by train_mich.py from dataset size, split, batch size, and
-                     # max_epochs (see _inject_scheduler_steps); set an explicit int to override
+  T_max: null       # auto-computed by train_mich.py from dataset size, split, batch size, and max_epochs (see _inject_scheduler_steps); set an explicit int to override
   eta_min: 1.0e-6
 
 lightning:
