@@ -4,12 +4,12 @@ import pytest
 from mich.data.signals import (
     AlphaPulse,
     ExpDecayPulse,
-    TriangularPulse,
     Noise,
     Pulse,
     RectPulse,
     SincPulse,
     Sources,
+    TriangularPulse,
     _make_pulse,
 )
 

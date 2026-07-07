@@ -12,9 +12,9 @@ import torch
 from mich.data.synthetic import (
     SyntheticDataModule,
     SyntheticH5Dataset,
-    compute_split_counts,
     _np_dtype,
     _torch_dtype,
+    compute_split_counts,
 )
 
 # -------------------------

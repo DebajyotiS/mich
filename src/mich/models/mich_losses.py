@@ -12,11 +12,13 @@ from mich.data.balloon import AcquisitionConstants, PointSpreadFunction
 from mich.models.collocation import CollocationMixin
 
 
-class MICHLossMixin:
+class MICHLossMixin(CollocationMixin):
     """Data loss, physics (ODE-residual) loss, and supervision loss.
 
-    Depends on CollocationMixin (index sampling/gathering) and LearnablePhysioMixin
-    (self._physio / self._current_acquisition) being mixed in alongside this one.
+    Inherits CollocationMixin (index sampling/gathering) for static analysis of the
+    `self._gather_*`/`self._signal_index` calls below; also depends on
+    LearnablePhysioMixin (self._physio / self._current_acquisition) being mixed in
+    alongside this one at the concrete-model level.
     """
 
     # Mapping from z_hat signal name -> batch key
@@ -34,10 +36,6 @@ class MICHLossMixin:
         ("v", "v"),
         ("q", "q"),
     )
-
-    # ------------------------------------------------------------------
-    # PSF
-    # ------------------------------------------------------------------
 
     def _setup_psf(self) -> None:
         """Build PSF objects and register 2D kernels as buffers so they move with the device."""
@@ -69,10 +67,6 @@ class MICHLossMixin:
                 .to(bold.dtype)
             )
         return torch.stack(layers_blurred, dim=1)  # [B, L, T, H, W]
-
-    # ------------------------------------------------------------------
-    # Loss-function factory
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _make_loss_fn(loss_cfg) -> callable:
@@ -125,10 +119,6 @@ class MICHLossMixin:
                 "Must be one of: mse, huber, pearson, mse+pearson, huber+pearson"
             )
 
-    # ------------------------------------------------------------------
-    # BOLD forward model
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _compute_bold(
         v: torch.Tensor, q: torch.Tensor, acquisition: AcquisitionConstants, V0: float
@@ -143,10 +133,6 @@ class MICHLossMixin:
         v = CollocationMixin._gather_z_hat_at(z_hat, idx, signal="v")
         q = CollocationMixin._gather_z_hat_at(z_hat, idx, signal="q")
         return MICHLossMixin._compute_bold(v, q, acquisition, V0)
-
-    # ------------------------------------------------------------------
-    # Antisteady loss
-    # ------------------------------------------------------------------
 
     def _antisteady_loss(
         self,
@@ -195,10 +181,6 @@ class MICHLossMixin:
 
         lambda_neg = getattr(self.hparams.loss_config, "lambda_antisteady_neg", 1.0)
         return pos_loss + lambda_neg * neg_loss
-
-    # ------------------------------------------------------------------
-    # Data (BOLD) loss
-    # ------------------------------------------------------------------
 
     def _data_loss(
         self,
@@ -270,10 +252,6 @@ class MICHLossMixin:
 
         total = colloc_loss + self.hparams.loss_config.lambda_src * src_loss
         return total, colloc_loss, src_loss
-
-    # ------------------------------------------------------------------
-    # Physics (ODE-residual) loss
-    # ------------------------------------------------------------------
 
     def _sanitise_states(self, states: dict[str, Any]) -> dict[str, Any]:
         for key, value in states.items():
@@ -390,8 +368,6 @@ class MICHLossMixin:
         losses = {"s": s_loss, "f": f_loss, "v": v_loss, "q": q_loss}
 
         if has_drain:
-            # NOTE: delay filter uses tau_d (its own timescale), not the layer's tau --
-            # matches src/data/balloon.py:delay_filter_derivatives.
             dv_star_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
             v_star_target = (-v_star + v - 1) / tau_d
             losses["vstar"] = self._ode_loss_fn(dv_star_dt[:, burn_in:], v_star_target[:, burn_in:])
@@ -465,10 +441,6 @@ class MICHLossMixin:
             dz_dt_fd = z_hat[:, :, :, 1:] - z_hat[:, :, :, :-1]  # [B, S, L, T-1, H, W]
             smoothness_loss = dz_dt_fd.pow(2).mean()
             return tot_physics_loss + lambda_smooth * smoothness_loss, per_eq
-
-    # ------------------------------------------------------------------
-    # Supervision (latent) loss
-    # ------------------------------------------------------------------
 
     def _supervision_keys(self, z_hat: torch.Tensor):
         keys = self._SUPERVISION_KEYS_SINGLE if z_hat.shape[1] <= 5 else self._SUPERVISION_KEYS_FULL
@@ -563,10 +535,6 @@ class MICHLossMixin:
         total = sum(per_sig.values()) / len(per_sig)
         return total, per_sig
 
-    # ------------------------------------------------------------------
-    # Derivative (ds/dt) supervision loss -- TEMPORARY ablation
-    # ------------------------------------------------------------------
-
     _DSDT_BATCH_KEY = {"s": "s", "f": "f", "v": "v", "q": "q", "vstar": "v_star", "qstar": "q_star"}
 
     def _derivative_supervision_loss(
@@ -595,7 +563,7 @@ class MICHLossMixin:
         previously produced squared-error gradients large enough to destabilise training.
         """
         lc = self.hparams.loss_config
-        signals = tuple(getattr(lc, "dsdt_supervision_signals", ("s",)))
+        signals = tuple(getattr(lc, "dzdt_supervision_signals", ("s",)))
         B = dz_hat_dt.shape[0]
         S = source_position.shape[1]
         device = dz_hat_dt.device
@@ -626,7 +594,7 @@ class MICHLossMixin:
             true_src = true_src.reshape(B * S, L, T_min)[mask.reshape(-1)]
             per_sig[sig] = torch.stack(
                 [
-                    self._dsdt_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
+                    self._dzdt_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
                     for layer_idx in range(L)
                 ]
             ).mean()
