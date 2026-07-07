@@ -291,10 +291,15 @@ class MICHLossMixin(CollocationMixin):
         if has_drain:
             v_star, q_star = states["vstar"], states["qstar"]
 
-        s_scale = 1.0
-        f_scale = 1.0
-        v_scale = 1.0
-        q_scale = 1.0
+        # dz_hat_dt is d(z_hat)/d(t_norm) (the decoder's analytic derivative w.r.t. its
+        # [0,1]-normalised time grid), but every RHS below (x - kappa*s - gamma*(f-1), s,
+        # target_vdot/tau, target_qdot/tau) is a plain physical-value combination with no
+        # t_norm involved -- i.e. already in per-sample-index ("physical") units. Dividing
+        # the *derivative* term by (T-1) converts it to that same per-index convention;
+        # matches _derivative_supervision_loss's identical `pred_src / (T_min - 1)`. Only
+        # the derivative side gets divided
+        total_time_samples = z_hat.shape[3]
+        t_norm_to_physical = total_time_samples - 1
 
         alpha = self._physio("alpha")
         gamma = self._physio("gamma")
@@ -304,14 +309,14 @@ class MICHLossMixin(CollocationMixin):
         tau_d = self.hparams.haemo.tau_d  # not learnable (currently out of scope)
         E0 = self._physio("E0")
 
-        ds_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="s")
+        ds_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="s") / t_norm_to_physical
         s_target = x - kappa * s - gamma * (f - 1)
-        s_loss = self._ode_loss_fn(ds_dt[:, burn_in:] / s_scale, s_target[:, burn_in:] / s_scale)
+        s_loss = self._ode_loss_fn(ds_dt[:, burn_in:], s_target[:, burn_in:])
 
-        df_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="f")
-        f_loss = self._ode_loss_fn(df_dt[:, burn_in:] / f_scale, s[:, burn_in:] / f_scale)
+        df_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="f") / t_norm_to_physical
+        f_loss = self._ode_loss_fn(df_dt[:, burn_in:], s[:, burn_in:])
 
-        dv_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="v")
+        dv_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="v") / t_norm_to_physical
         if order == "exact":
             target_vdot = f - v ** (1 / alpha)
         elif order == "linear":
@@ -330,11 +335,11 @@ class MICHLossMixin(CollocationMixin):
             vstar_deeper = self._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
             target_vdot += lambda_d * vstar_deeper
         v_loss = self._ode_loss_fn(
-            dv_dt[:, burn_in:] / v_scale,
-            (target_vdot[:, burn_in:] / tau) / v_scale,
+            dv_dt[:, burn_in:],
+            target_vdot[:, burn_in:] / tau,
         )
 
-        dq_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="q")
+        dq_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="q") / t_norm_to_physical
         if order == "exact":
             target_qdot = f * (1 - (1 - E0) ** (1 / f)) / E0 - q * v ** (1 / alpha - 1)
         elif order == "linear":
@@ -361,17 +366,17 @@ class MICHLossMixin(CollocationMixin):
             qstar_deeper = self._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
             target_qdot += lambda_d * qstar_deeper
         q_loss = self._ode_loss_fn(
-            dq_dt[:, burn_in:] / q_scale,
-            (target_qdot[:, burn_in:] / tau) / q_scale,
+            dq_dt[:, burn_in:],
+            target_qdot[:, burn_in:] / tau,
         )
 
         losses = {"s": s_loss, "f": f_loss, "v": v_loss, "q": q_loss}
 
         if has_drain:
-            dv_star_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar")
+            dv_star_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar") / t_norm_to_physical
             v_star_target = (-v_star + v - 1) / tau_d
             losses["vstar"] = self._ode_loss_fn(dv_star_dt[:, burn_in:], v_star_target[:, burn_in:])
-            dq_star_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar")
+            dq_star_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar") / t_norm_to_physical
             q_star_target = (-q_star + q - 1) / tau_d
             losses["qstar"] = self._ode_loss_fn(dq_star_dt[:, burn_in:], q_star_target[:, burn_in:])
 
