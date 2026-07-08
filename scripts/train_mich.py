@@ -126,13 +126,30 @@ def main(cfg: DictConfig) -> None:
         # top of the reloaded original config -- otherwise reload_original_config's
         # wholesale replacement of cfg would silently discard anything passed on the
         # command line for this resume run beyond network_name/project_name/resume.state.
-        cli_overrides = OmegaConf.from_dotlist(HydraConfig.get().overrides.task)
+        overrides_task = HydraConfig.get().overrides.task
+        cli_overrides = OmegaConf.from_dotlist(overrides_task)
         orig_cfg = reload_original_config(
             path=cfg.paths.full_path,
             ckpt_flag=cfg.resume.ckpt_flag,
             reload_states=False,
         )  # type: ignore
         cfg = OmegaConf.merge(orig_cfg, cli_overrides)
+
+        # T_max was resolved against the ORIGINAL run's max_epochs and is now a concrete
+        # (non-None) value inherited via the merge above -- _inject_scheduler_steps's own
+        # "leave alone if already set" guard means it would never recompute this, so
+        # extending trainer.max_epochs on resume would otherwise leave the cosine
+        # schedule exhausted (sitting at eta_min) for the entire extension. Recompute it
+        # against whatever max_epochs applies to this invocation, unless the user
+        # explicitly pinned scheduler.T_max themselves in this invocation's own overrides
+        # (matching _inject_scheduler_steps's documented pin-override intent).
+        user_pinned_t_max = any(
+            o.split("=")[0] == "model.scheduler.T_max" for o in overrides_task
+        )
+        if not user_pinned_t_max:
+            with open_dict(cfg):
+                cfg.model.scheduler.T_max = None
+            _inject_scheduler_steps(cfg)
 
     if cfg.model.loss_config.lambda_supervision == 0.0:
         log.info("lambda_supervision=0, disabling return_latents in datamodule")
