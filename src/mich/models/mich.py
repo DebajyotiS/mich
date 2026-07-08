@@ -48,6 +48,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         self._ode_loss_fn = self._make_loss_fn(getattr(lc, "ode_loss", None))
         self._supervision_loss_fn = self._make_loss_fn(getattr(lc, "supervision_loss", None))
         self._dzdt_loss_fn = self._make_loss_fn(getattr(lc, "dzdt_loss", None))
+        self._x_phase_loss_fn = self._make_loss_fn(getattr(lc, "x_phase_loss", None))
         self.pred_buffer = []
         self.neural_buffer = []
         self.bold_buffer = []
@@ -97,7 +98,10 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             getattr(lc, "delay_steps_smooth", 0),
         )
         need_grads = (
-            (lambda_physics_eff > 0.0) or (stage == "val") or getattr(lc, "supervise_dzdt", False)
+            (lambda_physics_eff > 0.0)
+            or (stage == "val")
+            or getattr(lc, "supervise_dzdt", False)
+            or getattr(lc, "supervise_x_phase", False)
         )
         sd_manifest = self(
             bold_norm,
@@ -171,6 +175,18 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 )
                 total_loss = total_loss + lambda_dzdt_eff * dzdt_supervision_loss
 
+        x_phase_loss = None
+        lambda_x_phase_eff = 0.0
+        if getattr(lc, "supervise_x_phase", False):
+            lambda_x_phase_eff = self._get_scheduled_lambda(
+                getattr(lc, "lambda_x_phase", 0.0),
+                getattr(lc, "warmup_steps_x_phase", 0),
+                getattr(lc, "delay_steps_x_phase", 0),
+            )
+            if lambda_x_phase_eff > 0:
+                x_phase_loss = self._x_phase_loss(z_hat, dz_hat_dt, source_position, num_sources)
+                total_loss = total_loss + lambda_x_phase_eff * x_phase_loss
+
         _to_logger = stage == "val"
         on_step = stage == "train"
         on_epoch = stage == "val"
@@ -226,6 +242,16 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             self.log(
                 f"{stage}/loss/dzdt_supervision",
                 dzdt_supervision_loss,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=False,
+                sync_dist=True,
+                logger=_to_logger,
+            )
+        if x_phase_loss is not None:
+            self.log(
+                f"{stage}/loss/x_phase",
+                x_phase_loss,
                 on_step=on_step,
                 on_epoch=on_epoch,
                 prog_bar=False,
@@ -289,6 +315,13 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                             dzdt_supervision_loss * lambda_dzdt_eff
                         ).item(),
                         **{f"dzdt_supervision/src_{k}": v.item() for k, v in per_sig_dzdt.items()},
+                    }
+                )
+            if x_phase_loss is not None:
+                log_dict.update(
+                    {
+                        "train/loss/x_phase": x_phase_loss.item(),
+                        "train/loss_weighted/x_phase": (x_phase_loss * lambda_x_phase_eff).item(),
                     }
                 )
             _direct_run.log(log_dict)

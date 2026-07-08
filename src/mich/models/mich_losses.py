@@ -629,3 +629,68 @@ class MICHLossMixin(CollocationMixin):
 
         total = sum(per_sig.values()) / len(per_sig)
         return total, per_sig
+
+    def _x_phase_loss(
+        self,
+        z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
+        dz_hat_dt: torch.Tensor,  # [B, 7, L, T, H, W]
+        source_position: torch.Tensor,  # [B, S, 2]
+        num_sources: torch.Tensor,  # [B]
+    ) -> torch.Tensor:
+        """Coherent, full-T, same-voxel phase-sensitive loss pulling x_hat toward its own
+        physics-residual reconstruction x_rhs = Dp_s + kappa*s_hat + gamma*(f_hat-1).
+
+        The physics residual (_compute_physics_layer_loss) is the only training signal
+        touching x_hat's value at all, but it's evaluated at scattered collocation points
+        -- a fresh random draw of times (and, separately, spatial locations) every step
+        (see _sample_collocation_indices), never a coherent, ordered whole trajectory.
+        s/f/v/q, by contrast, are judged by _source_supervision_loss on their full,
+        ordered T-length trajectory at the fixed source voxel every step -- a whole-shape
+        comparison, not a cloud of independent point constraints. This loss gives x_hat
+        that same kind of coherent, per-step, whole-trajectory signal, against a
+        reconstruction built entirely from data-derived quantities (Dp_s, s_hat, f_hat)
+        rather than ground-truth x, so it stays usable with real fMRI (no x label needed).
+        Uses hparams.loss_config.x_phase_loss (mse+pearson by default) so shape/phase
+        misalignment is penalised directly, not just implicitly through pointwise MSE.
+
+        Not detached: x_rhs is a function of s_hat/f_hat/Dp_s, so gradients flow both
+        ways, same bidirectional-consistency philosophy as the physics residual itself.
+        """
+        B = z_hat.shape[0]
+        S = source_position.shape[1]
+        T = z_hat.shape[3]
+        device = z_hat.device
+        b_idx = torch.arange(B, device=device)[:, None].expand(B, S)
+        src_h = source_position[..., 0].long()  # [B, S]
+        src_w = source_position[..., 1].long()
+        mask = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
+
+        kappa = self._physio("kappa")
+        gamma = self._physio("gamma")
+        burn_in = self.hparams.loss_config.burn_in
+        t_norm_to_physical = T - 1
+
+        x_hat = z_hat[:, self._signal_index("x")].float()  # [B, L, T, H, W]
+        s_hat = z_hat[:, self._signal_index("s")].float()
+        f_hat = z_hat[:, self._signal_index("f")].float()
+        Dp_s = dz_hat_dt[:, self._signal_index("s")].float() / t_norm_to_physical
+
+        x_src = x_hat[b_idx, :, :, src_h, src_w]  # [B, S, L, T]
+        s_src = s_hat[b_idx, :, :, src_h, src_w]
+        f_src = f_hat[b_idx, :, :, src_h, src_w]
+        Dp_s_src = Dp_s[b_idx, :, :, src_h, src_w]
+
+        x_rhs_src = Dp_s_src + kappa * s_src + gamma * (f_src - 1.0)
+
+        L = x_src.shape[2]
+        x_src = x_src.reshape(B * S, L, T)[mask.reshape(-1)]  # [M, L, T]
+        x_rhs_src = x_rhs_src.reshape(B * S, L, T)[mask.reshape(-1)]
+
+        return torch.stack(
+            [
+                self._x_phase_loss_fn(
+                    x_src[:, layer_idx, burn_in:], x_rhs_src[:, layer_idx, burn_in:]
+                )
+                for layer_idx in range(L)
+            ]
+        ).mean()
