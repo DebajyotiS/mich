@@ -51,10 +51,6 @@ def reload_original_config(
             if hasattr(orig_cfg.loggers, "wandb"):
                 orig_cfg.loggers.wandb.resume = True
 
-    # Typically the first instantiation of the model would load fresh pretrained checkpoints
-    # from the SD ckpt. When reloading config, we want to load the ckpt from the last run
-    orig_cfg.model.stimuli_model["reload_model"] = False
-    orig_cfg.model.latent_generator.setup_config["reload_model"] = False
     return orig_cfg
 
 

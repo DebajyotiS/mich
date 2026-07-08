@@ -6,7 +6,8 @@ import h5py
 import hydra
 import pytorch_lightning as pl
 import torch
-from omegaconf import DictConfig, open_dict
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from mich import CONFIG_DIR
 from mich.data.synthetic import compute_split_counts, discover_layers
@@ -121,7 +122,17 @@ def main(cfg: DictConfig) -> None:
     log.info("Setting up job configuration")
     if cfg.resume.state:
         log.info("Reloading original config and resuming training")
-        cfg = reload_original_config(cfg, reload_states=False)  # type: ignore
+        # Re-apply this invocation's own CLI overrides (e.g. trainer.max_epochs=800) on
+        # top of the reloaded original config -- otherwise reload_original_config's
+        # wholesale replacement of cfg would silently discard anything passed on the
+        # command line for this resume run beyond network_name/project_name/resume.state.
+        cli_overrides = OmegaConf.from_dotlist(HydraConfig.get().overrides.task)
+        orig_cfg = reload_original_config(
+            path=cfg.paths.full_path,
+            ckpt_flag=cfg.resume.ckpt_flag,
+            reload_states=False,
+        )  # type: ignore
+        cfg = OmegaConf.merge(orig_cfg, cli_overrides)
 
     if cfg.model.loss_config.lambda_supervision == 0.0:
         log.info("lambda_supervision=0, disabling return_latents in datamodule")
@@ -134,8 +145,6 @@ def main(cfg: DictConfig) -> None:
         log.info("Injecting physics constants from simulation HDF5")
         _inject_sim_physics(cfg, datamodule.sim_config)
         _inject_scheduler_steps(cfg)
-        log.info("Saving configuration")
-        save_config(cfg)
 
     if cfg.print_config:
         log.info("Printing configuration")
@@ -181,6 +190,16 @@ def main(cfg: DictConfig) -> None:
     if loggers:
         log.info("Logging hyperparameters")
         log_hyperparameters(cfg, model, trainer)  # type: ignore
+
+    # Saved after loggers are instantiated (not right after config setup) so that, when
+    # wandb is active, save_config's `cfg.loggers.wandb.id = wandb.run.id` capture has a
+    # real run to record -- doing this earlier always saw wandb.run as None, since the
+    # logger didn't exist yet, silently breaking wandb continuity for any later resume.
+    # Runs unconditionally (not just for fresh runs) so a resumed run's saved config
+    # reflects whatever values were actually used this time (e.g. an extended
+    # trainer.max_epochs), not the original run's values.
+    log.info("Saving configuration")
+    save_config(cfg)
 
     if cfg.train:
         log.info("MICH training started")
