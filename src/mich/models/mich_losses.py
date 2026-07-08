@@ -263,6 +263,58 @@ class MICHLossMixin(CollocationMixin):
             states[key] = value
         return states
 
+    def _balloon_v_q_dot_targets(
+        self, f: torch.Tensor, v: torch.Tensor, q: torch.Tensor, order: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Un-normalised (not yet divided by tau) dv/dt, dq/dt targets from the balloon
+        ODE's v/q equations (order in {exact, linear, quadratic}). Shared by
+        _compute_physics_layer_loss (evaluated on model states) and
+        _derivative_supervision_loss (evaluated on ground-truth states) so the two
+        formulas can't drift out of sync with each other.
+        """
+        alpha = self._physio("alpha")
+        E0 = self._physio("E0")
+
+        if order == "exact":
+            target_vdot = f - v ** (1 / alpha)
+        elif order == "linear":
+            f, v, q = f - 1, v - 1, q - 1
+            target_vdot = f - v / alpha
+            f, v, q = f + 1, v + 1, q + 1
+        elif order == "quadratic":
+            f, v, q = f - 1, v - 1, q - 1
+            target_vdot = f - v / alpha - (1 - alpha) / (2 * alpha**2) * v**2
+            f, v, q = f + 1, v + 1, q + 1
+        else:
+            raise ValueError(
+                f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}"
+            )
+
+        if order == "exact":
+            target_qdot = f * (1 - (1 - E0) ** (1 / f)) / E0 - q * v ** (1 / alpha - 1)
+        elif order == "linear":
+            f, v, q = f - 1, v - 1, q - 1
+            log_1mE0 = torch.log(torch.as_tensor(1 - E0, dtype=v.dtype, device=v.device))
+            beta_1 = (1 - E0) * log_1mE0 / E0
+            target_qdot = (1 + beta_1) * f - q - (1 / alpha - 1) * v
+            f, v, q = f + 1, v + 1, q + 1
+        elif order == "quadratic":
+            f, v, q = f - 1, v - 1, q - 1
+            log_1mE0 = torch.log(torch.as_tensor(1 - E0, dtype=v.dtype, device=v.device))
+            beta_1 = (1 - E0) * log_1mE0 / E0
+            beta_2 = beta_1 * log_1mE0 / 2
+            target_qdot = (
+                (1 + beta_1) * f
+                - q
+                - (1 / alpha - 1) * v
+                - beta_2 * f**2
+                - (1 / alpha - 1) * v * q
+                - (1 / 2) * (1 / alpha - 1) * (1 / alpha - 2) * v**2
+            )
+            f, v, q = f + 1, v + 1, q + 1
+
+        return target_vdot, target_qdot
+
     def _compute_physics_layer_loss(
         self,
         z_hat: torch.Tensor,
@@ -317,54 +369,19 @@ class MICHLossMixin(CollocationMixin):
         f_loss = self._ode_loss_fn(df_dt[:, burn_in:], s[:, burn_in:])
 
         dv_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="v") / t_norm_to_physical
-        if order == "exact":
-            target_vdot = f - v ** (1 / alpha)
-        elif order == "linear":
-            f, v, q = f - 1, v - 1, q - 1
-            target_vdot = f - v / alpha
-            f, v, q = f + 1, v + 1, q + 1
-        elif order == "quadratic":
-            f, v, q = f - 1, v - 1, q - 1
-            target_vdot = f - v / alpha - (1 - alpha) / (2 * alpha**2) * v**2
-            f, v, q = f + 1, v + 1, q + 1
-        else:
-            raise ValueError(
-                f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}"
-            )
+        target_vdot, target_qdot = self._balloon_v_q_dot_targets(f, v, q, order)
         if has_drain and layer > 0:
             vstar_deeper = self._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
-            target_vdot += lambda_d * vstar_deeper
+            target_vdot = target_vdot + lambda_d * vstar_deeper
         v_loss = self._ode_loss_fn(
             dv_dt[:, burn_in:],
             target_vdot[:, burn_in:] / tau,
         )
 
         dq_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="q") / t_norm_to_physical
-        if order == "exact":
-            target_qdot = f * (1 - (1 - E0) ** (1 / f)) / E0 - q * v ** (1 / alpha - 1)
-        elif order == "linear":
-            f, v, q = f - 1, v - 1, q - 1
-            log_1mE0 = torch.log(torch.as_tensor(1 - E0, dtype=v.dtype, device=v.device))
-            beta_1 = (1 - E0) * log_1mE0 / E0
-            target_qdot = (1 + beta_1) * f - q - (1 / alpha - 1) * v
-            f, v, q = f + 1, v + 1, q + 1
-        elif order == "quadratic":
-            f, v, q = f - 1, v - 1, q - 1
-            log_1mE0 = torch.log(torch.as_tensor(1 - E0, dtype=v.dtype, device=v.device))
-            beta_1 = (1 - E0) * log_1mE0 / E0
-            beta_2 = beta_1 * log_1mE0 / 2
-            target_qdot = (
-                (1 + beta_1) * f
-                - q
-                - (1 / alpha - 1) * v
-                - beta_2 * f**2
-                - (1 / alpha - 1) * v * q
-                - (1 / 2) * (1 / alpha - 1) * (1 / alpha - 2) * v**2
-            )
-            f, v, q = f + 1, v + 1, q + 1
         if has_drain and layer > 0:
             qstar_deeper = self._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
-            target_qdot += lambda_d * qstar_deeper
+            target_qdot = target_qdot + lambda_d * qstar_deeper
         q_loss = self._ode_loss_fn(
             dq_dt[:, burn_in:],
             target_qdot[:, burn_in:] / tau,
@@ -540,8 +557,6 @@ class MICHLossMixin(CollocationMixin):
         total = sum(per_sig.values()) / len(per_sig)
         return total, per_sig
 
-    _DSDT_BATCH_KEY = {"s": "s", "f": "f", "v": "v", "q": "q", "vstar": "v_star", "qstar": "q_star"}
-
     def _derivative_supervision_loss(
         self,
         dz_hat_dt: torch.Tensor,  # [B, 7, L, T, H, W]
@@ -549,23 +564,14 @@ class MICHLossMixin(CollocationMixin):
         source_position: torch.Tensor,  # [B, S, 2]
         num_sources: torch.Tensor,  # [B]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """MSE between the network's analytic dz_hat/dt and a finite-difference estimate
-        of the same derivative from ground-truth latents, at each valid source voxel
+        """MSE between the network's analytic dz_hat/dt and the exact Balloon-Windkessel
+        ODE derivative evaluated on ground-truth latents, at each valid source voxel
         across all T.
-
-        Motivation: value-only supervision (_source_supervision_loss) barely penalises a
-        small timing/phase error -- a slightly-lagged copy of a smooth curve has near
-        identical MSE/Pearson. x is only ever recovered via ds/dt through the physics
-        residual (there's no ground truth to check it against directly), so any phase lag
-        in the learned s(t) propagates straight into x with nothing to correct it.
-        Matching ds/dt directly is sharply sensitive to timing, unlike value-matching.
 
         Compared in per-index units (i.e. per stored sample, not per unit of the model's
         normalised [0, 1] time grid): dz_hat_dt is d(z_hat)/d(t_norm), so it's divided by
-        (T_min - 1) to undo that normalisation rather than scaling the (small, O(1))
-        ground-truth finite difference up to match it -- avoids inflating the loss target
-        to ~(T_min - 1) times every other signal's scale at sharp transitions, which
-        previously produced squared-error gradients large enough to destabilise training.
+        (T_min - 1) to undo that normalisation, matching _compute_physics_layer_loss's
+        identical convention.
         """
         lc = self.hparams.loss_config
         signals = tuple(getattr(lc, "dzdt_supervision_signals", ("s",)))
@@ -577,20 +583,37 @@ class MICHLossMixin(CollocationMixin):
         src_w = source_position[..., 1].long()
         mask = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
 
+        x_true = batch["neural"].float()  # [B, L, T_latent, H, W]
+        s_true = batch["s"].float()
+        f_true = batch["f"].float()
+        v_true = batch["v"].float()
+        q_true = batch["q"].float()
+        T_min = min(dz_hat_dt.shape[3], s_true.shape[2])
+        x_true, s_true, f_true, v_true, q_true = (
+            t[:, :, :T_min] for t in (x_true, s_true, f_true, v_true, q_true)
+        )
+
+        kappa = self._physio("kappa")
+        gamma = self._physio("gamma")
+        tau = self._physio("tau")
+        target_vdot, target_qdot = self._balloon_v_q_dot_targets(
+            f_true, v_true, q_true, lc.order
+        )
+        # NOTE: no cross-layer drain coupling here (unlike _compute_physics_layer_loss's
+        # vstar/qstar-deeper term) -- not needed for the currently-configured signals
+        # (s, f, v, q); would need extending before enabling "vstar"/"qstar" here for a
+        # multi-layer, lambda_d != 0 config.
+        analytic_target = {
+            "s": x_true - kappa * s_true - gamma * (f_true - 1.0),
+            "f": s_true,
+            "v": target_vdot / tau,
+            "q": target_qdot / tau,
+        }
+
         per_sig: dict[str, torch.Tensor] = {}
         for sig in signals:
-            bk = self._DSDT_BATCH_KEY[sig]
-            true = batch[bk].float()  # [B, L, T_latent, H, W]
+            true_dt = analytic_target[sig]  # [B, L, T_min, H, W]
             pred = dz_hat_dt[:, self._signal_index(sig)].float()  # [B, L, T, H, W]
-            T_min = min(pred.shape[2], true.shape[2])
-            true = true[:, :, :T_min]
-            # Per-index finite difference (NOT rescaled to the model's per-normalised-time
-            # convention) -- rescaling the *target* up by (T_min - 1) (~= 100 for this
-            # simulation's dt=1.0/time_duration=100) inflates it far past every other
-            # signal's O(1) scale, so squared error against it dwarfs the rest of the loss
-            # and blows up training. Instead bring the *prediction* down to the same
-            # per-index scale below; identical constraint, ~(T_min-1)^2 smaller gradient.
-            true_dt = torch.gradient(true, dim=2)[0]
 
             pred_src = pred[b_idx, :, :T_min, src_h, src_w] / (T_min - 1)  # [B, S, L, T_min]
             true_src = true_dt[b_idx, :, :T_min, src_h, src_w]  # [B, S, L, T_min]
