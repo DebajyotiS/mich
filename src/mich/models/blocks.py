@@ -449,7 +449,12 @@ class SpatioTemporalDecoder(nn.Module):
             return SpatialDecoderManifest(z_hat=z_hat)
 
         dgamma_dt, dbeta_dt = self._gamma_beta_time_grads(t)
-        dz_pre_dt = self._decode_dt_from_film(u, dgamma_dt, dbeta_dt, B, T, L, H, W)
+        # d(u)/d(t_norm): u is only sampled at the T recorded grid points (it comes from
+        # temporal_mixing's TCN, which has no closed form in continuous t), so this is a
+        # finite-difference estimate -- unlike dgamma_dt/dbeta_dt, which are exact (jacrev).
+        # See _decode_dt_from_film for why this term is needed at all.
+        du_dt = torch.gradient(u, dim=1)[0] * (T - 1)
+        dz_pre_dt = self._decode_dt_from_film(u, du_dt, gamma, dgamma_dt, dbeta_dt, B, T, L, H, W)
 
         # Chain rule: d/dt act(z) = act'(z) * dz/dt
         dz_hat_dt = self._apply_activation_derivatives(z_pre, dz_pre_dt)
@@ -582,19 +587,34 @@ class SpatioTemporalDecoder(nn.Module):
         out = torch.cat(out_parts, dim=3)  # [B, T, L, 7, H, W]
         return out.permute(0, 3, 2, 1, 4, 5).contiguous()  # [B, 7, L, T, H, W]
 
-    def _decode_dt_from_film(self, u, dgamma_dt, dbeta_dt, B, T, L, H, W):
-        # Same spatial projection as forward pass (u is constant w.r.t. t)
+    def _decode_dt_from_film(self, u, du_dt, gamma, dgamma_dt, dbeta_dt, B, T, L, H, W):
+        """Total derivative of z_pre = u_film * gamma(t) + beta(t) w.r.t. t_norm, via the
+        product rule: d(u_film)/dt * gamma + u_film * dgamma/dt + dbeta/dt. The previous
+        version computed only the last two terms, treating u_film as constant w.r.t. t --
+        exact for the FiLM branch alone, but structurally blind to u's own time-dependence,
+        which is where temporal_mixing's TCN actually carries the signal's dynamics (the O1
+        ablation showed replacing u with its temporal mean collapses this operator gap but
+        wrecks value fit -- the dynamics really do route through u).
+
+        signal_proj is a per-timestep-shared, bias-free linear map, so it commutes exactly
+        with a time-derivative: signal_proj(du_dt) really is d(signal_proj(u))/dt, not an
+        approximation on top of du_dt's own (finite-difference) one.
+        """
         u_film = self.signal_proj(u.reshape(B * T * L, -1, H, W))  # [B*T*L, c_film, H, W]
         c_film = u_film.shape[1]
         u_film = u_film.view(B, T, L, c_film, H, W)
+
+        du_film_dt = self.signal_proj(du_dt.reshape(B * T * L, -1, H, W))
+        du_film_dt = du_film_dt.view(B, T, L, c_film, H, W)
 
         # Apply conv weights only -- bias terms are constant so their derivative is zero
         # Process one signal at a time to avoid materialising [B, T, L, 7, c_film, H, W]
         dout_parts = []
         for sig_idx in range(len(self.signals)):
+            gamma_sig = gamma[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
             g_sig = dgamma_dt[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
             b_sig = dbeta_dt[:, :, :, sig_idx, :][..., None, None]  # [B, T, L, c_film, 1, 1]
-            dy_sig = g_sig * u_film + b_sig  # [B, T, L, c_film, H, W]
+            dy_sig = du_film_dt * gamma_sig + g_sig * u_film + b_sig  # [B, T, L, c_film, H, W]
             layer_parts = []
             for layer_idx in range(L):
                 head = self.out_heads[sig_idx * L + layer_idx]
