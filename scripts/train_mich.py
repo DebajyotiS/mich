@@ -124,9 +124,12 @@ def main(cfg: DictConfig) -> None:
         log.info("Reloading original config and resuming training")
         # Re-apply this invocation's own CLI overrides (e.g. trainer.max_epochs=800) on
         # top of the reloaded original config -- otherwise reload_original_config's
-        # wholesale replacement of cfg would silently discard anything passed on the
+        # wholesale replacement of cfg would discard anything passed on the
         # command line for this resume run beyond network_name/project_name/resume.state.
-        overrides_task = HydraConfig.get().overrides.task
+        # overrides.task is a List[str]-typed field on a structured Hydra config, so at
+        # runtime it's an OmegaConf ListConfig, not a plain list -- OmegaConf.from_dotlist
+        # rejects anything that isn't a real list/tuple, hence the explicit list(...).
+        overrides_task = list(HydraConfig.get().overrides.task)
         cli_overrides = OmegaConf.from_dotlist(overrides_task)
         orig_cfg = reload_original_config(
             path=cfg.paths.full_path,
@@ -135,14 +138,6 @@ def main(cfg: DictConfig) -> None:
         )  # type: ignore
         cfg = OmegaConf.merge(orig_cfg, cli_overrides)
 
-        # T_max was resolved against the ORIGINAL run's max_epochs and is now a concrete
-        # (non-None) value inherited via the merge above -- _inject_scheduler_steps's own
-        # "leave alone if already set" guard means it would never recompute this, so
-        # extending trainer.max_epochs on resume would otherwise leave the cosine
-        # schedule exhausted (sitting at eta_min) for the entire extension. Recompute it
-        # against whatever max_epochs applies to this invocation, unless the user
-        # explicitly pinned scheduler.T_max themselves in this invocation's own overrides
-        # (matching _inject_scheduler_steps's documented pin-override intent).
         user_pinned_t_max = any(
             o.split("=")[0] == "model.scheduler.T_max" for o in overrides_task
         )
@@ -208,13 +203,6 @@ def main(cfg: DictConfig) -> None:
         log.info("Logging hyperparameters")
         log_hyperparameters(cfg, model, trainer)  # type: ignore
 
-    # Saved after loggers are instantiated (not right after config setup) so that, when
-    # wandb is active, save_config's `cfg.loggers.wandb.id = wandb.run.id` capture has a
-    # real run to record -- doing this earlier always saw wandb.run as None, since the
-    # logger didn't exist yet, silently breaking wandb continuity for any later resume.
-    # Runs unconditionally (not just for fresh runs) so a resumed run's saved config
-    # reflects whatever values were actually used this time (e.g. an extended
-    # trainer.max_epochs), not the original run's values.
     log.info("Saving configuration")
     save_config(cfg)
 
