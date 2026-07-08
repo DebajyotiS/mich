@@ -131,6 +131,18 @@ loss_config:
   warmup_steps_dzdt_supervision: 0
   delay_steps_dzdt_supervision: 0
   dzdt_supervision_signals: ["s", "f", "v", "q"] # which signals to compute dz/dt supervision loss on; must be a subset of the signals in the dataset
+  supervise_x_phase: false # Opt-in: coherent full-T, same-source-voxel loss pulling
+                    # x_hat toward x_rhs = Dp_s + kappa*s_hat + gamma*(f_hat-1). Unlike
+                    # the physics residual's scattered per-step collocation points (a
+                    # fresh random draw of times every step, see
+                    # _sample_collocation_indices), this compares whole ordered
+                    # trajectories at the fixed source voxel every step -- the same kind
+                    # of signal supervision_loss already gives s/f/v/q, but built
+                    # entirely from data-derived quantities so no ground-truth x is
+                    # needed.
+  lambda_x_phase: 10.0 # weight applied when supervise_x_phase=true
+  warmup_steps_x_phase: 0
+  delay_steps_x_phase: 0
   n_space: 100 # colocation points
   dense_spatial_frac: 0.95
   dense_spatial_radius: ${model.spatial_radius}
@@ -157,6 +169,11 @@ loss_config:
     type: "huber" # huber, not mse -- ds/dt at a sharp transition is an outlier relative
                    # to the near-flat per-index differences elsewhere; squared error over-
                    # weights it, huber caps its influence past huber_delta.
+  x_phase_loss:
+    type: "mse+pearson" # pearson is what makes this loss shape/phase-sensitive, not
+                         # just magnitude-sensitive -- see supervise_x_phase above.
+    lambda_npearson: 10.0
+    lambda_pearson: 1.0
     huber_delta: 0.1
 
 # haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
