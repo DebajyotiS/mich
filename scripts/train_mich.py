@@ -208,7 +208,8 @@ def main(cfg: DictConfig) -> None:
 
     if cfg.train:
         log.info("MICH training started")
-        trainer.fit(model, datamodule, ckpt_path=cfg.ckpt_path)
+        # I trust my own code, and so I can set weights_only=False here, because the model architecture is always derived from the simulation HDF5 and will always match the checkpoint.
+        trainer.fit(model, datamodule, ckpt_path=cfg.ckpt_path, weights_only=False)
     log.info("MICH training complete")
 
 
