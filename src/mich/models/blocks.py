@@ -524,32 +524,39 @@ class SpatioTemporalDecoder(nn.Module):
 
         all_dgamma = []
         all_dbeta = []
-        for l_idx in range(L):
-            tok_l = layer_toks[l_idx]  # [layer_embed_dim]
+        # vmap(jacrev(...)) is incompatible with autocast -- the composed functorch
+        # transform's wrapper tensors hit "Unexpected floating ScalarType in
+        # at::autocast::prioritize" under bf16-mixed. Same class of issue as
+        # TimeEmbedding.forward's trig ops above; disable autocast for the whole
+        # vmap/jacrev call and run it in float32.
+        device_type = "cuda" if t.is_cuda else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            for l_idx in range(L):
+                tok_l = layer_toks[l_idx].float()  # [layer_embed_dim]
 
-            def _gb_from_scalar(
-                ts: torch.Tensor,
-                _tok_l: torch.Tensor = tok_l,
-                _sig_toks: torch.Tensor = sig_toks,
-            ) -> torch.Tensor:
-                """ts: scalar -> [7, 2, c_film] = [gamma, beta] for all signals"""
-                emb = self.time_embedding(ts)  # [2F]
-                emb_exp = emb.unsqueeze(0).expand(N_SIG, -1)  # [7, 2F]
-                tok_l_exp = _tok_l.unsqueeze(0).expand(N_SIG, -1).to(emb.dtype)
-                film_in = torch.cat(
-                    [emb_exp, tok_l_exp, _sig_toks.to(emb.dtype)], dim=-1
-                )  # [7, 2F+layer_embed_dim+signal_embed_dim]
-                g, b = self.time_film(film_in)  # [7, c_film]
-                return torch.stack([g, b], dim=1)  # [7, 2, c_film]
+                def _gb_from_scalar(
+                    ts: torch.Tensor,
+                    _tok_l: torch.Tensor = tok_l,
+                    _sig_toks: torch.Tensor = sig_toks,
+                ) -> torch.Tensor:
+                    """ts: scalar -> [7, 2, c_film] = [gamma, beta] for all signals"""
+                    emb = self.time_embedding(ts).float()  # [2F]
+                    emb_exp = emb.unsqueeze(0).expand(N_SIG, -1)  # [7, 2F]
+                    tok_l_exp = _tok_l.unsqueeze(0).expand(N_SIG, -1).to(emb.dtype)
+                    film_in = torch.cat(
+                        [emb_exp, tok_l_exp, _sig_toks.to(emb.dtype)], dim=-1
+                    )  # [7, 2F+layer_embed_dim+signal_embed_dim]
+                    g, b = self.time_film(film_in.float())  # [7, c_film]
+                    return torch.stack([g, b], dim=1)  # [7, 2, c_film]
 
-            grads_flat = vmap(jacrev(_gb_from_scalar))(t_flat)  # [BT, 7, 2, c_film]
-            c_film = grads_flat.shape[-1]
-            grads = grads_flat.view(B, T, N_SIG, 2, c_film)
-            all_dgamma.append(grads[:, :, :, 0, :])  # [B, T, 7, c_film]
-            all_dbeta.append(grads[:, :, :, 1, :])  # [B, T, 7, c_film]
+                grads_flat = vmap(jacrev(_gb_from_scalar))(t_flat.float())  # [BT, 7, 2, c_film]
+                c_film = grads_flat.shape[-1]
+                grads = grads_flat.view(B, T, N_SIG, 2, c_film)
+                all_dgamma.append(grads[:, :, :, 0, :])  # [B, T, 7, c_film]
+                all_dbeta.append(grads[:, :, :, 1, :])  # [B, T, 7, c_film]
 
-        dgamma_dt = torch.stack(all_dgamma, dim=2)  # [B, T, L, 7, c_film]
-        dbeta_dt = torch.stack(all_dbeta, dim=2)  # [B, T, L, 7, c_film]
+            dgamma_dt = torch.stack(all_dgamma, dim=2)  # [B, T, L, 7, c_film]
+            dbeta_dt = torch.stack(all_dbeta, dim=2)  # [B, T, L, 7, c_film]
         return dgamma_dt, dbeta_dt
 
     def _decode_from_film(
