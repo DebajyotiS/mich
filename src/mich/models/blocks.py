@@ -448,16 +448,29 @@ class SpatioTemporalDecoder(nn.Module):
         if not return_gradients:
             return SpatialDecoderManifest(z_hat=z_hat)
 
-        dgamma_dt, dbeta_dt = self._gamma_beta_time_grads(t)
-        # d(u)/d(t_norm): u is only sampled at the T recorded grid points (it comes from
-        # temporal_mixing's TCN, which has no closed form in continuous t), so this is a
-        # finite-difference estimate -- unlike dgamma_dt/dbeta_dt, which are exact (jacrev).
-        # See _decode_dt_from_film for why this term is needed at all.
-        du_dt = torch.gradient(u, dim=1)[0] * (T - 1)
-        dz_pre_dt = self._decode_dt_from_film(u, du_dt, gamma, dgamma_dt, dbeta_dt, B, T, L, H, W)
-
-        # Chain rule: d/dt act(z) = act'(z) * dz/dt
-        dz_hat_dt = self._apply_activation_derivatives(z_pre, dz_pre_dt)
+        # The whole analytic-derivative branch runs in float32, not just
+        # _gamma_beta_time_grads's vmap(jacrev(...)) call -- mixing its (forced-fp32)
+        # output with otherwise-bf16 tensors (u_film, gamma) here would create a new
+        # fp32/bf16 seam that doesn't exist on the z_hat/value path, and composed
+        # functorch transforms (vmap+jacrev) under autocast are fragile enough that
+        # introducing a seam right at their boundary risks corrupting autocast's
+        # dispatch state for unrelated ops later in the same forward pass. One clean
+        # precision boundary for the entire branch avoids that class of bug entirely.
+        device_type = "cuda" if t.is_cuda else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            u_fp32 = u.float()
+            gamma_fp32 = gamma.float()
+            dgamma_dt, dbeta_dt = self._gamma_beta_time_grads(t)
+            # d(u)/d(t_norm): u is only sampled at the T recorded grid points (it comes
+            # from temporal_mixing's TCN, which has no closed form in continuous t), so
+            # this is a finite-difference estimate -- unlike dgamma_dt/dbeta_dt, which
+            # are exact (jacrev). See _decode_dt_from_film for why this term is needed.
+            du_dt = torch.gradient(u_fp32, dim=1)[0] * (T - 1)
+            dz_pre_dt = self._decode_dt_from_film(
+                u_fp32, du_dt, gamma_fp32, dgamma_dt, dbeta_dt, B, T, L, H, W
+            )
+            # Chain rule: d/dt act(z) = act'(z) * dz/dt
+            dz_hat_dt = self._apply_activation_derivatives(z_pre.float(), dz_pre_dt)
 
         return SpatialDecoderManifest(z_hat=z_hat, grads=dz_hat_dt)
 
