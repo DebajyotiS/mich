@@ -19,12 +19,11 @@ import pytest
 import torch
 import torch.optim
 import torch.optim.lr_scheduler
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import Callback
-
 from mich.data.synthetic import SyntheticDataModule
 from mich.models.blocks import HeinzleNet
 from mich.models.mich import MICH
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import Callback
 
 # -------------------------
 # Module-level constants
@@ -340,9 +339,9 @@ class TestMICHLosses:
         (data_loss + physics_loss).backward()
         grads_with_value = [p.grad for p in model.parameters() if p.grad is not None]
         assert len(grads_with_value) > 0, "No parameter received a gradient"
-        assert all(torch.isfinite(g).all() for g in grads_with_value), (
-            "At least one parameter gradient contains NaN or Inf"
-        )
+        assert all(
+            torch.isfinite(g).all() for g in grads_with_value
+        ), "At least one parameter gradient contains NaN or Inf"
 
 
 # -------------------------

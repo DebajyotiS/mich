@@ -46,12 +46,11 @@ import torch
 import wandb
 from hydra.utils import instantiate
 from matplotlib.animation import FuncAnimation, PillowWriter
-from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.utils.data import default_collate
-
 from mich import CONFIG_DIR
 from mich.data.synthetic import SyntheticH5Dataset, discover_layers
 from mich.utils.plotting import LAYER_NAMES, plot_latent_layers, plot_neural_bold_layers
+from omegaconf import DictConfig, OmegaConf, open_dict
+from torch.utils.data import default_collate
 
 console = rich.console.Console()
 
@@ -419,7 +418,7 @@ def plot_grid_heatmaps(grid_metrics: dict[str, dict[str, float]], metric: str = 
     fig, axes = plt.subplots(1, len(models), figsize=(7 * len(models), 6), constrained_layout=True)
     if len(models) == 1:
         axes = [axes]
-    for ax, prefix in zip(axes, models):
+    for ax, prefix in zip(axes, models, strict=False):
         grid = grids[prefix]
         im = ax.imshow(grid, aspect="auto", origin="lower", vmin=vmin, vmax=vmax, cmap="RdYlGn")
         ax.set_xticks(range(len(taus)))

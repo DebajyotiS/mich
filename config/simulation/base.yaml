@@ -77,7 +77,7 @@ simulation:
 bold:
   voxel_mm: 0.8               # physical pixel size (mm/pixel); psf_fwhm (grid units) is derived from this
   psf_fwhm_mm: [0.83, 1.78]   # [deep, superficial] PSF FWHM in mm, interpolated across num_layers
-  
+
   # NOTE: noise_model/noise_scales below tune noise *amplitude only when
   # simulation.BOLD_SNR is null/absent*. Every current variant sets BOLD_SNR to a
   # finite value, so this per-layer noise tuning is currently inert (see priority

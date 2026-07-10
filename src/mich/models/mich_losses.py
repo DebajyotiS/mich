@@ -353,13 +353,13 @@ class MICHLossMixin(CollocationMixin):
         total_time_samples = z_hat.shape[3]
         t_norm_to_physical = total_time_samples - 1
 
-        alpha = self._physio("alpha")
+        _alpha = self._physio("alpha")
         gamma = self._physio("gamma")
         kappa = self._physio("kappa")
         lambda_d = self.hparams.haemo.lambda_d  # not learnable (currently out of scope)
         tau = self._physio("tau")
         tau_d = self.hparams.haemo.tau_d  # not learnable (currently out of scope)
-        E0 = self._physio("E0")
+        _E0 = self._physio("E0")
 
         ds_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="s") / t_norm_to_physical
         s_target = x - kappa * s - gamma * (f - 1)

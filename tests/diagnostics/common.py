@@ -251,7 +251,7 @@ def detect_blocks(rising: torch.Tensor, falling: torch.Tensor) -> list[tuple[int
     The first segment (0 -> first edge) and last (last edge -> T) are dropped since
     their true width is truncated by the trace boundary, not representative."""
     edges = torch.sort(torch.cat([rising, falling])).values.tolist()
-    return list(zip(edges[:-1], edges[1:]))
+    return list(zip(edges[:-1], edges[1:], strict=False))
 
 
 def power_spectrum(x: torch.Tensor, dim: int = -1, d: float = 1.0):

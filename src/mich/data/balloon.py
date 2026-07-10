@@ -226,7 +226,9 @@ def _reflect_pad(x: torch.Tensor, pad: int, dim: int) -> torch.Tensor:
     return x.index_select(dim, idx)
 
 
-def _apply_psf_torch(data: torch.Tensor, sigma: float, *, boundary: str = "absorbing") -> torch.Tensor:
+def _apply_psf_torch(
+    data: torch.Tensor, sigma: float, *, boundary: str = "absorbing"
+) -> torch.Tensor:
     if data.ndim <= 1:
         return data
     kernel_np = _gaussian_kernel_1d(sigma)
@@ -337,7 +339,9 @@ def sanitize_state(
     return out
 
 
-def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants, order: str) -> dict[str, Timecourse]:
+def balloon_derivatives(
+    layer: CortexLayer, c: HaemodynamicConstants, order: str
+) -> dict[str, Timecourse]:
     clean = sanitize_state(layer.state.as_dict())
     x = clean["x"]  # type: ignore[assignment]
     s = clean["s"]  # type: ignore[assignment]
@@ -359,9 +363,9 @@ def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants, order: str
         v -= 1
         f -= 1
         q -= 1
-        beta = (1 - c.E0) * np.log(1 - c.E0) / c.E0 
-        dv = (f - v / c.alpha) / layer.tau  
-        dq = ( (1 + beta) * f - q - (1/c.alpha - 1) * v ) / layer.tau 
+        beta = (1 - c.E0) * np.log(1 - c.E0) / c.E0
+        dv = (f - v / c.alpha) / layer.tau
+        dq = ((1 + beta) * f - q - (1 / c.alpha - 1) * v) / layer.tau
         v += 1
         f += 1
         q += 1
@@ -373,17 +377,22 @@ def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants, order: str
         beta = (1 - c.E0) * np.log(1 - c.E0) / c.E0
         gamma = beta * np.log(1 - c.E0) / 2
         dv = (f - v / c.alpha - (1 - c.alpha) / (2 * c.alpha**2) * v**2) / layer.tau
-        dq = ((1 + beta) * f - q - (1/c.alpha - 1) * v
+        dq = (
+            (1 + beta) * f
+            - q
+            - (1 / c.alpha - 1) * v
             - gamma * f**2
-            - (1/c.alpha - 1) * v * q
-            - (1/2) * (1/c.alpha - 1) * (1/c.alpha - 2) * v**2) / layer.tau        
+            - (1 / c.alpha - 1) * v * q
+            - (1 / 2) * (1 / c.alpha - 1) * (1 / c.alpha - 2) * v**2
+        ) / layer.tau
         v += 1
         f += 1
         q += 1
 
     else:
-        raise ValueError(f"Unknown order: '{order}'. Implemented 'exact', 'linear', or 'quadratic'.")
-
+        raise ValueError(
+            f"Unknown order: '{order}'. Implemented 'exact', 'linear', or 'quadratic'."
+        )
 
     if layer.drain_from is not None and layer.lambda_d != 0.0:
         delayed = sanitize_state(layer.drain_from.state.as_dict())
@@ -395,6 +404,7 @@ def balloon_derivatives(layer: CortexLayer, c: HaemodynamicConstants, order: str
         dq = dq + (layer.lambda_d * q_star) / layer.tau  # type: ignore[operator]
 
     return {"ds_dt": ds, "df_dt": df, "dv_dt": dv, "dq_dt": dq}  # type: ignore[return-value]
+
 
 def delay_filter_derivatives(layer: CortexLayer, *, tau_d: float) -> dict[str, Timecourse]:
     if layer.state.v_star is None or layer.state.q_star is None:
@@ -414,21 +424,13 @@ def delay_filter_derivatives(layer: CortexLayer, *, tau_d: float) -> dict[str, T
     # Cleaner derivative names (avoid '*' in keys)
     return {"dv_star_dt": dv_star, "dq_star_dt": dq_star}
 
+
 def get_inversion_derivatives(
     layer: CortexLayer, c: HaemodynamicConstants, tau_d: float, order: str
 ) -> dict[str, Timecourse]:
     delayed_derivs = delay_filter_derivatives(layer, tau_d=tau_d)
     balloon_derivs = balloon_derivatives(layer, c, order)
     return {**balloon_derivs, **delayed_derivs}
-
-
-
-
-
-
-
-
-
 
 
 def rk4_step(
@@ -481,7 +483,7 @@ def simulate_cortex(
     x_inputs: list[Timecourse],
     *,
     dt: float,
-    tau_d: float, 
+    tau_d: float,
     order: str,
 ) -> dict[int, dict[str, Timecourse]]:
     if len(layers) != len(x_inputs):
@@ -649,6 +651,3 @@ def get_bold_from_state(
             bold = bold + noise_arr
 
     return bold
-
-
-

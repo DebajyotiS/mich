@@ -32,6 +32,7 @@ class RectPulse:
         signal[mask] += self.amplitude
         return signal
 
+
 @deprecated(reason="TriangularPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
 @dataclass(frozen=True, slots=True)
 class TriangularPulse:
@@ -54,6 +55,7 @@ class TriangularPulse:
         mask_fall = (t >= self.t_peak) & (t < t_end)
         signal[mask_fall] += self.amplitude * (t_end - t[mask_fall]) / half_width
         return signal
+
 
 @deprecated(reason="TriangularPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
 @dataclass(frozen=True, slots=True)
@@ -79,6 +81,7 @@ class SincPulse:
         window = 0.54 + 0.46 * np.cos(np.pi * t_norm)
         signal[mask] += self.amplitude * sinc_val * window
         return signal
+
 
 @deprecated(reason="TriangularPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
 @dataclass(frozen=True, slots=True)
@@ -117,15 +120,15 @@ class Pulse:
         if self.pulse_type == "rect" and self.baseline == "random":
             rng = self.rng if self.rng is not None else np.random.default_rng()
             mask = np.isclose(signal, 0.0, atol=1e-9).astype(int)
-            padded = np.pad(mask, 1, mode='constant', constant_values=0)
+            padded = np.pad(mask, 1, mode="constant", constant_values=0)
             diffs = np.diff(padded)
             starts = np.where(diffs == 1)[0]
             ends = np.where(diffs == -1)[0] - 1
-            zero_intervals = list(zip(starts, ends))[1:-1]
+            zero_intervals = list(zip(starts, ends, strict=False))[1:-1]
             median_amplitude = np.median([peak[0] for peak in self.peaks])
             for start, end in zero_intervals:
                 random_baseline = rng.uniform(-0.1 * median_amplitude, 0.1 * median_amplitude)
-                signal[start:end + 1] += random_baseline
+                signal[start : end + 1] += random_baseline
         return t, signal
 
 

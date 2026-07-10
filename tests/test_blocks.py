@@ -4,7 +4,6 @@ from dataclasses import is_dataclass
 
 import pytest
 import torch
-
 from mich.models.blocks import (  # noqa: E402
     DepthWiseSeparableConvLayer,
     FourierTimeEmbedding,

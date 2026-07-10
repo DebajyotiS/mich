@@ -253,10 +253,18 @@ class SyntheticH5Dataset(Dataset):
             q = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
 
             for layer_index in range(L):
-                self._m_latent_s[layer_index].read_direct(s, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
-                self._m_latent_f[layer_index].read_direct(f, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
-                self._m_latent_v[layer_index].read_direct(v, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
-                self._m_latent_q[layer_index].read_direct(q, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                self._m_latent_s[layer_index].read_direct(
+                    s, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
+                self._m_latent_f[layer_index].read_direct(
+                    f, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
+                self._m_latent_v[layer_index].read_direct(
+                    v, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
+                self._m_latent_q[layer_index].read_direct(
+                    q, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                )
 
             out.update({"s": s, "f": f, "v": v, "q": q})
 
@@ -264,8 +272,12 @@ class SyntheticH5Dataset(Dataset):
                 v_star = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
                 q_star = np.empty((L, self.lt, H, W), dtype=self._np_dtype)
                 for layer_index in range(L):
-                    self._m_latent_v_star[layer_index].read_direct(v_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
-                    self._m_latent_q_star[layer_index].read_direct(q_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index])
+                    self._m_latent_v_star[layer_index].read_direct(
+                        v_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                    )
+                    self._m_latent_q_star[layer_index].read_direct(
+                        q_star, source_sel=np.s_[idx], dest_sel=np.s_[layer_index]
+                    )
                 out.update({"v_star": v_star, "q_star": q_star})
 
         return out
@@ -391,6 +403,7 @@ class SyntheticDataModule(pl.LightningDataModule):
     @property
     def sim_config(self) -> dict:
         import json
+
         path = self.data_config.get("path")
         if path is None:
             raise ValueError("data.path is not set in datamodule config")
