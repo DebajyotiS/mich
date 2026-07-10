@@ -28,6 +28,7 @@ from common import (
     write_report,
     xcorr_lag,
 )
+
 from mich.data.balloon import CortexLayer, HaemodynamicConstants, HaemodynamicState, simulate_cortex
 
 EDGE_TOL = 0.05

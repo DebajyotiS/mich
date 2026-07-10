@@ -46,11 +46,12 @@ import torch
 import wandb
 from hydra.utils import instantiate
 from matplotlib.animation import FuncAnimation, PillowWriter
+from omegaconf import DictConfig, OmegaConf, open_dict
+from torch.utils.data import default_collate
+
 from mich import CONFIG_DIR
 from mich.data.synthetic import SyntheticH5Dataset, discover_layers
 from mich.utils.plotting import LAYER_NAMES, plot_latent_layers, plot_neural_bold_layers
-from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.utils.data import default_collate
 
 console = rich.console.Console()
 
