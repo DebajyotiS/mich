@@ -830,12 +830,12 @@ def test_simulate_cortex_near_resting_state_for_small_input():
     q = out[0]["q"]
     # With a small, constant drive and short simulation, v and q should not
     # deviate more than 15 % from their resting value of 1.0.
-    assert (
-        np.abs(v.mean() - 1.0) < 0.15
-    ), f"v mean {v.mean():.4f} deviated too far from resting state 1.0"
-    assert (
-        np.abs(q.mean() - 1.0) < 0.15
-    ), f"q mean {q.mean():.4f} deviated too far from resting state 1.0"
+    assert np.abs(v.mean() - 1.0) < 0.15, (
+        f"v mean {v.mean():.4f} deviated too far from resting state 1.0"
+    )
+    assert np.abs(q.mean() - 1.0) < 0.15, (
+        f"q mean {q.mean():.4f} deviated too far from resting state 1.0"
+    )
 
 
 def test_simulate_cortex_zero_input_stays_at_resting_state():
