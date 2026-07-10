@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import pickle
+import re
 
 import h5py
 import numpy as np
 import pytest
 import torch
 
-from src.data.synthetic import (
+from mich.data.synthetic import (
     SyntheticDataModule,
     SyntheticH5Dataset,
-    _compute_split_counts,
     _np_dtype,
     _torch_dtype,
+    compute_split_counts,
 )
 
 # -------------------------
@@ -35,6 +36,7 @@ def _make_h5(
     include_meta: bool = True,
     include_latents: bool = True,
     latent_t: int | None = None,
+    max_sources: int = 3,
 ) -> None:
     """Write a minimal valid HDF5 file understood by SyntheticH5Dataset."""
     lt = latent_t if latent_t is not None else t
@@ -48,14 +50,22 @@ def _make_h5(
                 grp.create_dataset(key, data=rng.standard_normal((n, lt, h, w)).astype(np.float32))
         if include_meta:
             meta = f.require_group("meta")
-            meta.create_dataset("num_pulses", data=rng.integers(1, 4, size=n).astype(np.int32))
-            meta.create_dataset(
-                "source_layer", data=rng.integers(0, len(layers), size=n).astype(np.int32)
-            )
-            meta.create_dataset(
-                "source_position",
-                data=rng.integers(0, min(h, w), size=(n, 2)).astype(np.int32),
-            )
+            num_sources = rng.integers(1, max_sources + 1, size=n).astype(np.int32)
+            meta.create_dataset("num_sources", data=num_sources)
+
+            source_layer = np.full((n, max_sources), -1, dtype=np.int32)
+            source_position = np.full((n, max_sources, 2), -1, dtype=np.int32)
+            source_num_pulses = np.zeros((n, max_sources), dtype=np.int32)
+            for i in range(n):
+                k = int(num_sources[i])
+                source_layer[i, :k] = rng.integers(0, len(layers), size=k)
+                source_position[i, :k] = rng.integers(0, min(h, w), size=(k, 2))
+                source_num_pulses[i, :k] = rng.integers(1, 4, size=k)
+
+            sources = meta.create_group("sources")
+            sources.create_dataset("layer", data=source_layer)
+            sources.create_dataset("position", data=source_position)
+            sources.create_dataset("num_pulses", data=source_num_pulses)
 
 
 # -------------------------
@@ -104,17 +114,17 @@ def test_np_dtype_unsupported_raises():
 
 
 # -------------------------
-# _compute_split_counts — fraction-based
+# compute_split_counts — fraction-based
 # -------------------------
 
 
 def test_split_fracs_default_sums_to_n():
-    tr, va, te = _compute_split_counts(100, {})
+    tr, va, te = compute_split_counts(100, {})
     assert tr + va + te == 100
 
 
 def test_split_fracs_explicit_splits_correct():
-    tr, va, te = _compute_split_counts(100, {"val_frac": 0.1, "test_frac": 0.2})
+    tr, va, te = compute_split_counts(100, {"val_frac": 0.1, "test_frac": 0.2})
     assert va == 10
     assert te == 20
     assert tr == 70
@@ -123,16 +133,16 @@ def test_split_fracs_explicit_splits_correct():
 
 def test_split_fracs_sum_gt_one_raises():
     with pytest.raises(ValueError, match="val_frac.*test_frac|test_frac.*val_frac"):
-        _compute_split_counts(100, {"val_frac": 0.6, "test_frac": 0.6})
+        compute_split_counts(100, {"val_frac": 0.6, "test_frac": 0.6})
 
 
 def test_split_fracs_negative_raises():
     with pytest.raises(ValueError, match="non-negative"):
-        _compute_split_counts(100, {"val_frac": -0.1, "test_frac": 0.1})
+        compute_split_counts(100, {"val_frac": -0.1, "test_frac": 0.1})
 
 
 def test_split_train_frac_explicit_sums_to_n():
-    tr, va, te = _compute_split_counts(100, {"train_frac": 0.8, "val_frac": 0.1, "test_frac": 0.1})
+    tr, va, te = compute_split_counts(100, {"train_frac": 0.8, "val_frac": 0.1, "test_frac": 0.1})
     assert tr + va + te == 100
     assert tr == 80
     assert va == 10
@@ -140,22 +150,35 @@ def test_split_train_frac_explicit_sums_to_n():
 
 def test_split_train_frac_not_sum_to_one_raises():
     with pytest.raises(ValueError, match="sum to 1"):
-        _compute_split_counts(100, {"train_frac": 0.7, "val_frac": 0.1, "test_frac": 0.1})
+        compute_split_counts(100, {"train_frac": 0.7, "val_frac": 0.1, "test_frac": 0.1})
+
+
+def test_split_train_frac_not_sum_to_one_message_mentions_actual_sum():
+    trf, vf, tf = 0.5, 0.3, 0.3
+    expected_sum = trf + vf + tf
+    with pytest.raises(ValueError, match=re.escape(f"Got {expected_sum}")):
+        compute_split_counts(100, {"train_frac": trf, "val_frac": vf, "test_frac": tf})
+
+
+@pytest.mark.parametrize("bad_trf", [-0.1, 1.1])
+def test_split_train_frac_out_of_range_raises(bad_trf):
+    with pytest.raises(ValueError, match=r"train_frac must be in \[0,1\]"):
+        compute_split_counts(100, {"train_frac": bad_trf, "val_frac": 0.1, "test_frac": 0.1})
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 10])
 def test_split_fracs_small_n_sums_to_n(n):
-    tr, va, te = _compute_split_counts(n, {"val_frac": 0.2, "test_frac": 0.2})
+    tr, va, te = compute_split_counts(n, {"val_frac": 0.2, "test_frac": 0.2})
     assert tr + va + te == n
 
 
 # -------------------------
-# _compute_split_counts — count-based
+# compute_split_counts — count-based
 # -------------------------
 
 
 def test_split_counts_explicit_values():
-    tr, va, te = _compute_split_counts(100, {"train_count": 70, "val_count": 20, "test_count": 10})
+    tr, va, te = compute_split_counts(100, {"train_count": 70, "val_count": 20, "test_count": 10})
     assert tr == 70
     assert va == 20
     assert te == 10
@@ -163,11 +186,11 @@ def test_split_counts_explicit_values():
 
 def test_split_counts_exceed_n_raises():
     with pytest.raises(ValueError, match="exceed dataset size"):
-        _compute_split_counts(100, {"train_count": 80, "val_count": 15, "test_count": 10})
+        compute_split_counts(100, {"train_count": 80, "val_count": 15, "test_count": 10})
 
 
 def test_split_counts_missing_train_allocates_remainder():
-    tr, va, te = _compute_split_counts(100, {"val_count": 20, "test_count": 10})
+    tr, va, te = compute_split_counts(100, {"val_count": 20, "test_count": 10})
     assert va == 20
     assert te == 10
     assert tr == 70
@@ -175,7 +198,7 @@ def test_split_counts_missing_train_allocates_remainder():
 
 def test_split_counts_take_precedence_over_fracs():
     # Fraction would give val=50, but explicit count overrides
-    tr, va, te = _compute_split_counts(
+    tr, va, te = compute_split_counts(
         100,
         {"train_count": 60, "val_count": 10, "test_count": 5, "val_frac": 0.5},
     )
@@ -237,21 +260,23 @@ def test_dataset_return_meta_false_excludes_meta_keys(tmp_path):
     _make_h5(p, n=3, include_meta=True)
     ds = SyntheticH5Dataset(p, cache_cfg=_CACHE_CFG, return_meta=False, layers=_LAYERS_2)
     item = ds[0]
-    for key in ("num_pulses", "source_layer", "source_position"):
+    for key in ("num_sources", "num_pulses", "source_layer", "source_position"):
         assert key not in item
 
 
 def test_dataset_return_meta_true_includes_meta_keys(tmp_path):
     p = str(tmp_path / "d.h5")
-    _make_h5(p, n=3, include_meta=True)
+    _make_h5(p, n=3, include_meta=True, max_sources=3)
     ds = SyntheticH5Dataset(p, cache_cfg=_CACHE_CFG, return_meta=True, layers=_LAYERS_2)
     item = ds[0]
+    assert "num_sources" in item
     assert "num_pulses" in item
     assert "source_layer" in item
     assert "source_position" in item
-    assert isinstance(item["num_pulses"], int)
-    assert isinstance(item["source_layer"], int)
-    assert item["source_position"].ndim == 1  # per-sample 2-vector
+    assert isinstance(item["num_sources"], int)
+    assert item["source_layer"].shape == (3,)  # [max_sources]
+    assert item["source_position"].shape == (3, 2)  # [max_sources, 2]
+    assert item["num_pulses"].shape == (3,)  # [max_sources]
 
 
 def test_dataset_return_latents_true_includes_latent_keys(tmp_path):
@@ -270,6 +295,18 @@ def test_dataset_return_latents_false_excludes_latent_keys(tmp_path):
     item = ds[0]
     for key in ("s", "f", "v", "q", "v_star", "q_star"):
         assert key not in item
+
+
+def test_dataset_return_latents_single_layer_excludes_v_star_q_star(tmp_path):
+    # v_star/q_star are only loaded when len(self.layers) > 1; with a single layer
+    # the guard should skip them even though the on-disk datasets exist.
+    p = str(tmp_path / "d.h5")
+    _make_h5(p, n=3, layers=("layer_0",))
+    ds = SyntheticH5Dataset(p, cache_cfg=_CACHE_CFG, return_latents=True, layers=("layer_0",))
+    item = ds[0]
+    assert "s" in item and "f" in item and "v" in item and "q" in item
+    assert "v_star" not in item
+    assert "q_star" not in item
 
 
 def test_dataset_latent_shapes_match_expected(tmp_path):
@@ -414,6 +451,7 @@ class TestSyntheticDataModule:
             "bold",
             "neural",
             "source_position",
+            "num_sources",
             "num_pulses",
             "source_layer",
             "s",
@@ -448,3 +486,29 @@ class TestSyntheticDataModule:
         dm.setup()
         batch = next(iter(dm.val_dataloader()))
         assert batch["bold"].shape == (2, len(_DM_LAYERS), 8, 4, 4)
+
+    def test_resolve_split_cfg_applies_overrides_and_strips_split_keys(self, tmp_path):
+        dm = SyntheticDataModule(
+            data={
+                "path": "dummy.h5",
+                "layers": ["layer_0"],
+                "dtype": "float32",
+                "train": {"dtype": "float16"},
+                "val": {"return_meta": True},
+            },
+            split={},
+            loader={},
+            h5_cache={},
+        )
+
+        train_cfg = dm._resolve_split_cfg("train")
+        assert train_cfg["dtype"] == "float16"  # per-split override applied
+        assert train_cfg["path"] == "dummy.h5"  # base config preserved
+        for key in ("train", "val", "test"):
+            assert key not in train_cfg
+
+        val_cfg = dm._resolve_split_cfg("val")
+        assert val_cfg["return_meta"] is True  # per-split override applied
+        assert val_cfg["dtype"] == "float32"  # unaffected by train's override
+        for key in ("train", "val", "test"):
+            assert key not in val_cfg

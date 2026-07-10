@@ -1,0 +1,9 @@
+# "Exact" Balloon-Windkessel variant: uses the closed-form (non-linearised)
+# volume/dHb ODEs (src/data/balloon.py, order == "exact"). This is exactly the
+# base.yaml setup (order already defaults to "exact" there) — only output_path
+# differs.
+defaults:
+  - base
+  - _self_
+
+output_path: data/simulations-exact.h5

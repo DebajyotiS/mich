@@ -1,129 +1,220 @@
-_target_: src.models.mich.MICH
+_target_: mich.models.mich.MICH
 
-# -- Free scalars --------------------------------------------------------------
-# Constraints on derived values are annotated inline with "# = <expression>".
-#
-#   L         number of cortical input layers
-#   C         MaskedLayerMixing output channels -> first spatial encoder cin
-#   c_enc     final spatial encoder output channels -> all temporal cin + decoder cin
-#   c_dec     decoder feature channels -> time_film_config.c_dec must equal this
-#   num_freqs Fourier frequencies -> time_film_config.embed_dim = 2 * num_freqs
-# -----------------------------------------------------------------------------
+L: 3
+C: 32
+c_enc: 64
+c_dec: 64
+c_film: 32           # FiLM bottleneck per signal (~c_dec / 7, rounded up for groups)
+signal_embed_dim: 8
+num_freqs: 24   # log-spaced between min_freq/max_freq; raised from 20 to keep the same
+                # per-decade resolution now that the range is wider (1-48 vs the old 2-45)
+min_freq: 1.0   # was 2.0 -- skipped the single dominant mode (one cycle over the whole
+                # T-sample window) that carries 30-51% of f/v/q/v*/q*'s total power
+max_freq: 48.0  # was 45.0 -- just under Nyquist ((T-1)/2=49.5), to cover x/s's near-Nyquist
+                # edge content (99.9% of their power sits at ~freq 50)
+tcn_kernel: 3
+spatial_radius: 2
+grid_size: 10
+
+embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
+out_channels: 7 # must equal len(signals) (7 with drainage, 5 without) -- NOT multiplied by L;
+                # SpatioTemporalDecoder builds len(signals)*L output heads internally using L separately
 
 heinzle_net:
-  _target_: src.models.blocks.HeinzleNet
+  _target_: mich.models.blocks.HeinzleNet
+
   layer_mixing_config:
-    L: 3                #  L
-    C: 16               #  C
+    L: ${model.L}
+    C: ${model.C}
     init_identity: true
 
-  # Each layer's cin must equal the previous layer's cout.
-  # First cin = C; last cout = c_enc.
   spatial_encoder_config:
-    - cin: 16           # = C
-      cout: 16          # = c_enc (single-stage: set to c_enc directly)
+    - cin: ${model.C}
+      cout: ${model.c_enc}
       stride: 1
       dw_kernel: 3
       pw_kernel: 1
-      num_groups: 4     # must divide cout
+      num_groups: 8
       activation: silu
-    - cin: 16           # = previous cout
-      cout: 16          # = c_enc
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
       stride: 1
       dw_kernel: 3
       pw_kernel: 1
-      num_groups: 4     # must divide cout
+      num_groups: 8
       activation: silu
 
-  # Dilations are auto-set to 2^i by TemporalMixingEncoder so do not add dilation.
-  # All layers must share the same cin (residual skip connection x + residual).
   temporal_mixing_config:
-    - cin: 16           # = c_enc
-      kernel_size: 3
-      num_groups: 4     # must divide cin
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
       activation: silu
-    - cin: 16           # = c_enc
-      kernel_size: 3
-      num_groups: 4
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
       activation: silu
-    - cin: 16           # = c_enc
-      kernel_size: 3
-      num_groups: 4
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
       activation: silu
-    - cin: 16           # = c_enc
-      kernel_size: 3
-      num_groups: 4
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      kernel_size: ${model.tcn_kernel}
+      num_groups: 8
       activation: silu
 
   time_embedding_config:
-    num_freqs: 16       #  num_freqs
-    max_freq: 500.0
+    num_freqs: ${model.num_freqs}
+    min_freq: ${model.min_freq}
+    max_freq: ${model.max_freq}
 
   time_film_config:
-    embed_dim: 32       # = 2 * num_freqs
-    hidden_dim: 16
+    embed_dim: ${model.embed_dim}  # overridden in SpatioTemporalDecoder.__init__
+    hidden_dim: ${model.c_film}
     activation: silu
-    c_dec: 16           #  c_dec; must equal spatial_decoder_config.c_dec
+    c_dec: ${model.c_film}         # overridden to c_film in SpatioTemporalDecoder.__init__
 
   spatial_decoder_config:
-    cin: 16             # = c_enc
-    c_dec: 16           # c_dec; must equal time_film_config.c_dec
-    out_channels: 21    # = 7 * L  (hardcoded reshape in SpatialDecoder.forward:255)
+    cin: ${model.c_enc}
+    c_dec: ${model.c_dec}
+    c_film: ${model.c_film}
+    signal_embed_dim: ${model.signal_embed_dim}
+    out_channels: ${model.out_channels}
     activation: silu
-    L: 3                # = L
+    L: ${model.L}
+    layer_embed_dim: 8
 
 normaliser:
-  _target_: src.models.normaliser.LayerwiseBOLDNormalizer
-  H: 32 # This needs to change if  the number of grid points change
-  W: 32 # This needs to change if  the number of grid points change
+  _target_: mich.models.normaliser.LayerwiseBOLDNormalizer
+  H: ${model.grid_size}
+  W: ${model.grid_size}
   eps: 1.0e-6
-  freeze_after_steps: 5000
+  freeze_after_steps: 320  # ~20 epochs of coverage at 16 steps/epoch (batch=128, n_train=2100)
+  neighbourhood_radius: ${model.spatial_radius}
+
 loss_config:
-  lambda_data: 1.0
-  lambda_physics: 1.0
-  lambda_src: 1.0
-  lambda_smooth: 1.0
-  warmup_steps_physics: 10000
-  warmup_steps_smooth: 5000
-  delay_steps_physics: 0
+  order: linear # choose between linear, quadratic, exact
+  lambda_data: 100.0
+  lambda_physics: 1000.0
+  warmup_steps_physics: 100
+  delay_steps_physics: 50
+  lambda_src: 10.0
+  lambda_smooth: 0.0
+  warmup_steps_smooth: 0
   delay_steps_smooth: 0
-  n_time: 2000
-  n_space: 400
-  dense_time_frac: 0.8
-  dense_time_lo: 0.05
-  dense_time_hi: 0.55
-  uniform_time_lo: 0.05
-  dense_spatial_frac: 0.8
-  dense_spatial_radius: 5
-  burn_in: 20
-  bold_loss:
-    type: "mse"
+  lambda_antisteady: 0.5        # set 0.0 to disable
+  antisteady_epsilon: 0.01      # variance threshold (hinge)
+  warmup_steps_antisteady: 0    # optional warm-up
+  delay_steps_antisteady: 0
+  lambda_supervision: 100.0
+  warmup_steps_supervision: 0
+  delay_steps_supervision: 0
+  supervise_x: false # TEMPORARY ablation switch -- adds direct MSE+Pearson supervision on
+                      # x against batch["neural"]. Not part of the normal objective (x is
+                      # meant to be recovered purely via physics consistency with s, since
+                      # real fMRI has no ground-truth neural signal). Only for diagnosing
+                      # whether varying-amplitude neural blocks are an identifiability
+                      # issue vs. an architecture-capacity issue.
+  supervise_dzdt: true # MSE/huber between the network's analytic
+                      # dz_hat/dt and a finite-difference derivative of the ground-truth
+                      # latents (see dzdt_supervision_signals), at each source voxel.
+                      # Unlike value-only supervision_loss, this is sharply sensitive to
+                      # timing/phase, since x is only ever recovered via dz/dt through the
+                      # physics residual and has no direct ground-truth check. Uses the
+                      # same ground-truth latents already used by supervision_loss
+                      # (s/f/v/q), not x itself, so it stays applicable without ground-truth x.
+  lambda_dzdt_supervision: 100.0 # weight applied when supervise_dzdt=true
+  warmup_steps_dzdt_supervision: 0
+  delay_steps_dzdt_supervision: 0
+  dzdt_supervision_signals: ["s", "f", "v", "q"] # which signals to compute dz/dt supervision loss on; must be a subset of the signals in the dataset
+  supervise_x_phase: false # Opt-in: coherent full-T, same-source-voxel loss pulling
+                    # x_hat toward x_rhs = Dp_s + kappa*s_hat + gamma*(f_hat-1). Unlike
+                    # the physics residual's scattered per-step collocation points (a
+                    # fresh random draw of times every step, see
+                    # _sample_collocation_indices), this compares whole ordered
+                    # trajectories at the fixed source voxel every step -- the same kind
+                    # of signal supervision_loss already gives s/f/v/q, but built
+                    # entirely from data-derived quantities so no ground-truth x is
+                    # needed.
+  lambda_x_phase: 10.0 # weight applied when supervise_x_phase=true (used as-is unless the
+                       # lambda_x_phase_start/_end anneal below is active)
+  warmup_steps_x_phase: 0
+  delay_steps_x_phase: 0
+  # Optional curriculum, shared anneal window for both of the below. No-op (holds the
+  # static values) unless x_phase_ratio_anneal_end_step > x_phase_ratio_anneal_start_step
+  # is set explicitly.
+  x_phase_ratio_anneal_start_step: 0
+  x_phase_ratio_anneal_end_step: 0
+  # (a) x_phase_loss's internal lambda_npearson/lambda_pearson: MSE-favoring (stable,
+  # penalizes overshoot directly) -> pearson-favoring (sharper phase alignment, more ringing).
+  x_phase_npearson_start: 10.0
+  x_phase_npearson_end: 1.0
+  x_phase_pearson_start: 1.0
+  x_phase_pearson_end: 10.0
+  # (b) lambda_x_phase itself, ramped upward so x_phase's share of the total gradient
+  # doesn't fade late in training (measured: ~6.6% of total_loss early -> ~1.9% late,
+  # while dzdt_supervision grew from ~0.3% to ~63% over the same run).
+  lambda_x_phase_start: 10.0
+  lambda_x_phase_end: 80.0
+  n_space: 100 # colocation points
+  dense_spatial_frac: 0.95
+  dense_spatial_radius: ${model.spatial_radius}
+  n_time: 100
+  dense_time_frac: 0.0
+  dense_time_lo: 0.0
+  dense_time_hi: 0.70
+  uniform_time_lo: 0.0
+  burn_in: 0
+  supervision_loss:
+    type: "mse+pearson"
+    lambda_npearson: 10.0
     lambda_pearson: 1.0
-    huber_delta: 1.0
+    huber_delta: 0.1
+  bold_loss:
+    type: "mse+pearson"
+    lambda_npearson: 10.0
+    lambda_pearson: 1.0
+    huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
   ode_loss:
     type: "mse"
-    huber_delta: 1.0
+    huber_delta: 0.1 #used if type is "huber"
+  dzdt_loss:
+    type: "huber" # huber, not mse -- ds/dt at a sharp transition is an outlier relative
+                   # to the near-flat per-index differences elsewhere; squared error over-
+                   # weights it, huber caps its influence past huber_delta.
+  x_phase_loss:
+    type: "mse+pearson" # pearson is what makes this loss shape/phase-sensitive, not
+                         # just magnitude-sensitive -- see supervise_x_phase above.
+    lambda_npearson: 10.0
+    lambda_pearson: 1.0
+    huber_delta: 0.1
 
-haemo:
-  kappa: 0.65       # Vasodilatory signal decay rate
-  gamma: 0.41       # Autoregulatory feedback rate
-  alpha: 0.32       # Grubb's exponent
-  tau: 2.66          # Mean transit time (s)
-  lambda_d: 0.5
+# haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
+# HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
 
-acquisition:
-  f0: 28.625        # Frequency offset at outer vessel surface (Hz)
-  E0: 0.34          # Resting oxygen extraction fraction
-  TE: 0.25          # Echo time (s)
-  r0: 340           # Intravascular relaxation rate (Hz)
-  eps: 1.0e-32
-  k1: 10.4624375
-  k2: 2.433125e-32
-  k3: 1.0
+# Log validation-set prediction/latent plots to wandb only every Nth validation call
+# (scalar val metrics still log every validation call, unaffected) -- set > 1 to reduce
+# wandb media storage on long runs. 1 = log images every validation call (old behaviour).
+image_log_every_n_val_calls: 1
 
-V0: 0.5
-
-psf_fwhm: [18.0, 27.675, 40.05]  # per-layer Gaussian PSF FWHM in grid units (deep, mid, superficial)
+# Set any of these to true to make that physiological constant a learnable parameter
+# (initialized from the simulation-injected value above, optimized in log-space so it
+# can't go non-positive) instead of a fixed constant. lambda_d and tau_d are not yet
+# supported here. k1/k2/k3 are recomputed from E0 each forward pass when E0 is learnable.
+learnable_physio:
+  kappa: false
+  gamma: false
+  alpha: false
+  tau: false
+  V0: false
+  E0: false
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -134,7 +225,7 @@ optimizer:
 scheduler:
   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
   _partial_: true
-  T_max: 312500
+  T_max: null       # auto-computed by train_mich.py from dataset size, split, batch size, and max_epochs (see _inject_scheduler_steps); set an explicit int to override
   eta_min: 1.0e-6
 
 lightning:

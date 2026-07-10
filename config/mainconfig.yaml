@@ -11,11 +11,11 @@ defaults:
   - loggers: default.yaml
   - hydra: default.yaml
   - callbacks: default.yaml
-  - experiment: null
+  - experiments: null
 
 seed: null # For reproducibility, remove it for generative models.
 project_name: mich-bold-inversion # Determines output directory path and wandb project
-network_name: single-layer # Used for both saving and wandb
+network_name: single_layer_linearised # Used for both saving and wandb
 train: True # Set False to skip model training
 ckpt_path: null # Checkpoint path to resume training
 print_config: False # Print the final config to the console

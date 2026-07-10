@@ -3,7 +3,7 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
-from src.data.neuronal import LayeredDiffusionSimulator, NeuralSimulatorParams
+from mich.data.neuronal import LayeredDiffusionSimulator, NeuralSimulatorParams
 
 # -------------------------
 # Helpers / test doubles

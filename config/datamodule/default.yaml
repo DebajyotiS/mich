@@ -1,18 +1,18 @@
-_target_: src.data.synthetic.SyntheticDataModule
+_target_: mich.data.synthetic.SyntheticDataModule
 
 data:
-  path: ${paths.data_dir}
-  layers: [layer_0, layer_1, layer_2]
+  path: ${paths.data_dir}/simulations-single_layer_single_source.h5
+  layers: auto   # auto-discovers all layer_* groups in the HDF5 file; set explicitly to use a subset
   dtype: float16
   return_meta: true
-  return_latents: false
+  return_latents: true
   val:
     return_latents: true
 
 split:
-  train_frac: 0.6
-  val_frac: 0.1
-  test_frac: 0.3
+  train_frac: 0.7
+  val_frac: 0.2
+  test_frac: 0.1
   train_count: null
   val_count: null
   test_count: null
@@ -20,15 +20,15 @@ split:
   shuffle: true
 
 loader:
-  batch_size: 2
+  batch_size: 32
   num_workers: 4
-  pin_memory: true
+  pin_memory: false
   persistent_workers: true
   prefetch_factor: 2
   drop_last: true
 
 h5_cache:
   rdcc_nbytes: 268435456   # 256MB per worker
-  rdcc_nslots: 200003     
+  rdcc_nslots: 200003
   rdcc_w0: 0.75
   swmr: false

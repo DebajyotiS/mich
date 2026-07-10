@@ -1,0 +1,90 @@
+# Base simulation config is a complete, directly runnable config using the "exact"
+# Balloon-Windkessel order (3-layer cortex with vascular drainage, 32x32 grid).
+# Variant files (exact/linear/quadratic) compose from this via defaults: [base]
+# and override only what differs for that order:
+#   - exact.yaml:     nothing but output_path (this *is* the exact config)
+#   - quadratic.yaml: order + output_path
+#   - linear.yaml:    order + output_path + the single-layer/no-drainage setup
+# simulation.order selects the Balloon-Windkessel approximation used in
+# src/data/balloon.py ("exact" | "linear" | "quadratic").
+#
+# Invariant enforced by scripts/run_sim.py: simulation.layers and bold.noise_scales
+# must each have exactly simulation.num_layers entries. bold.psf_fwhm is derived per layer from bold.voxel_mm / bold.psf_fwhm_mm (see
+# _derive_psf_fwhm in scripts/run_sim.py).
+
+num_simulations: 10
+seed: 42
+output_path: data/simulations.h5
+workers: 40          # null -> os.cpu_count(); 1 -> serial
+latent_downsample: 1   # downsample factor for stored latent states (s/f/v/q/v*/q*); x/bold always stored at full T
+
+# -- Haemodynamic constants ----------------------
+haemodynamic:
+  alpha: 0.32       # Grubb's exponent
+  E0: 0.34          # Resting oxygen extraction fraction
+  V0: 0.05           # Resting blood volume fraction
+  kappa: 1.92       # Vasodilatory signal decay rate; exp(mu0=0.65) from the paper's log-normal prior over kappa
+  gamma: 0.41       # Autoregulatory feedback rate
+
+# -- Acquisition (7T) ----------------------------
+acquisition:
+  TE: 0.25          # Echo time (s)
+  r0: 340           # Intravascular relaxation rate
+  f0: 28.625        # Frequency offset at outer vessel surface
+  eps: 1.0e-32      # intravascular signal weight; ~0 drops the intravascular term (extravascular-only approx)
+
+# -- Simulation ----------------------------------
+simulation:
+  order: "exact"    # Balloon-Windkessel approximation; see src/data/balloon.py
+  grid_size: [10, 10]
+  dt: 1.0
+  haemo_dt: 0.05
+  time_duration: 100
+  max_pulses: 10
+  pulse_type: rect
+  isi_min: 5        # minimum gap (s) between a pulse's end and the next pulse's onset
+  baseline_mode: random # or "fixed". random adds a small random offset (+/-10% of median pulse amplitude) to zero periods; fixed leaves them at 0.
+  amp_range: [0.3, 1.0]
+  width_range: [2.0, 10.0] # when pulse_type is rect, this sets the range of widths for the pulses. When pulse_type is exp_decay, this parameter is ignored.
+  exp_decay_rate: 1.0  # currently unused: not read by any code path (exp_decay pulses draw their own random decay rate instead)
+  neural_SNR: .inf
+  BOLD_SNR: 20.0    # noise *amplitude* is derived from this (see bold.noise_model note below); .inf disables BOLD noise entirely
+  diffusion_coefficient_inter: 0.0
+  diffusion_coefficient_intra: 12.0
+  decay_rate: 1.0   # s-1, neural decay timescale
+  tau_d: 1.0        # delay-filter timescale (s) for the drain-from delay; NOT the same as layer_tau below
+  num_layers: 3
+  min_active_layers: 1  # lower bound (inclusive) on how many of num_layers get an active source per simulation
+  max_active_layers: 1  # upper bound (inclusive); the rest still run, receiving only drainage from active layers
+  layer_tau: 2.66   # per-layer transit time (s), shared by all layers below via interpolation — override
+                    # simulation.layer_tau=<value> (e.g. for a parameter sweep) instead of editing
+                    # each layers[i].tau individually. Distinct from tau_d above.
+  # source configuration for multi-source, multi-layer sims
+  source_placement:
+    sources_per_layer: [1, 4]   # Set to [1, 1] for a single signal, or [min, max] for multiple
+    shared_position: false      # if true, every active layer's single source sits at the same
+                                 # (x, y) -- a cortical column; requires sources_per_layer == [1, 1]
+    shared_pulse: false         # if true, every active layer's source also reuses the exact same
+                                 # pulse train/waveform (not just position); requires shared_position: true
+  # One entry per layer, bottom (deep) to top (superficial); layer[i>0] drains from layer[i-1].
+  # Must have exactly num_layers entries.
+  layers:
+    - {tau: "${simulation.layer_tau}", lambda_d: 0.0}  # deep  — no drain source
+    - {tau: "${simulation.layer_tau}", lambda_d: 1.0}  # mid   — drains from deep
+    - {tau: "${simulation.layer_tau}", lambda_d: 1.0}  # sup   — drains from mid
+
+# -- BOLD post-processing ------------------------
+bold:
+  voxel_mm: 0.8               # physical pixel size (mm/pixel); psf_fwhm (grid units) is derived from this
+  psf_fwhm_mm: [0.83, 1.78]   # [deep, superficial] PSF FWHM in mm, interpolated across num_layers
+
+  # NOTE: noise_model/noise_scales below tune noise *amplitude only when
+  # simulation.BOLD_SNR is null/absent*. Every current variant sets BOLD_SNR to a
+  # finite value, so this per-layer noise tuning is currently inert (see priority
+  # order in src/data/balloon.py:BoldPostProcessingConfig). PSF blurring above is
+  # unconditional and always applied regardless of BOLD_SNR.
+  noise_model:
+    field: "7T"
+    V: 8.0
+    TR: 2.0
+  noise_scales: [1.0, 1.23, 1.16]   # one entry per layer, deep -> superficial

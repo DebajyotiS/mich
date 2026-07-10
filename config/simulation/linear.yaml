@@ -1,0 +1,23 @@
+# "Linear" Balloon-Windkessel variant: first-order Taylor expansion of the
+# volume/dHb ODEs around steady state (src/data/balloon.py, order == "linear").
+# Single-layer cortex (no drainage) on a small grid for fast iteration — overrides
+# every structural key that depends on num_layers/grid_size; bold.voxel_mm and
+# psf_fwhm_mm are unchanged from base (a single layer just uses the deep_mm value).
+defaults:
+  - base
+  - _self_
+
+output_path: data/simulations-linear.h5
+
+simulation:
+  order: "linear"
+  num_layers: 1
+  source_placement:
+    sources_per_layer: [1, 5]
+  grid_size: [10, 10]
+  diffusion_coefficient_intra: 2.0
+  layers:
+    - {tau: "${simulation.layer_tau}", lambda_d: 0.0}  # deep — no drain source
+
+bold:
+  noise_scales: [1.0]   # single layer

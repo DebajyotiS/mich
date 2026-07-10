@@ -1,0 +1,17 @@
+# Plain flat YAML for scripts/eval_mich.py --config <this file>.
+# Keys match the CLI dest names (underscores, not hyphens); any flag passed explicitly
+# on the command line overrides the matching key here.
+#
+# Usage:
+#   python scripts/eval_mich.py --config config/eval/single_layer_single_source.yaml
+#   python scripts/eval_mich.py --config config/eval/single_layer_single_source.yaml -n 16   # override n_samples
+
+project: mich-bold-inversion
+network: single_layer_single_source
+ckpt_tag: best
+
+data:
+  - data/simulations-single_layer_single_source.h5
+
+n_samples: 8
+n_gif_samples: 1

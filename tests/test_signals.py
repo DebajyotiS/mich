@@ -1,15 +1,15 @@
 import numpy as np
 import pytest
 
-from src.data.signals import (
+from mich.data.signals import (
     AlphaPulse,
     ExpDecayPulse,
-    GaussianPulse,
     Noise,
     Pulse,
     RectPulse,
     SincPulse,
     Sources,
+    TriangularPulse,
     _make_pulse,
 )
 
@@ -42,7 +42,7 @@ def test_exp_decay_pulse_generate_basic():
 
 def test_rect_pulse_generate_basic():
     t = _t_grid(1.0, 0.1)
-    p = RectPulse(amplitude=3.0, t_start=0.2, width=0.3)
+    p = RectPulse(amplitude=3.0, t_onset=0.2, width=0.3)
     y = p.generate(t)
 
     assert y.shape == t.shape
@@ -54,12 +54,12 @@ def test_gaussian_pulse_generate_triangle_shape_and_zero_width_returns_zero():
     t = _t_grid(1.0, 0.1)
 
     # width=0 should return all zeros (division-by-zero guard path)
-    p0 = GaussianPulse(amplitude=1.0, t_peak=0.5, width=0.0)
+    p0 = TriangularPulse(amplitude=1.0, t_peak=0.5, width=0.0)
     y0 = p0.generate(t)
     assert np.all(y0 == 0.0)
 
     # nonzero width: piecewise linear ramp up/down
-    p = GaussianPulse(amplitude=2.0, t_peak=0.5, width=0.4)
+    p = TriangularPulse(amplitude=2.0, t_peak=0.5, width=0.4)
     y = p.generate(t)
 
     t_start = 0.5 - 0.2
@@ -120,7 +120,7 @@ def test_alpha_pulse_generate_basic():
     [
         ("exp_decay", [1.0, 0.2, 2.0], ExpDecayPulse),
         ("rect", [1.0, 0.2, 0.3], RectPulse),
-        ("gaussian", [1.0, 0.5, 0.4], GaussianPulse),
+        ("gaussian", [1.0, 0.5, 0.4], TriangularPulse),
         ("sinc", [1.0, 0.5, 0.4, 3.0], SincPulse),
         ("alpha", [1.0, 0.2, 2.0, 3.0], AlphaPulse),
     ],
@@ -158,6 +158,54 @@ def test_pulse_generate_sums_multiple_peaks_and_respects_dt():
     assert np.all(y[(t >= 0.5) & (t < 0.6)] == 2.0)
     # [0.6,1.0): 0
     assert np.all(y[t >= 0.6] == 0.0)
+
+
+def test_pulse_generate_random_baseline_fills_only_interior_gaps():
+    peaks = [
+        [1.0, 0.2, 0.2],  # active t in [0.2, 0.4)
+        [2.0, 0.6, 0.2],  # active t in [0.6, 0.8)
+    ]
+
+    P1 = Pulse(
+        pulse_type="rect",
+        peaks=peaks,
+        duration=1.0,
+        dt=0.1,
+        baseline="random",
+        rng=np.random.default_rng(7),
+    )
+    t, y1 = P1.generate()
+
+    # determinism given a fixed rng seed
+    P2 = Pulse(
+        pulse_type="rect",
+        peaks=peaks,
+        duration=1.0,
+        dt=0.1,
+        baseline="random",
+        rng=np.random.default_rng(7),
+    )
+    _, y2 = P2.generate()
+    assert np.array_equal(y1, y2)
+
+    assert np.allclose(t, np.arange(0, 1.0, 0.1))
+
+    # pulse-active regions retain their exact deterministic values
+    assert np.allclose(y1[2:4], 1.0)
+    assert np.allclose(y1[6:8], 2.0)
+
+    # leading (pre-first-pulse) and trailing (post-last-pulse) zero regions are
+    # NOT randomized -- only the [1:-1] slice of zero_intervals is, i.e. strictly
+    # interior gaps between pulses.
+    assert np.allclose(y1[0:2], 0.0)
+    assert np.allclose(y1[8:10], 0.0)
+
+    # the single interior gap (t in [0.4, 0.6)) gets a nonzero-but-small baseline
+    median_amplitude = np.median([1.0, 2.0])
+    gap = y1[4:6]
+    assert np.all(gap != 0.0)
+    assert np.allclose(gap, gap[0])  # single scalar baseline added across the interval
+    assert np.all(np.abs(gap) <= 0.1 * median_amplitude + 1e-12)
 
 
 # -----------------------

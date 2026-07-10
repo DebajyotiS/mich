@@ -1,21 +1,23 @@
-_target_: src.models.mich.MICH
+_target_: mich.models.mich.MICH
 
-L: 3
+L: 1
 C: 32
-c_enc: 32
-c_dec: 32
+c_enc: 64
+c_dec: 64
+c_film: 32           # FiLM bottleneck per signal (~c_dec / 7, rounded up for groups)
+signal_embed_dim: 8
 num_freqs: 10
 min_freq: 5.0
 max_freq: 20.0
 tcn_kernel: 3
-spatial_radius: 5
-grid_size: 32
+spatial_radius: 1
+grid_size: 10 # this was 32
 
-embed_dim: 20 # This needs to be manually set. 2 x num_freqs
-out_channels: 21
+embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
+out_channels: 5
 
 heinzle_net:
-  _target_: src.models.blocks.HeinzleNet
+  _target_: mich.models.blocks.HeinzleNet
 
   layer_mixing_config:
     L: ${model.L}
@@ -70,21 +72,24 @@ heinzle_net:
     max_freq: ${model.max_freq}
 
   time_film_config:
-    embed_dim: ${model.embed_dim}
-    hidden_dim: ${model.c_dec}
+    embed_dim: ${model.embed_dim}  # overridden in SpatioTemporalDecoder.__init__
+    hidden_dim: ${model.c_film}
     activation: silu
-    c_dec: ${model.c_dec}
+    c_dec: ${model.c_film}         # overridden to c_film in SpatioTemporalDecoder.__init__
 
   spatial_decoder_config:
     cin: ${model.c_enc}
     c_dec: ${model.c_dec}
+    c_film: ${model.c_film}
+    signal_embed_dim: ${model.signal_embed_dim}
     out_channels: ${model.out_channels}
     activation: silu
     L: ${model.L}
     layer_embed_dim: 8
+    signals: [x, s, f, v, q]
 
 normaliser:
-  _target_: src.models.normaliser.LayerwiseBOLDNormalizer
+  _target_: mich.models.normaliser.LayerwiseBOLDNormalizer
   H: ${model.grid_size}
   W: ${model.grid_size}
   eps: 1.0e-6
@@ -92,51 +97,55 @@ normaliser:
   neighbourhood_radius: ${model.spatial_radius}
 
 loss_config:
-  lambda_data: 10.0
-  lambda_physics: 1.0
+  order: linear # choose between linear, quadratic, exact
+  lambda_data: 100.0
+  lambda_physics: 1000.0
+  warmup_steps_physics: 20
+  delay_steps_physics: 10
   lambda_src: 10.0
   lambda_smooth: 0.0
-  warmup_steps_physics: 20000
   warmup_steps_smooth: 0
-  delay_steps_physics: 2000
   delay_steps_smooth: 0
-  n_time: 80
-  n_space: 900
-  dense_time_frac: 0.85
-  dense_time_lo: 0.1
-  dense_time_hi: 0.70
-  uniform_time_lo: 0.1
-  dense_spatial_frac: 0.8
+  lambda_supervision: 10.0
+  warmup_steps_supervision: 0
+  delay_steps_supervision: 0
+  n_space: 225
+  dense_spatial_frac: 0.95
   dense_spatial_radius: ${model.spatial_radius}
+  n_time: 100
+  dense_time_frac: 0.0
+  dense_time_lo: 0.0
+  dense_time_hi: 0.70
+  uniform_time_lo: 0.0
   burn_in: 0
-  bold_loss:
-    type: "mse"
+  supervision_loss:
+    type: "mse+pearson"
+    lambda_npearson: 100.0
     lambda_pearson: 1.0
+    huber_delta: 0.1
+  bold_loss:
+    type: "mse+pearson"
+    lambda_npearson: 10.0
+    lambda_pearson: 1
     huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
   ode_loss:
     type: "mse"
     huber_delta: 0.1 #used if type is "huber"
 
-haemo:
-  kappa: 0.65
-  gamma: 0.41
-  alpha: 0.32
-  tau: 2.66
-  lambda_d: 0.5
+# haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
+# HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
 
-acquisition:
-  f0: 28.625
-  E0: 0.34
-  TE: 0.25
-  r0: 340
-  eps: 1.0e-32
-  k1: 10.4624375
-  k2: 2.433125e-32
-  k3: 1.0
-
-V0: 0.5
-
-psf_fwhm: [18.0, 27.675, 40.05]  # per-layer Gaussian PSF FWHM in grid units (deep, mid, superficial)
+# Set any of these to true to make that physiological constant a learnable parameter
+# (initialized from the simulation-injected value above, optimized in log-space so it
+# can't go non-positive) instead of a fixed constant. lambda_d and tau_d are not yet
+# supported here. k1/k2/k3 are recomputed from E0 each forward pass when E0 is learnable.
+learnable_physio:
+  kappa: false
+  gamma: false
+  alpha: false
+  tau: false
+  V0: false
+  E0: false
 
 optimizer:
   _target_: torch.optim.AdamW
