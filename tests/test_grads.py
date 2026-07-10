@@ -1,7 +1,6 @@
 """Tests for gradient and derivative functions in torch_utils."""
 
 import torch
-
 from mich.utils.torch_utils import (
     _neg_softplus_neg,
     _neg_softplus_neg_deriv,

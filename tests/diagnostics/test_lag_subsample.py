@@ -28,7 +28,6 @@ from common import (
     write_report,
     xcorr_lag,
 )
-
 from mich.data.balloon import CortexLayer, HaemodynamicConstants, HaemodynamicState, simulate_cortex
 
 EDGE_TOL = 0.05
@@ -136,7 +135,6 @@ def test_noise_free_calibration(diag_model, diag_device, diag_out_dir):
     scripts_dir = _Path(__file__).resolve().parents[2] / "scripts"
     if str(scripts_dir) not in _sys.path:
         _sys.path.insert(0, str(scripts_dir))
-    from eval_mich import gather_source_traces
 
     model, full_cfg = diag_model
     device = diag_device
