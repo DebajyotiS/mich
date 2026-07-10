@@ -48,7 +48,7 @@ class MICHLossMixin(CollocationMixin):
             if fwhm is not None and fwhm > 0:
                 kernel = torch.as_tensor(psf.kernel_2d(), dtype=torch.float32)
             else:
-                kernel = torch.tensor([[1.0]], dtype=torch.float32)
+                kernel = torch.tensor([[[[1.0]]]], dtype=torch.float32)
             self.register_buffer(f"_psf_kernel_{i}", kernel)
 
     def _apply_psf_blur(self, bold: torch.Tensor) -> torch.Tensor:

@@ -159,6 +159,54 @@ def test_pulse_generate_sums_multiple_peaks_and_respects_dt():
     assert np.all(y[t >= 0.6] == 0.0)
 
 
+def test_pulse_generate_random_baseline_fills_only_interior_gaps():
+    peaks = [
+        [1.0, 0.2, 0.2],  # active t in [0.2, 0.4)
+        [2.0, 0.6, 0.2],  # active t in [0.6, 0.8)
+    ]
+
+    P1 = Pulse(
+        pulse_type="rect",
+        peaks=peaks,
+        duration=1.0,
+        dt=0.1,
+        baseline="random",
+        rng=np.random.default_rng(7),
+    )
+    t, y1 = P1.generate()
+
+    # determinism given a fixed rng seed
+    P2 = Pulse(
+        pulse_type="rect",
+        peaks=peaks,
+        duration=1.0,
+        dt=0.1,
+        baseline="random",
+        rng=np.random.default_rng(7),
+    )
+    _, y2 = P2.generate()
+    assert np.array_equal(y1, y2)
+
+    assert np.allclose(t, np.arange(0, 1.0, 0.1))
+
+    # pulse-active regions retain their exact deterministic values
+    assert np.allclose(y1[2:4], 1.0)
+    assert np.allclose(y1[6:8], 2.0)
+
+    # leading (pre-first-pulse) and trailing (post-last-pulse) zero regions are
+    # NOT randomized -- only the [1:-1] slice of zero_intervals is, i.e. strictly
+    # interior gaps between pulses.
+    assert np.allclose(y1[0:2], 0.0)
+    assert np.allclose(y1[8:10], 0.0)
+
+    # the single interior gap (t in [0.4, 0.6)) gets a nonzero-but-small baseline
+    median_amplitude = np.median([1.0, 2.0])
+    gap = y1[4:6]
+    assert np.all(gap != 0.0)
+    assert np.allclose(gap, gap[0])  # single scalar baseline added across the interval
+    assert np.all(np.abs(gap) <= 0.1 * median_amplitude + 1e-12)
+
+
 # -----------------------
 # Sources
 # -----------------------

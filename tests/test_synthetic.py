@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+import re
 
 import h5py
 import numpy as np
@@ -151,6 +152,19 @@ def test_split_train_frac_not_sum_to_one_raises():
         compute_split_counts(100, {"train_frac": 0.7, "val_frac": 0.1, "test_frac": 0.1})
 
 
+def test_split_train_frac_not_sum_to_one_message_mentions_actual_sum():
+    trf, vf, tf = 0.5, 0.3, 0.3
+    expected_sum = trf + vf + tf
+    with pytest.raises(ValueError, match=re.escape(f"Got {expected_sum}")):
+        compute_split_counts(100, {"train_frac": trf, "val_frac": vf, "test_frac": tf})
+
+
+@pytest.mark.parametrize("bad_trf", [-0.1, 1.1])
+def test_split_train_frac_out_of_range_raises(bad_trf):
+    with pytest.raises(ValueError, match=r"train_frac must be in \[0,1\]"):
+        compute_split_counts(100, {"train_frac": bad_trf, "val_frac": 0.1, "test_frac": 0.1})
+
+
 @pytest.mark.parametrize("n", [1, 2, 3, 10])
 def test_split_fracs_small_n_sums_to_n(n):
     tr, va, te = compute_split_counts(n, {"val_frac": 0.2, "test_frac": 0.2})
@@ -280,6 +294,18 @@ def test_dataset_return_latents_false_excludes_latent_keys(tmp_path):
     item = ds[0]
     for key in ("s", "f", "v", "q", "v_star", "q_star"):
         assert key not in item
+
+
+def test_dataset_return_latents_single_layer_excludes_v_star_q_star(tmp_path):
+    # v_star/q_star are only loaded when len(self.layers) > 1; with a single layer
+    # the guard should skip them even though the on-disk datasets exist.
+    p = str(tmp_path / "d.h5")
+    _make_h5(p, n=3, layers=("layer_0",))
+    ds = SyntheticH5Dataset(p, cache_cfg=_CACHE_CFG, return_latents=True, layers=("layer_0",))
+    item = ds[0]
+    assert "s" in item and "f" in item and "v" in item and "q" in item
+    assert "v_star" not in item
+    assert "q_star" not in item
 
 
 def test_dataset_latent_shapes_match_expected(tmp_path):
@@ -459,3 +485,29 @@ class TestSyntheticDataModule:
         dm.setup()
         batch = next(iter(dm.val_dataloader()))
         assert batch["bold"].shape == (2, len(_DM_LAYERS), 8, 4, 4)
+
+    def test_resolve_split_cfg_applies_overrides_and_strips_split_keys(self, tmp_path):
+        dm = SyntheticDataModule(
+            data={
+                "path": "dummy.h5",
+                "layers": ["layer_0"],
+                "dtype": "float32",
+                "train": {"dtype": "float16"},
+                "val": {"return_meta": True},
+            },
+            split={},
+            loader={},
+            h5_cache={},
+        )
+
+        train_cfg = dm._resolve_split_cfg("train")
+        assert train_cfg["dtype"] == "float16"  # per-split override applied
+        assert train_cfg["path"] == "dummy.h5"  # base config preserved
+        for key in ("train", "val", "test"):
+            assert key not in train_cfg
+
+        val_cfg = dm._resolve_split_cfg("val")
+        assert val_cfg["return_meta"] is True  # per-split override applied
+        assert val_cfg["dtype"] == "float32"  # unaffected by train's override
+        for key in ("train", "val", "test"):
+            assert key not in val_cfg
