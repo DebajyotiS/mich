@@ -35,6 +35,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         scheduler: Mapping,
         loss_config: Mapping,
         learnable_physio: Mapping[str, bool] | None = None,
+        image_log_every_n_val_calls: int = 1,
         *args,
         **kwargs: Any,
     ):
@@ -43,6 +44,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         self.save_hyperparameters(logger=False, ignore=["heinzle_net", "normaliser"])
         self.heinzle_net = heinzle_net
         self.normaliser = normaliser
+        self._val_call_count = 0
         lc = self.hparams.loss_config
         self._bold_loss_fn = self._make_loss_fn(getattr(lc, "bold_loss", None))
         self._ode_loss_fn = self._make_loss_fn(getattr(lc, "ode_loss", None))
@@ -177,12 +179,52 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
 
         x_phase_loss = None
         lambda_x_phase_eff = 0.0
+        xp_npearson_eff = None
+        xp_pearson_eff = None
         if getattr(lc, "supervise_x_phase", False):
+            # Optional curriculum, shared anneal window for both:
+            #  (a) x_phase_loss's internal mse/pearson balance, MSE-favoring (stable, penalizes
+            #      overshoot directly) -> pearson-favoring (sharper phase alignment, more ringing).
+            #  (b) lambda_x_phase itself, ramped upward so x_phase's share of the total gradient
+            #      doesn't fade late in training even as dzdt_supervision's raw loss comes to
+            #      dominate the (naturally shrinking) other terms -- see the loss-scale audit
+            #      that motivated this: x_phase's weighted share fell from ~6.6% of total_loss
+            #      early in training to ~1.9% late, while dzdt_supervision grew from ~0.3% to
+            #      ~63%, i.e. x_phase's influence was fading exactly when fine phase-alignment
+            #      pressure matters most.
+            # Both are no-ops (hold their static values) unless anneal_end_step > anneal_start_step.
+            xp_cfg = getattr(lc, "x_phase_loss", None)
+            anneal_start_step = getattr(lc, "x_phase_ratio_anneal_start_step", 0)
+            anneal_end_step = getattr(lc, "x_phase_ratio_anneal_end_step", 0)
+            lambda_x_phase_target = getattr(lc, "lambda_x_phase", 0.0)
+            if anneal_end_step > anneal_start_step:
+                lambda_x_phase_target = self._anneal_between(
+                    getattr(lc, "lambda_x_phase_start", lambda_x_phase_target),
+                    getattr(lc, "lambda_x_phase_end", lambda_x_phase_target),
+                    anneal_start_step,
+                    anneal_end_step,
+                )
             lambda_x_phase_eff = self._get_scheduled_lambda(
-                getattr(lc, "lambda_x_phase", 0.0),
+                lambda_x_phase_target,
                 getattr(lc, "warmup_steps_x_phase", 0),
                 getattr(lc, "delay_steps_x_phase", 0),
             )
+            if xp_cfg is not None and anneal_end_step > anneal_start_step:
+                xp_cfg.lambda_npearson = self._anneal_between(
+                    getattr(lc, "x_phase_npearson_start", xp_cfg.lambda_npearson),
+                    getattr(lc, "x_phase_npearson_end", xp_cfg.lambda_npearson),
+                    anneal_start_step,
+                    anneal_end_step,
+                )
+                xp_cfg.lambda_pearson = self._anneal_between(
+                    getattr(lc, "x_phase_pearson_start", xp_cfg.lambda_pearson),
+                    getattr(lc, "x_phase_pearson_end", xp_cfg.lambda_pearson),
+                    anneal_start_step,
+                    anneal_end_step,
+                )
+            if xp_cfg is not None:
+                xp_npearson_eff = xp_cfg.lambda_npearson
+                xp_pearson_eff = xp_cfg.lambda_pearson
             if lambda_x_phase_eff > 0:
                 x_phase_loss = self._x_phase_loss(z_hat, dz_hat_dt, source_position, num_sources)
                 total_loss = total_loss + lambda_x_phase_eff * x_phase_loss
@@ -252,6 +294,34 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             self.log(
                 f"{stage}/loss/x_phase",
                 x_phase_loss,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=False,
+                sync_dist=True,
+                logger=_to_logger,
+            )
+        if xp_npearson_eff is not None:
+            self.log(
+                f"{stage}/x_phase_loss/lambda_npearson",
+                xp_npearson_eff,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=False,
+                sync_dist=True,
+                logger=_to_logger,
+            )
+            self.log(
+                f"{stage}/x_phase_loss/lambda_pearson",
+                xp_pearson_eff,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=False,
+                sync_dist=True,
+                logger=_to_logger,
+            )
+            self.log(
+                f"{stage}/x_phase_loss/lambda_x_phase_eff",
+                lambda_x_phase_eff,
                 on_step=on_step,
                 on_epoch=on_epoch,
                 prog_bar=False,
@@ -399,6 +469,38 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         self.num_sources_buffer.clear()
         self.true_z_hat_buffer.clear()
 
+        self._val_call_count += 1
+        log_images = (
+            self._val_call_count % max(1, getattr(self.hparams, "image_log_every_n_val_calls", 1))
+            == 0
+        )
+
+        # Neural recovery metrics over the full val set (not just the plot subset),
+        # averaged over every real source per sample (not just source slot 0) --
+        # padded slots (index >= num_sources) are masked out before averaging.
+        S = source_position.shape[1]
+        all_src_h = source_position[..., 0].long()  # [B, S]
+        all_src_w = source_position[..., 1].long()  # [B, S]
+        all_batch = (
+            torch.arange(z_hat.shape[0], device=z_hat.device).unsqueeze(1).expand(-1, S)
+        )  # [B, S]
+        all_pred_neural = z_hat[
+            all_batch, self._signal_index("x"), :, :, all_src_h, all_src_w
+        ]  # [B, S, L, T]
+        all_true_neural = neural[all_batch, :, :, all_src_h, all_src_w]  # [B, S, L, T]
+        src_mask = torch.arange(S, device=z_hat.device)[None, :] < num_sources[:, None]  # [B, S]
+        metrics = self._neural_recovery_metrics(
+            all_pred_neural[src_mask], all_true_neural[src_mask]
+        )
+        run = getattr(self, "_rank_run", None) or wandb.run
+        if run is not None:
+            run.log({"global_step": self.global_step, **metrics})
+        for k, v in metrics.items():
+            self.log(k, v, on_epoch=True, sync_dist=True, logger=True)
+
+        if not log_images:
+            return
+
         # Each rank logs its own plots to its own W&B run -- no gather needed.
         subset = min(10, bold.shape[0])
         random_indices = torch.randperm(bold.shape[0])[:subset]
@@ -433,29 +535,6 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         pred_bold = pred_bold_full[batch_idx, :, :, subset_h, subset_w]  # [B, L, T]
 
         pred_neural = subset_z_hat[:, self._signal_index("x")]
-
-        # Neural recovery metrics over the full val set (not just the plot subset),
-        # averaged over every real source per sample (not just source slot 0) --
-        # padded slots (index >= num_sources) are masked out before averaging.
-        S = source_position.shape[1]
-        all_src_h = source_position[..., 0].long()  # [B, S]
-        all_src_w = source_position[..., 1].long()  # [B, S]
-        all_batch = (
-            torch.arange(z_hat.shape[0], device=z_hat.device).unsqueeze(1).expand(-1, S)
-        )  # [B, S]
-        all_pred_neural = z_hat[
-            all_batch, self._signal_index("x"), :, :, all_src_h, all_src_w
-        ]  # [B, S, L, T]
-        all_true_neural = neural[all_batch, :, :, all_src_h, all_src_w]  # [B, S, L, T]
-        src_mask = torch.arange(S, device=z_hat.device)[None, :] < num_sources[:, None]  # [B, S]
-        metrics = self._neural_recovery_metrics(
-            all_pred_neural[src_mask], all_true_neural[src_mask]
-        )
-        run = getattr(self, "_rank_run", None) or wandb.run
-        if run is not None:
-            run.log({"global_step": self.global_step, **metrics})
-        for k, v in metrics.items():
-            self.log(k, v, on_epoch=True, sync_dist=True, logger=True)
 
         self._plot_and_log_predictions(
             pred_bold=pred_bold,

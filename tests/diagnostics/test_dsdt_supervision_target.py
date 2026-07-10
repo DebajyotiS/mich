@@ -24,7 +24,13 @@ from __future__ import annotations
 
 import math
 
-from common import dt_physical, parabolic_subsample_lag, phase_slope_lag, upsampled_xcorr_lag, write_report
+from common import (
+    dt_physical,
+    parabolic_subsample_lag,
+    phase_slope_lag,
+    upsampled_xcorr_lag,
+    write_report,
+)
 
 
 def _flat(t):
@@ -54,7 +60,9 @@ def test_dp_s_vs_its_own_supervision_target(diag_val_data, diag_out_dir):
     T = Dp_s.shape[-1]
 
     Dp_s_phys = Dp_s / (T - 1)
-    fd_target = dt_physical(s_true, dim=-1)  # exactly what _derivative_supervision_loss trains against
+    fd_target = dt_physical(
+        s_true, dim=-1
+    )  # exactly what _derivative_supervision_loss trains against
     true_ds_dt = x_true - kappa * s_true - gamma * (f_true - 1.0)  # FD-free, exact (see LS8)
 
     report = {

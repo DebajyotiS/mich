@@ -85,7 +85,7 @@ def _mk_heinzle_configs(
             cin=Cenc,
             c_dec=c_dec,
             c_film=c_film,
-            out_channels=7 * L,
+            out_channels=7,
             activation="silu",
             L=L,
             upsample=False,
@@ -105,6 +105,7 @@ def _make_mich(*, L: int = _L) -> MICH:
             lr_lambda=_const_lr,
         ),
         loss_config=types.SimpleNamespace(
+            order="linear",
             n_time=4,
             n_space=4,
             dense_spatial_frac=0.8,
@@ -117,6 +118,7 @@ def _make_mich(*, L: int = _L) -> MICH:
             lambda_data=1.0,
             lambda_physics=0.1,
             lambda_smooth=0.01,
+            lambda_supervision=0.0,
             warmup_steps_physics=0,
             warmup_steps_smooth=0,
             delay_steps_physics=0,
@@ -129,6 +131,7 @@ def _make_mich(*, L: int = _L) -> MICH:
             alpha=0.32,
             tau=1.0,
             lambda_d=0.2,
+            tau_d=1.0,
         ),
         acquisition=types.SimpleNamespace(
             k1=0.02,

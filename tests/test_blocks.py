@@ -69,7 +69,7 @@ def _mk_heinzle_configs(*, L=3, Cmix=4, Cenc=6, c_dec=8, c_film=4):
         cin=Cenc,
         c_dec=c_dec,
         c_film=c_film,
-        out_channels=7 * L,
+        out_channels=7,
         activation="silu",
         L=L,
         upsample=False,
@@ -332,7 +332,7 @@ def test_spatiotemporal_decoder_output_shape_no_grads():
     cin = 5
     c_dec = 7
     c_film = 4
-    out_channels = 7 * L
+    out_channels = 7
 
     dec = SpatioTemporalDecoder(
         cin=cin,
@@ -363,7 +363,7 @@ def test_spatiotemporal_decoder_output_shape_with_grads_and_central_difference_c
     cin = 3
     c_dec = 5
     c_film = 3
-    out_channels = 7 * L
+    out_channels = 7
 
     dec = SpatioTemporalDecoder(
         cin=cin,
@@ -412,25 +412,31 @@ def test_fourier_time_embedding_forces_float32_and_can_cause_dtype_mismatch_if_m
     assert out.dtype == torch.float32  # intentional behavior in implementation
 
 
-def test_spatiotemporal_decoder_out_channels_is_accepted_as_legacy_param():
-    # out_channels is accepted for backwards compatibility but no longer validated.
+def test_spatiotemporal_decoder_out_channels_must_match_signal_count():
+    # out_channels is strictly validated against len(signals) (7 by default),
+    # independent of L: the layer dimension is handled internally via
+    # per-(signal, layer) output heads, not folded into out_channels.
     B, T, H, W = 1, 2, 3, 3
     L = 2
     cin = 3
     c_dec = 4
     c_film = 3
 
-    dec = SpatioTemporalDecoder(
+    common_kwargs = dict(
         cin=cin,
         c_dec=c_dec,
         c_film=c_film,
-        out_channels=7 * L,  # accepted but not used to size the conv
         activation="silu",
         L=L,
         temporal_embedding_config=dict(num_freqs=2, max_freq=2.0),
         temporal_film_config=dict(embed_dim=4, hidden_dim=8, activation="silu", c_dec=c_film),
         upsample=False,
     )
+
+    with pytest.raises(AssertionError, match="out_channels must match"):
+        SpatioTemporalDecoder(out_channels=7 * L, **common_kwargs)
+
+    dec = SpatioTemporalDecoder(out_channels=7, **common_kwargs)
 
     x = torch.randn(B, T, L, cin, H, W)
     t = torch.linspace(0, 1, T).unsqueeze(0).expand(B, -1)

@@ -66,8 +66,7 @@ def test_u_ablation(diag_val_data, diag_val_data_ablated, diag_out_dir):
         "lag_Dp_s_vs_D_emit_ablated": lag_ablated,
         "s_value_rmse_normal": s_hat_true_rmse_normal,
         "s_value_rmse_ablated": s_hat_true_rmse_ablated,
-        "s_value_rmse_degradation_ratio": s_hat_true_rmse_ablated
-        / (s_hat_true_rmse_normal + 1e-8),
+        "s_value_rmse_degradation_ratio": s_hat_true_rmse_ablated / (s_hat_true_rmse_normal + 1e-8),
     }
     write_report(report, diag_out_dir, "O1_u_ablation")
 

@@ -28,7 +28,7 @@ class RectPulse:
 
     def generate(self, t: np.ndarray) -> np.ndarray:
         signal = np.zeros_like(t)
-        mask = (t >= self.t_onset) & (t <= self.t_onset + self.width)
+        mask = (t >= self.t_onset) & (t < self.t_onset + self.width)
         signal[mask] += self.amplitude
         return signal
 
@@ -136,13 +136,10 @@ def _make_pulse(pulse_type: str, peak: Sequence[Any]) -> Any:
     if pulse_type == "rect":
         return RectPulse(*peak)
     if pulse_type == "gaussian":
-        raise DeprecationWarning("GaussianPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
         return TriangularPulse(*peak)
     if pulse_type == "sinc":
-        raise DeprecationWarning("SincPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
         return SincPulse(*peak)
     if pulse_type == "alpha":
-        raise DeprecationWarning("AlphaPulse is deprecated. Use ExpDecayPulse or RectPulse instead.")
         return AlphaPulse(*peak)
     raise ValueError(f"Unknown pulse type: {pulse_type}")
 

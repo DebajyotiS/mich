@@ -6,9 +6,12 @@ c_enc: 64
 c_dec: 64
 c_film: 32           # FiLM bottleneck per signal (~c_dec / 7, rounded up for groups)
 signal_embed_dim: 8
-num_freqs: 20
-min_freq: 2.0
-max_freq: 45.0
+num_freqs: 24   # log-spaced between min_freq/max_freq; raised from 20 to keep the same
+                # per-decade resolution now that the range is wider (1-48 vs the old 2-45)
+min_freq: 1.0   # was 2.0 -- skipped the single dominant mode (one cycle over the whole
+                # T-sample window) that carries 30-51% of f/v/q/v*/q*'s total power
+max_freq: 48.0  # was 45.0 -- just under Nyquist ((T-1)/2=49.5), to cover x/s's near-Nyquist
+                # edge content (99.9% of their power sits at ~freq 50)
 tcn_kernel: 3
 spatial_radius: 2
 grid_size: 10
@@ -140,9 +143,26 @@ loss_config:
                     # of signal supervision_loss already gives s/f/v/q, but built
                     # entirely from data-derived quantities so no ground-truth x is
                     # needed.
-  lambda_x_phase: 10.0 # weight applied when supervise_x_phase=true
+  lambda_x_phase: 10.0 # weight applied when supervise_x_phase=true (used as-is unless the
+                       # lambda_x_phase_start/_end anneal below is active)
   warmup_steps_x_phase: 0
   delay_steps_x_phase: 0
+  # Optional curriculum, shared anneal window for both of the below. No-op (holds the
+  # static values) unless x_phase_ratio_anneal_end_step > x_phase_ratio_anneal_start_step
+  # is set explicitly.
+  x_phase_ratio_anneal_start_step: 0
+  x_phase_ratio_anneal_end_step: 0
+  # (a) x_phase_loss's internal lambda_npearson/lambda_pearson: MSE-favoring (stable,
+  # penalizes overshoot directly) -> pearson-favoring (sharper phase alignment, more ringing).
+  x_phase_npearson_start: 10.0
+  x_phase_npearson_end: 1.0
+  x_phase_pearson_start: 1.0
+  x_phase_pearson_end: 10.0
+  # (b) lambda_x_phase itself, ramped upward so x_phase's share of the total gradient
+  # doesn't fade late in training (measured: ~6.6% of total_loss early -> ~1.9% late,
+  # while dzdt_supervision grew from ~0.3% to ~63% over the same run).
+  lambda_x_phase_start: 10.0
+  lambda_x_phase_end: 80.0
   n_space: 100 # colocation points
   dense_spatial_frac: 0.95
   dense_spatial_radius: ${model.spatial_radius}
@@ -178,6 +198,11 @@ loss_config:
 
 # haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
 # HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
+
+# Log validation-set prediction/latent plots to wandb only every Nth validation call
+# (scalar val metrics still log every validation call, unaffected) -- set > 1 to reduce
+# wandb media storage on long runs. 1 = log images every validation call (old behaviour).
+image_log_every_n_val_calls: 1
 
 # Set any of these to true to make that physiological constant a learnable parameter
 # (initialized from the simulation-injected value above, optimized in log-space so it

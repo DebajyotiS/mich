@@ -5,6 +5,7 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import torch
 import wandb
+from pytorch_lightning.loggers import WandbLogger
 
 from mich.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
@@ -69,7 +70,9 @@ class MICHLoggingMixin:
                 T = pred_neural.shape[2]
                 t_full = torch.arange(T).float()
                 t_short = torch.arange(T - 1).float()
-                ax.plot(t_full, true_neural[i, layer_index].cpu().float(), label="True x", color="green")
+                ax.plot(
+                    t_full, true_neural[i, layer_index].cpu().float(), label="True x", color="green"
+                )
                 ax.plot(
                     t_full,
                     pred_neural[i, layer_index].cpu().float(),
@@ -93,7 +96,8 @@ class MICHLoggingMixin:
                 )
                 n_src_here = int((valid_layers == layer_index).sum())
                 ax.set_title(
-                    f"{layer_names[layer_index]}" + (f" [{n_src_here} src]" if n_src_here > 0 else "")
+                    f"{layer_names[layer_index]}"
+                    + (f" [{n_src_here} src]" if n_src_here > 0 else "")
                 )
                 ax.legend(fontsize=6)
             fig.suptitle("x: head vs ODE reconstruction")
@@ -219,6 +223,8 @@ class MICHLoggingMixin:
             _direct_run.log(log_dict)
 
     def on_fit_start(self) -> None:
+        if not isinstance(self.trainer.logger, WandbLogger):
+            return
         if self.trainer.is_global_zero:
             wandb.define_metric("global_step")
             wandb.define_metric("*", step_metric="global_step")

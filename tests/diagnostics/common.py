@@ -110,9 +110,7 @@ def xcorr_curve(pred: torch.Tensor, true: torch.Tensor, dim: int = -1):
     true = true.movedim(dim, -1).float()
     T = pred.shape[-1]
     n = 2 * T
-    xcorr = torch.fft.irfft(
-        torch.fft.rfft(true, n=n) * torch.fft.rfft(pred, n=n).conj(), n=n
-    )
+    xcorr = torch.fft.irfft(torch.fft.rfft(true, n=n) * torch.fft.rfft(pred, n=n).conj(), n=n)
     lags = -torch.fft.fftfreq(n, d=1.0 / n).long().to(xcorr.device)  # sign-corrected, see xcorr_lag
     order = torch.argsort(lags)
     return xcorr[..., order], lags[order]
@@ -153,7 +151,9 @@ def parabolic_lag_at_edge(
     return parabolic_subsample_lag(pred_row[lo:hi], true_row[lo:hi]).item()
 
 
-def upsampled_xcorr_lag(pred: torch.Tensor, true: torch.Tensor, factor: int = 10, dim: int = -1) -> torch.Tensor:
+def upsampled_xcorr_lag(
+    pred: torch.Tensor, true: torch.Tensor, factor: int = 10, dim: int = -1
+) -> torch.Tensor:
     """Sub-sample lag via band-limited resampling (scipy.signal.resample, correct Nyquist-
     bin handling for real signals -- deliberately not a hand-rolled FFT zero-pad) followed
     by the same integer-argmax xcorr, then dividing by `factor`. Independent of the
@@ -215,7 +215,9 @@ def phase_slope_lag(
     coef, *_ = np.linalg.lstsq(sw[:, None] * A, sw * p, rcond=None)
     a, b = coef
     residual = p - (a + b * f)
-    residual_std = float(np.sqrt(np.average(residual**2, weights=w))) if w.sum() > 0 else float("nan")
+    residual_std = (
+        float(np.sqrt(np.average(residual**2, weights=w))) if w.sum() > 0 else float("nan")
+    )
 
     return {"delay": float(b / (2 * np.pi)), "phase_residual_std": residual_std}
 

@@ -42,7 +42,7 @@ def test_exp_decay_pulse_generate_basic():
 
 def test_rect_pulse_generate_basic():
     t = _t_grid(1.0, 0.1)
-    p = RectPulse(amplitude=3.0, t_start=0.2, width=0.3)
+    p = RectPulse(amplitude=3.0, t_onset=0.2, width=0.3)
     y = p.generate(t)
 
     assert y.shape == t.shape
