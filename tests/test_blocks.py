@@ -5,6 +5,7 @@ from dataclasses import is_dataclass
 import pytest
 import torch
 from mich.models.blocks import (  # noqa: E402
+    HEINZLE_SIGNAL_IDX,
     DepthWiseSeparableConvLayer,
     FourierTimeEmbedding,
     HeinzleNet,
@@ -15,6 +16,7 @@ from mich.models.blocks import (  # noqa: E402
     TemporalDepthWiseTCNLayer,
     TemporalMixingEncoder,
     TimeFiLM,
+    _init_heinzle_output_bias,
 )
 
 # -----------------------------
@@ -97,9 +99,73 @@ def test_spatial_decoder_manifest_is_dataclass_and_fields():
     assert m.dz_hat_dt is None
 
 
+def test_spatial_decoder_manifest_channel_indexes_correctly():
+    B, L, T, H, W = 2, 3, 4, 5, 6
+    z = torch.randn(B, 7, L, T, H, W)
+    m = SpatialDecoderManifest(z_hat=z)
+
+    for signal, idx in HEINZLE_SIGNAL_IDX.items():
+        assert torch.equal(m.channel(signal), z[:, idx])
+
+
+def test_spatial_decoder_manifest_channel_grad_raises_without_grads():
+    z = torch.randn(1, 7, 2, 3, 4, 4)
+    m = SpatialDecoderManifest(z_hat=z)
+    with pytest.raises(RuntimeError, match="Gradients were not requested"):
+        m.channel_grad("v")
+
+
+def test_spatial_decoder_manifest_channel_grad_indexes_correctly_when_set():
+    B, L, T, H, W = 1, 2, 3, 4, 4
+    z = torch.randn(B, 7, L, T, H, W)
+    grads = torch.randn(B, 7, L, T, H, W)
+    m = SpatialDecoderManifest(z_hat=z, grads=grads)
+
+    for signal, idx in HEINZLE_SIGNAL_IDX.items():
+        assert torch.equal(m.channel_grad(signal), grads[:, idx])
+
+
+# -----------------------------
+# _init_heinzle_output_bias
+# -----------------------------
+
+
+def test_init_heinzle_output_bias_raises_when_bias_missing():
+    conv = torch.nn.Conv2d(4, 7, kernel_size=1, bias=False)
+    with pytest.raises(ValueError, match="Expected out_conv to have a bias"):
+        _init_heinzle_output_bias(conv, L=2)
+
+
+def test_init_heinzle_output_bias_raises_when_out_channels_mismatch():
+    conv = torch.nn.Conv2d(4, 5, kernel_size=1, bias=True)
+    with pytest.raises(ValueError, match=r"got 5"):
+        _init_heinzle_output_bias(conv, L=2)
+
+
+def test_init_heinzle_output_bias_sets_expected_constants():
+    conv = torch.nn.Conv2d(4, 7, kernel_size=1, bias=True)
+    _init_heinzle_output_bias(conv, L=2)
+    bias = conv.bias.detach()
+
+    x_idx = HEINZLE_SIGNAL_IDX["x"]
+    assert bias[x_idx].item() == pytest.approx(-3.0)  # softplus_inv_0
+
+    for sig in ("f", "v", "q"):
+        assert bias[HEINZLE_SIGNAL_IDX[sig]].item() == pytest.approx(0.5413)  # softplus_inv_1
+
+    for sig in ("s", "vstar", "qstar"):
+        assert bias[HEINZLE_SIGNAL_IDX[sig]].item() == 0.0
+
+
 # -----------------------------
 # MaskedLayerMixing
 # -----------------------------
+
+
+def test_masked_layer_mixing_mask_l_equals_1_is_just_diagonal():
+    m = MaskedLayerMixing(L=1, C=3, init_identity=True)
+    mask2d = m.mask[:, :, 0, 0]
+    assert torch.equal(mask2d, torch.tensor([[1.0]]))
 
 
 def test_masked_layer_mixing_mask_structure_and_identity_init():
