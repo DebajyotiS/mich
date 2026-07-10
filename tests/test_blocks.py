@@ -4,6 +4,7 @@ from dataclasses import is_dataclass
 
 import pytest
 import torch
+
 from mich.models.blocks import (  # noqa: E402
     HEINZLE_SIGNAL_IDX,
     DepthWiseSeparableConvLayer,

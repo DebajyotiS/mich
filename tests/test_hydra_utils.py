@@ -12,6 +12,8 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import wandb
+from omegaconf import OmegaConf
+
 from mich.utils.hydra_utils import (
     instantiate_collection,
     log_hyperparameters,
@@ -19,7 +21,6 @@ from mich.utils.hydra_utils import (
     reload_original_config,
     save_config,
 )
-from omegaconf import OmegaConf
 
 # -----------------------------
 # Test doubles / helpers
