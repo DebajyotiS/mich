@@ -1,11 +1,3 @@
-# tests/test_balloon_bold.py
-#
-# Comprehensive pytest suite for the provided haemodynamics / BOLD module.
-# Adjust the import path at the top to match your repo.
-#
-# Recommended: run with
-#   pytest -q --disable-warnings --maxfail=1
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -334,7 +326,7 @@ def test_balloon_derivatives_basic_no_drain_numpy_scalar():
     c = _mk_consts()
     layer = _mk_layer(tau=2.0, x=1.0, s=0.1, f=1.2, v=1.1, q=0.9)
 
-    d = balloon_derivatives(layer, c)
+    d = balloon_derivatives(layer, c, order="exact")
     assert set(d.keys()) == {"ds_dt", "df_dt", "dv_dt", "dq_dt"}
     for v in d.values():
         assert np.isfinite(np.asarray(v)).all()
@@ -359,9 +351,9 @@ def test_balloon_derivatives_with_drain_adds_terms_and_requires_stars():
     )
 
     d_no_drain = balloon_derivatives(
-        _mk_layer(depth=1, tau=2.0, x=0.0, s=0.0, f=1.0, v=1.0, q=1.0), c
+        _mk_layer(depth=1, tau=2.0, x=0.0, s=0.0, f=1.0, v=1.0, q=1.0), c, order="exact"
     )
-    d_drain = balloon_derivatives(upper, c)
+    d_drain = balloon_derivatives(upper, c, order="exact")
 
     # dv_dt and dq_dt should differ due to coupling
     assert not np.isclose(np.asarray(d_drain["dv_dt"]), np.asarray(d_no_drain["dv_dt"]))
@@ -375,7 +367,7 @@ def test_balloon_derivatives_with_drain_adds_terms_and_requires_stars():
         depth=1, tau=2.0, x=0.0, s=0.0, f=1.0, v=1.0, q=1.0, lambda_d=0.8, drain_from=lower_bad
     )
     with pytest.raises(ValueError, match="v_star/q_star"):
-        balloon_derivatives(upper_bad, c)
+        balloon_derivatives(upper_bad, c, order="exact")
 
 
 def test_delay_filter_derivatives_requires_allocated_delayed_states():
@@ -410,7 +402,7 @@ def test_get_inversion_derivatives_union_of_keys():
         v_star=np.array(0.0, dtype=np.float64),
         q_star=np.array(0.0, dtype=np.float64),
     )
-    d = get_inversion_derivatives(layer, c, tau_d=2.0)
+    d = get_inversion_derivatives(layer, c, tau_d=2.0, order="exact")
     assert set(d.keys()) == {"ds_dt", "df_dt", "dv_dt", "dq_dt", "dv_star_dt", "dq_star_dt"}
 
 
@@ -455,10 +447,10 @@ def test_simulate_cortex_shape_validation():
     x0 = np.zeros((5, 4, 3), dtype=np.float64)
     x1 = np.zeros((6, 4, 3), dtype=np.float64)  # mismatched T
     with pytest.raises(ValueError, match="shape"):
-        simulate_cortex(layers, c, [x0, x1], dt=0.1, tau_d=1.0)
+        simulate_cortex(layers, c, [x0, x1], dt=0.1, tau_d=1.0, order="exact")
 
     with pytest.raises(ValueError, match="must match"):
-        simulate_cortex(layers, c, [x0], dt=0.1, tau_d=1.0)
+        simulate_cortex(layers, c, [x0], dt=0.1, tau_d=1.0, order="exact")
 
 
 def test_simulate_cortex_outputs_expected_keys_numpy_without_delays():
@@ -468,7 +460,7 @@ def test_simulate_cortex_outputs_expected_keys_numpy_without_delays():
         _mk_layer(depth=1, tau=1.0),
     ]
     x_inputs = [np.zeros((4, 5, 6), dtype=np.float64) for _ in layers]
-    out = simulate_cortex(layers, c, x_inputs, dt=0.1, tau_d=1.0)
+    out = simulate_cortex(layers, c, x_inputs, dt=0.1, tau_d=1.0, order="exact")
 
     assert set(out.keys()) == {0, 1}
     for depth in (0, 1):
@@ -488,7 +480,7 @@ def test_simulate_cortex_outputs_include_delays_when_allocated():
         q_star=np.zeros((3, 2), dtype=np.float64),
     )
     x_inputs = [np.zeros((5, 3, 2), dtype=np.float64)]
-    out = simulate_cortex([layer], c, x_inputs, dt=0.1, tau_d=2.0)
+    out = simulate_cortex([layer], c, x_inputs, dt=0.1, tau_d=2.0, order="exact")
 
     d = out[0]
     assert "v*" in d and "q*" in d
@@ -509,7 +501,7 @@ def test_simulate_cortex_works_with_torch_inputs_and_preserves_dtype_device():
     layer.state.v = torch.ones((3, 2), dtype=torch.float32, device=device)
     layer.state.q = torch.ones((3, 2), dtype=torch.float32, device=device)
 
-    out = simulate_cortex([layer], c, [x0], dt=0.1, tau_d=1.0)
+    out = simulate_cortex([layer], c, [x0], dt=0.1, tau_d=1.0, order="exact")
     d = out[0]
     assert isinstance(d["x"], torch.Tensor)
     assert d["x"].dtype == torch.float32
@@ -657,7 +649,7 @@ def test_simulate_cortex_nontrivial_input_stays_finite_and_physically_plausible(
     """Non-zero neural input produces finite outputs with physically valid states.
 
     Blood flow (f), volume (v), and deoxy-Hb content (q) must remain positive
-    throughout the simulation — a basic physical constraint of the Balloon model.
+    throughout the simulation, a basic physical constraint of the Balloon model.
     """
     np.random.seed(42)
     c = _mk_consts()
@@ -667,7 +659,7 @@ def test_simulate_cortex_nontrivial_input_stays_finite_and_physically_plausible(
     x0 = (np.random.randn(T, H, W) * 0.1).astype(np.float64)
     x1 = (np.random.randn(T, H, W) * 0.1).astype(np.float64)
     layers = [_mk_layer(depth=0, tau=1.0), _mk_layer(depth=1, tau=1.5)]
-    out = simulate_cortex(layers, c, [x0, x1], dt=dt, tau_d=1.0)
+    out = simulate_cortex(layers, c, [x0, x1], dt=dt, tau_d=1.0, order="exact")
 
     for depth in (0, 1):
         d = out[depth]
@@ -692,7 +684,7 @@ def test_simulate_cortex_near_resting_state_for_small_input():
     # Constant small input — physiology should stay near rest
     x0 = np.full((T, H, W), 0.05, dtype=np.float64)
     layer = _mk_layer(depth=0, tau=1.0)
-    out = simulate_cortex([layer], c, [x0], dt=0.01, tau_d=1.0)
+    out = simulate_cortex([layer], c, [x0], dt=0.01, tau_d=1.0, order="exact")
 
     v = out[0]["v"]
     q = out[0]["q"]
@@ -717,7 +709,7 @@ def test_simulate_cortex_zero_input_stays_at_resting_state():
     T, H, W = 10, 3, 3
     x0 = np.zeros((T, H, W), dtype=np.float64)
     layer = _mk_layer(depth=0, tau=1.0)  # f=1, v=1, q=1, s=0 at init
-    out = simulate_cortex([layer], c, [x0], dt=0.01, tau_d=1.0)
+    out = simulate_cortex([layer], c, [x0], dt=0.01, tau_d=1.0, order="exact")
 
     d = out[0]
     assert np.allclose(d["f"], 1.0, atol=1e-6), "f drifted from resting 1.0 under zero input"

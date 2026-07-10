@@ -138,9 +138,7 @@ def main(cfg: DictConfig) -> None:
         )  # type: ignore
         cfg = OmegaConf.merge(orig_cfg, cli_overrides)
 
-        user_pinned_t_max = any(
-            o.split("=")[0] == "model.scheduler.T_max" for o in overrides_task
-        )
+        user_pinned_t_max = any(o.split("=")[0] == "model.scheduler.T_max" for o in overrides_task)
         if not user_pinned_t_max:
             with open_dict(cfg):
                 cfg.model.scheduler.T_max = None

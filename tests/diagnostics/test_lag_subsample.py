@@ -184,7 +184,12 @@ def test_noise_free_calibration(diag_model, diag_device, diag_out_dir):
             drain_from=None,
         )
         out = simulate_cortex(
-            [layer], constants, [x_up], dt=haemo_dt, tau_d=float(haemo.tau_d), order=str(full_cfg.model.loss_config.order)
+            [layer],
+            constants,
+            [x_up],
+            dt=haemo_dt,
+            tau_d=float(haemo.tau_d),
+            order=str(full_cfg.model.loss_config.order),
         )
         v_clean = torch.from_numpy(out[0]["v"][::haemo_ratio]).float()
         q_clean = torch.from_numpy(out[0]["q"][::haemo_ratio]).float()

@@ -49,9 +49,7 @@ def test_required_bandwidth(diag_val_data, diag_out_dir):
         "max_freq_available": max_freq,
         "nyquist": nyquist,
         "bandwidth_containing_99pct_power": bandwidth_99,
-        "frac_power_above_max_freq": (
-            psd_mean[freqs > max_freq].sum() / total_power
-        ).item(),
+        "frac_power_above_max_freq": (psd_mean[freqs > max_freq].sum() / total_power).item(),
     }
     write_report(report, diag_out_dir, "B1_required_bandwidth")
 
@@ -123,9 +121,7 @@ def test_capacity_probe(diag_model, diag_device, diag_out_dir):
     lc = full_cfg.model.loss_config
     loader = build_val_loader(full_cfg)
     batch = next(iter(loader))
-    single = {
-        k: (v[:1].to(diag_device) if torch.is_tensor(v) else v) for k, v in batch.items()
-    }
+    single = {k: (v[:1].to(diag_device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
     before_edge_rms, before_full_rms = _edge_rms(model, single, diag_device)
 

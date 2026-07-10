@@ -48,8 +48,11 @@ def test_resimulated_s_f_match_recorded_at_zero_shift(diag_model, diag_out_dir):
 
     haemo = full_cfg.model.haemo
     constants = HaemodynamicConstants(
-        kappa=haemo.kappa, gamma=haemo.gamma, alpha=haemo.alpha,
-        E0=full_cfg.model.acquisition.E0, V0=full_cfg.model.V0,
+        kappa=haemo.kappa,
+        gamma=haemo.gamma,
+        alpha=haemo.alpha,
+        E0=full_cfg.model.acquisition.E0,
+        V0=full_cfg.model.V0,
     )
 
     N = neural.shape[0]
@@ -64,18 +67,28 @@ def test_resimulated_s_f_match_recorded_at_zero_shift(diag_model, diag_out_dir):
             x_shifted = np.roll(x_row, k)
             x_up = np.repeat(x_shifted, haemo_ratio)
             layer = CortexLayer(
-                depth=0, tau=float(haemo.tau),
+                depth=0,
+                tau=float(haemo.tau),
                 state=HaemodynamicState(x=0.0, s=0.0, f=1.0, v=1.0, q=1.0),
-                lambda_d=0.0, drain_from=None,
+                lambda_d=0.0,
+                drain_from=None,
             )
             out = simulate_cortex(
-                [layer], constants, [x_up], dt=haemo_dt, tau_d=float(haemo.tau_d),
+                [layer],
+                constants,
+                [x_up],
+                dt=haemo_dt,
+                tau_d=float(haemo.tau_d),
                 order=str(full_cfg.model.loss_config.order),
             )
             s_sim = out[0]["s"][::haemo_ratio]
             f_sim = out[0]["f"][::haemo_ratio]
-            s_gap = rms(torch.from_numpy(s_sim - s_true_row)) / (rms(torch.from_numpy(s_true_row)) + 1e-8)
-            f_gap = rms(torch.from_numpy(f_sim - f_true_row)) / (rms(torch.from_numpy(f_true_row)) + 1e-8)
+            s_gap = rms(torch.from_numpy(s_sim - s_true_row)) / (
+                rms(torch.from_numpy(s_true_row)) + 1e-8
+            )
+            f_gap = rms(torch.from_numpy(f_sim - f_true_row)) / (
+                rms(torch.from_numpy(f_true_row)) + 1e-8
+            )
             report_per_shift[k].append((s_gap, f_gap))
 
     report = {

@@ -390,14 +390,29 @@ class MICHLossMixin(CollocationMixin):
         losses = {"s": s_loss, "f": f_loss, "v": v_loss, "q": q_loss}
 
         if has_drain:
-            dv_star_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar") / t_norm_to_physical
+            dv_star_dt = (
+                self._gather_grad_at(dz_hat_dt, layer, idx, signal="vstar") / t_norm_to_physical
+            )
             v_star_target = (-v_star + v - 1) / tau_d
             losses["vstar"] = self._ode_loss_fn(dv_star_dt[:, burn_in:], v_star_target[:, burn_in:])
-            dq_star_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar") / t_norm_to_physical
+            dq_star_dt = (
+                self._gather_grad_at(dz_hat_dt, layer, idx, signal="qstar") / t_norm_to_physical
+            )
             q_star_target = (-q_star + q - 1) / tau_d
             losses["qstar"] = self._ode_loss_fn(dq_star_dt[:, burn_in:], q_star_target[:, burn_in:])
 
         return losses
+
+    def _anneal_between(
+        self, start_val: float, end_val: float, anneal_start_step: int, anneal_end_step: int
+    ) -> float:
+        """Linearly interpolate start_val -> end_val over [anneal_start_step,
+        anneal_end_step], clamped to start_val before and end_val after."""
+        if anneal_end_step <= anneal_start_step:
+            return end_val
+        frac = (self.global_step - anneal_start_step) / (anneal_end_step - anneal_start_step)
+        frac = min(1.0, max(0.0, frac))
+        return start_val + frac * (end_val - start_val)
 
     def _get_scheduled_lambda(
         self, lambda_target: float, warmup_steps: int, delay_steps: int = 0
@@ -596,9 +611,7 @@ class MICHLossMixin(CollocationMixin):
         kappa = self._physio("kappa")
         gamma = self._physio("gamma")
         tau = self._physio("tau")
-        target_vdot, target_qdot = self._balloon_v_q_dot_targets(
-            f_true, v_true, q_true, lc.order
-        )
+        target_vdot, target_qdot = self._balloon_v_q_dot_targets(f_true, v_true, q_true, lc.order)
         # NOTE: no cross-layer drain coupling here (unlike _compute_physics_layer_loss's
         # vstar/qstar-deeper term) -- not needed for the currently-configured signals
         # (s, f, v, q); would need extending before enabling "vstar"/"qstar" here for a
