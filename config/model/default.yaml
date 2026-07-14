@@ -109,19 +109,35 @@ loss_config:
   lambda_smooth: 0.0
   warmup_steps_smooth: 0
   delay_steps_smooth: 0
-  lambda_antisteady: 0.5        # set 0.0 to disable
-  antisteady_epsilon: 0.01      # variance threshold (hinge)
-  warmup_steps_antisteady: 0    # optional warm-up
-  delay_steps_antisteady: 0
+  lambda_source_activity: 0.5   # set 0.0 to disable. Encourages real x dynamics (not a
+                                # flat collapse) at the labelled source voxel.
+  source_activity_epsilon: 0.01  # variance threshold (hinge)
+  warmup_steps_source_activity: 0    # optional warm-up
+  delay_steps_source_activity: 0
+  lambda_quiescence_consistency: 0.0  # self-consistency off-source hallucination guard;
+                                      # 0.0 = off (opt-in). This is the ONLY off-source
+                                      # hallucination guard
+  warmup_steps_quiescence_consistency: 500  # ramp over 500 steps once active (see delay)
+  delay_steps_quiescence_consistency: 500 
+  quiescence_consistency_tau_s: 0.05   # |s| below this counts as "s at baseline"
+  quiescence_consistency_tau_f: 0.05   # |f - 1| below this counts as "f at baseline"
+  quiescence_consistency_eps_x: 0.05   # |x| above this, at a jointly-quiescent (s, f)
+                                      # voxel/timestep, is penalised as hallucination
+  # Wherever the model's OWN predicted s and f settle to baseline (s~=0, f~=1), the
+  # s-equation ODE residual (ds/dt = x - kappa*s - gamma*(f-1), already enforced by
+  # physics_loss) implies x must be ~0 there too -- this re-applies that same implied
+  # constraint DENSELY over the whole grid every step, since physics_loss itself is only
+  # evaluated at collocation points heavily biased toward the known source
+  # (dense_spatial_frac). Deliberately NOT a geometric distance-from-source radius (see
+  # git history / project memory for why that approach was abandoned): the correct
+  # radius would have been scenario-dependent (tied to the simulator's diffusion_coeff-
+  # icient_intra/decay_rate) and, even when correctly computed, collapsed grid coverage
+  # to near-zero for multi-source-per-layer scenarios. tau_s/tau_f/eps_x here are generic
+  # numerical tolerances, not physics constants -- no recomputation needed per scenario.
   lambda_supervision: 100.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
-  supervise_x: false # TEMPORARY ablation switch -- adds direct MSE+Pearson supervision on
-                      # x against batch["neural"]. Not part of the normal objective (x is
-                      # meant to be recovered purely via physics consistency with s, since
-                      # real fMRI has no ground-truth neural signal). Only for diagnosing
-                      # whether varying-amplitude neural blocks are an identifiability
-                      # issue vs. an architecture-capacity issue.
+  supervise_x: false 
   supervise_dzdt: true # MSE/huber between the network's analytic
                       # dz_hat/dt and a finite-difference derivative of the ground-truth
                       # latents (see dzdt_supervision_signals), at each source voxel.
@@ -134,15 +150,7 @@ loss_config:
   warmup_steps_dzdt_supervision: 0
   delay_steps_dzdt_supervision: 0
   dzdt_supervision_signals: ["s", "f", "v", "q"] # which signals to compute dz/dt supervision loss on; must be a subset of the signals in the dataset
-  supervise_x_phase: false # Opt-in: coherent full-T, same-source-voxel loss pulling
-                    # x_hat toward x_rhs = Dp_s + kappa*s_hat + gamma*(f_hat-1). Unlike
-                    # the physics residual's scattered per-step collocation points (a
-                    # fresh random draw of times every step, see
-                    # _sample_collocation_indices), this compares whole ordered
-                    # trajectories at the fixed source voxel every step -- the same kind
-                    # of signal supervision_loss already gives s/f/v/q, but built
-                    # entirely from data-derived quantities so no ground-truth x is
-                    # needed.
+  supervise_x_phase: false 
   lambda_x_phase: 10.0 # weight applied when supervise_x_phase=true (used as-is unless the
                        # lambda_x_phase_start/_end anneal below is active)
   warmup_steps_x_phase: 0
@@ -186,22 +194,14 @@ loss_config:
     type: "mse"
     huber_delta: 0.1 #used if type is "huber"
   dzdt_loss:
-    type: "huber" # huber, not mse -- ds/dt at a sharp transition is an outlier relative
+    type: "huber" #  ds/dt at a sharp transition is an outlier relative
                    # to the near-flat per-index differences elsewhere; squared error over-
                    # weights it, huber caps its influence past huber_delta.
   x_phase_loss:
-    type: "mse+pearson" # pearson is what makes this loss shape/phase-sensitive, not
-                         # just magnitude-sensitive -- see supervise_x_phase above.
+    type: "mse+pearson" # pearson is what makes this loss shape/phase-sensitive.
     lambda_npearson: 10.0
     lambda_pearson: 1.0
     huber_delta: 0.1
-
-# haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
-# HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
-
-# Log validation-set prediction/latent plots to wandb only every Nth validation call
-# (scalar val metrics still log every validation call, unaffected) -- set > 1 to reduce
-# wandb media storage on long runs. 1 = log images every validation call (old behaviour).
 image_log_every_n_val_calls: 1
 
 # Set any of these to true to make that physiological constant a learnable parameter
