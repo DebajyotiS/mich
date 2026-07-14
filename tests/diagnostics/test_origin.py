@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 import torch
 from common import _forward_and_gather, build_val_loader, dt_index, rms, write_report, xcorr_lag
-
 from mich.data.balloon import (
     CortexLayer,
     HaemodynamicConstants,

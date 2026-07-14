@@ -6,7 +6,6 @@ import types
 
 import pytest
 import torch
-
 from mich.models.mich_losses import MICHLossMixin
 from mich.models.physio import LearnablePhysioMixin
 

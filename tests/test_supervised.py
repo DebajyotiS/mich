@@ -28,12 +28,11 @@ import torch
 import torch.optim
 import torch.optim.lr_scheduler
 import wandb
+from mich.models.blocks import FullySupervisedNet
+from mich.models.supervised import SupervisedMICH
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import Callback
 from torch.utils.data import DataLoader, Dataset
-
-from mich.models.blocks import FullySupervisedNet
-from mich.models.supervised import SupervisedMICH
 
 # -------------------------
 # Module-level constants

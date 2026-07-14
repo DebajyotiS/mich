@@ -9,7 +9,6 @@ import h5py
 import numpy as np
 import pytest
 import torch
-
 from mich.data.synthetic import (
     SyntheticDataModule,
     SyntheticH5Dataset,

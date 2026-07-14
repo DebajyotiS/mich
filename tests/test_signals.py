@@ -1,6 +1,5 @@
 import numpy as np
 import pytest
-
 from mich.data.signals import (
     AlphaPulse,
     ExpDecayPulse,
