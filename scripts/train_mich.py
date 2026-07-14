@@ -47,7 +47,7 @@ def _resolve_total_steps(cfg: DictConfig) -> int:
 
 def _inject_scheduler_steps(cfg: DictConfig) -> None:
     """Auto-set scheduler.T_max from the actual dataset/split/batch/epoch config, unless
-    the user has pinned an explicit value (e.g. for a deliberately shorter warm-restart)."""
+    provided with an explicit value (e.g. for a deliberately shorter warm-restart)."""
     if cfg.model.scheduler.get("T_max") is not None:
         return
     total_steps = _resolve_total_steps(cfg)
@@ -121,14 +121,6 @@ def _inject_sim_physics(cfg: DictConfig, sim_cfg: dict) -> None:
 def main(cfg: DictConfig) -> None:
     log.info("Setting up job configuration")
     if cfg.resume.state:
-        log.info("Reloading original config and resuming training")
-        # Re-apply this invocation's own CLI overrides (e.g. trainer.max_epochs=800) on
-        # top of the reloaded original config -- otherwise reload_original_config's
-        # wholesale replacement of cfg would discard anything passed on the
-        # command line for this resume run beyond network_name/project_name/resume.state.
-        # overrides.task is a List[str]-typed field on a structured Hydra config, so at
-        # runtime it's an OmegaConf ListConfig, not a plain list -- OmegaConf.from_dotlist
-        # rejects anything that isn't a real list/tuple, hence the explicit list(...).
         overrides_task = list(HydraConfig.get().overrides.task)
         cli_overrides = OmegaConf.from_dotlist(overrides_task)
         orig_cfg = reload_original_config(

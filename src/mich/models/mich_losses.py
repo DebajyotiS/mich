@@ -134,22 +134,17 @@ class MICHLossMixin(CollocationMixin):
         q = CollocationMixin._gather_z_hat_at(z_hat, idx, signal="q")
         return MICHLossMixin._compute_bold(v, q, acquisition, V0)
 
-    def _antisteady_loss(
+    def _source_activity_loss(
         self,
         z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
         source_position: torch.Tensor,  # [B, S, 2]
         source_layer: torch.Tensor,  # [B, S]
         num_sources: torch.Tensor,  # [B]
+        eps: float,
     ) -> torch.Tensor:
-        """Two-sided variance penalty at each source voxel.
-
-        Positive term: at a source's own (layer, h, w), x should show real
-        dynamics over time (not settle to steady state).
-        Negative term: at that SAME (h, w) in every OTHER layer, there is no
-        neural source -- so despite possible BOLD drainage from the source
-        layer, x should stay flat. This teaches the model that BOLD can
-        exist without co-located neural activity (venous drainage) rather
-        than hallucinating neural signal wherever BOLD moves.
+        """At a source's own (layer, h, w), x should show real dynamics over time (not
+        settle to steady state). Penalises var(x) < eps at the labelled source voxel --
+        stops the trivial "predict a flat constant" collapse there.
         """
         B, _, L = z_hat.shape[:3]
         S = source_position.shape[1]
@@ -162,25 +157,77 @@ class MICHLossMixin(CollocationMixin):
         src_l = source_layer.clamp(min=0, max=L - 1).long()  # [B, S], padding clamped, masked below
 
         x_idx = self._signal_index("x")
-        eps = getattr(self.hparams.loss_config, "antisteady_epsilon", 0.01)
-
-        # x at each source's own voxel/layer: [B, S, T]
-        x_src = z_hat[b_idx, x_idx, src_l, :, src_h, src_w]
+        x_src = z_hat[b_idx, x_idx, src_l, :, src_h, src_w]  # [B, S, T]
         x_var = x_src.var(dim=-1)  # [B, S]
         pos_term = F.relu(eps - x_var)
-        pos_loss = (pos_term * mask).sum() / mask.sum().clamp(min=1)
+        return (pos_term * mask).sum() / mask.sum().clamp(min=1)
 
-        # x at the same (h, w) across every OTHER layer: [B, S, L, T]
-        x_all_layers = z_hat[b_idx, x_idx, :, :, src_h, src_w]
-        x_var_other = x_all_layers.var(dim=-1)  # [B, S, L]
-        other_layer_mask = torch.arange(L, device=device)[None, None, :] != src_l[:, :, None]
-        other_mask = mask[:, :, None] & other_layer_mask  # [B, S, L]
-        eps_neg = getattr(self.hparams.loss_config, "antisteady_neg_epsilon", eps)
-        neg_term = F.relu(x_var_other - eps_neg)
-        neg_loss = (neg_term * other_mask).sum() / other_mask.sum().clamp(min=1)
+    def _quiescence_consistency_loss(
+        self,
+        z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
+        tau_s: float,
+        tau_f: float,
+        eps_x: float,
+    ) -> torch.Tensor:
+        """Self-consistency off-source guard, using the model's OWN predicted s/f as the
+        "is this quiescent" signal instead of a geometric distance-from-source radius.
 
-        lambda_neg = getattr(self.hparams.loss_config, "lambda_antisteady_neg", 1.0)
-        return pos_loss + lambda_neg * neg_loss
+        The s-equation ODE residual (already enforced elsewhere by physics_loss) is
+        ds/dt = x - kappa*s - gamma*(f-1). If s sits at its steady baseline (s~=0) for a
+        stretch of time, ds/dt~=0 there, which forces x = kappa*s + gamma*(f-1) ~= 0
+        whenever f is ALSO at its baseline (f~=1). So wherever the model's own s and f
+        jointly say "nothing is happening here" (pointwise, per voxel per timestep), x
+        should be ~0 too -- and if it isn't, that's an internal inconsistency in the
+        model's own output, not something that needs to be compared against any known
+        source position, diffusion constant, or grid geometry at all.
+
+        This replaces an earlier geometric "exclude a radius around each known source"
+        design (see git history / project memory), which had two real problems: (a) the
+        correct radius is scenario-dependent (derived from
+        mich.data.neuronal.LayeredDiffusionSimulator's diffusion_coefficient_intra/
+        decay_rate) and there's no single safe value across all simulation configs in
+        general, and (b) even the correct radius, once measured, collapsed grid coverage
+        to near-zero for multi-source-per-layer scenarios (Monte Carlo: ~9% chance of a
+        *complete* no-op at 4 simultaneous sources on this project's 10x10 grid). This
+        gate has neither problem: it needs no external physics constant (tau_s/tau_f are
+        generic "how close to exact baseline" numerical tolerances, not tied to any
+        scenario's diffusion parameters), and it's evaluated per (voxel, timestep)
+        directly from z_hat, so it never "runs out of coverage" regardless of how many
+        sources are active or how close together they are. It's also naturally time-
+        resolved: a voxel quiescent early but genuinely active later (e.g. reached by
+        real diffusion) is correctly excluded the moment its OWN s/f move off baseline,
+        with no dependence on pulse timing at all.
+
+        It also replaces an earlier cross-layer negative term (same (h, w) in every
+        OTHER layer should be flat, modelling venous drainage without neural activity
+        following it) -- removed because it assumed "not this source's own layer" meant
+        "no source there," which is false for config/simulation/three_layer_single_
+        source_shared_position*.yaml (2-3 layers deliberately share a genuine,
+        independently-active source at the same column), and more generally whenever ANY
+        layer above/below the labelled source has its own source. This gate subsumes
+        that intent correctly with no such assumption: it checks the model's OWN s/f at
+        every voxel (including that same-column-other-layer case), so a genuinely active
+        neighbour layer is naturally exempt (non-baseline s/f) rather than needing to be
+        specially excluded by position.
+
+        Note this densely re-applies, over the whole grid every step, the exact same
+        constraint the physics loss's s-equation residual already implies -- it's needed
+        in addition because physics_loss is only evaluated at sparse collocation points
+        that are heavily biased toward the known source (dense_spatial_frac), so this
+        constraint is otherwise barely enforced away from the source at all.
+        """
+        x_idx, s_idx, f_idx = (
+            self._signal_index("x"),
+            self._signal_index("s"),
+            self._signal_index("f"),
+        )
+        s = z_hat[:, s_idx]
+        f = z_hat[:, f_idx]
+        x = z_hat[:, x_idx]
+
+        quiescent = (s.abs() < tau_s) & ((f - 1.0).abs() < tau_f)  # [B, L, T, H, W]
+        penalty = F.relu(x.abs() - eps_x)
+        return (penalty * quiescent).sum() / quiescent.sum().clamp(min=1)
 
     def _data_loss(
         self,

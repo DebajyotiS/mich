@@ -370,7 +370,18 @@ class TestMICHOptionalLossWiring:
     @pytest.mark.parametrize(
         "loss_overrides",
         [
-            pytest.param(dict(lambda_antisteady=1.0, antisteady_epsilon=0.01), id="antisteady"),
+            pytest.param(
+                dict(lambda_source_activity=1.0, source_activity_epsilon=0.01),
+                id="source_activity",
+            ),
+            pytest.param(
+                dict(
+                    lambda_quiescence_consistency=1.0,
+                    delay_steps_quiescence_consistency=0,
+                    warmup_steps_quiescence_consistency=0,
+                ),
+                id="quiescence_consistency",
+            ),
             pytest.param(dict(lambda_supervision=1.0), id="supervision"),
             pytest.param(
                 dict(
@@ -387,7 +398,10 @@ class TestMICHOptionalLossWiring:
             ),
             pytest.param(
                 dict(
-                    lambda_antisteady=1.0,
+                    lambda_source_activity=1.0,
+                    lambda_quiescence_consistency=1.0,
+                    delay_steps_quiescence_consistency=0,
+                    warmup_steps_quiescence_consistency=0,
                     lambda_supervision=1.0,
                     supervise_dzdt=True,
                     lambda_dzdt_supervision=1.0,
@@ -544,8 +558,11 @@ class TestMICHSharedStepInternals:
         fake_run = MagicMock()
         monkeypatch.setattr(wandb, "run", fake_run)
         model = _make_mich(
-            lambda_antisteady=1.0,
-            antisteady_epsilon=0.01,
+            lambda_source_activity=1.0,
+            source_activity_epsilon=0.01,
+            lambda_quiescence_consistency=1.0,
+            delay_steps_quiescence_consistency=0,
+            warmup_steps_quiescence_consistency=0,
             lambda_supervision=1.0,
             supervise_dzdt=True,
             lambda_dzdt_supervision=1.0,
@@ -562,8 +579,10 @@ class TestMICHSharedStepInternals:
             "train/loss/total",
             "train/loss/data",
             "train/loss/physics",
-            "train/loss/antisteady",
-            "train/loss_weighted/antisteady",
+            "train/loss/source_activity",
+            "train/loss_weighted/source_activity",
+            "train/loss/quiescence_consistency",
+            "train/loss_weighted/quiescence_consistency",
             "train/loss/supervision",
             "train/loss_weighted/supervision",
             "train/loss/dzdt_supervision",
@@ -571,9 +590,46 @@ class TestMICHSharedStepInternals:
             "train/loss/x_phase",
             "train/loss_weighted/x_phase",
             "parameters/lambda_physics",
-            "parameters/lambda_antisteady",
+            "parameters/lambda_source_activity",
+            "parameters/lambda_quiescence_consistency",
         ):
             assert key in log_dict, f"missing {key}"
+
+    def test_quiescence_consistency_absent_before_delay_steps(self, monkeypatch):
+        # s=0, f=1 is the trivial baseline every signal starts near before data_loss/
+        # physics_loss have shaped real dynamics -- delay_steps_quiescence_consistency
+        # must keep this term fully out of total_loss (not just down-weighted) until
+        # global_step clears the delay window.
+        fake_run = MagicMock()
+        monkeypatch.setattr(wandb, "run", fake_run)
+        model = _make_mich(
+            lambda_quiescence_consistency=1.0,
+            delay_steps_quiescence_consistency=100,
+            warmup_steps_quiescence_consistency=50,
+        )
+        self._attach_fake_trainer(model, log_every_n_steps=1, global_step=50)
+        batch = _make_full_batch()
+        model._shared_step(batch, stage="train")
+
+        (log_dict,), _ = fake_run.log.call_args
+        assert log_dict["parameters/lambda_quiescence_consistency"] == pytest.approx(0.0)
+        assert "train/loss/quiescence_consistency" not in log_dict
+
+    def test_quiescence_consistency_present_after_delay_steps(self, monkeypatch):
+        fake_run = MagicMock()
+        monkeypatch.setattr(wandb, "run", fake_run)
+        model = _make_mich(
+            lambda_quiescence_consistency=1.0,
+            delay_steps_quiescence_consistency=100,
+            warmup_steps_quiescence_consistency=50,
+        )
+        self._attach_fake_trainer(model, log_every_n_steps=1, global_step=1000)
+        batch = _make_full_batch()
+        model._shared_step(batch, stage="train")
+
+        (log_dict,), _ = fake_run.log.call_args
+        assert log_dict["parameters/lambda_quiescence_consistency"] == pytest.approx(1.0)
+        assert "train/loss/quiescence_consistency" in log_dict
 
     def test_wandb_detailed_logging_noop_off_cadence(self, monkeypatch):
         fake_run = MagicMock()

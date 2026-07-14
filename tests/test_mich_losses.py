@@ -67,8 +67,13 @@ def _mk_loss_config(**overrides):
     return types.SimpleNamespace(**base)
 
 
-def _mk_host(**loss_cfg_overrides):
-    return _LossHost(_mk_loss_config(**loss_cfg_overrides), _mk_haemo(), _mk_acquisition())
+def _mk_host(global_step=0, **loss_cfg_overrides):
+    return _LossHost(
+        _mk_loss_config(**loss_cfg_overrides),
+        _mk_haemo(),
+        _mk_acquisition(),
+        global_step=global_step,
+    )
 
 
 # -----------------------------
@@ -384,47 +389,44 @@ def test_apply_psf_blur_positive_fwhm_actually_blurs_and_is_per_layer():
 
 
 # -----------------------------
-# _antisteady_loss
+# _source_activity_loss
 # -----------------------------
 
 
-def test_antisteady_loss_penalizes_flat_source_and_noisy_other_layers():
-    host = _mk_host(antisteady_epsilon=0.01)
+def test_source_activity_loss_penalizes_flat_source():
+    host = _mk_host()
     B, L, T, H, W = 1, 2, 20, 6, 6
     z_hat = torch.zeros(B, 7, L, T, H, W)
     x_idx = host._signal_index("x")
     # Source at (h=2,w=3) in layer 0: flat over time -> should be penalized (var ~ 0 < eps).
     z_hat[:, x_idx, 0, :, 2, 3] = 1.0
-    # Same (h,w) in the OTHER layer (layer 1): noisy -> should be penalized (var > eps_neg).
-    z_hat[:, x_idx, 1, :, 2, 3] = torch.randn(T)
 
     source_position = torch.tensor([[[2, 3]]])
     source_layer = torch.tensor([[0]])
     num_sources = torch.tensor([1])
 
-    loss = host._antisteady_loss(z_hat, source_position, source_layer, num_sources)
+    loss = host._source_activity_loss(z_hat, source_position, source_layer, num_sources, eps=0.01)
     assert torch.isfinite(loss)
     assert loss > 0.0
 
 
-def test_antisteady_loss_zero_when_source_dynamic_and_others_flat():
-    host = _mk_host(antisteady_epsilon=0.01)
+def test_source_activity_loss_zero_when_source_dynamic():
+    host = _mk_host()
     B, L, T, H, W = 1, 2, 20, 6, 6
     z_hat = torch.zeros(B, 7, L, T, H, W)
     x_idx = host._signal_index("x")
     z_hat[:, x_idx, 0, :, 2, 3] = torch.linspace(0, 1, T)  # real dynamics, var > eps
-    # other layer at same voxel stays exactly flat (0) -> no penalty there either
 
     source_position = torch.tensor([[[2, 3]]])
     source_layer = torch.tensor([[0]])
     num_sources = torch.tensor([1])
 
-    loss = host._antisteady_loss(z_hat, source_position, source_layer, num_sources)
+    loss = host._source_activity_loss(z_hat, source_position, source_layer, num_sources, eps=0.01)
     assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
 
 
-def test_antisteady_loss_masks_padded_sources():
-    host = _mk_host(antisteady_epsilon=0.01)
+def test_source_activity_loss_masks_padded_sources():
+    host = _mk_host()
     B, L, T, H, W = 1, 2, 20, 6, 6
     z_hat = torch.zeros(B, 7, L, T, H, W)
     x_idx = host._signal_index("x")
@@ -435,11 +437,121 @@ def test_antisteady_loss_masks_padded_sources():
     source_position = torch.tensor([[[2, 3], [0, 0]]])
     source_layer = torch.tensor([[0, 0]])
     num_sources = torch.tensor([1])
-    loss_masked = host._antisteady_loss(z_hat, source_position, source_layer, num_sources)
+    loss_masked = host._source_activity_loss(
+        z_hat, source_position, source_layer, num_sources, eps=0.01
+    )
 
     source_position2 = torch.tensor([[[2, 3], [5, 5]]])  # different padding content
-    loss_masked2 = host._antisteady_loss(z_hat, source_position2, source_layer, num_sources)
+    loss_masked2 = host._source_activity_loss(
+        z_hat, source_position2, source_layer, num_sources, eps=0.01
+    )
     assert torch.isclose(loss_masked, loss_masked2, atol=1e-6)
+
+
+# -----------------------------
+# _quiescence_consistency_loss
+# -----------------------------
+
+
+def test_quiescence_consistency_loss_penalizes_hallucination_at_quiescent_voxel():
+    # Where s and f are jointly at baseline (s~=0, f~=1), x should be ~0 too (the
+    # s-equation ODE residual forces this). A voxel that's quiescent per s/f but has
+    # noisy x is an internal inconsistency and must be penalized.
+    host = _mk_host()
+    B, L, T, H, W = 1, 1, 20, 4, 4
+    f_idx, x_idx = host._signal_index("f"), host._signal_index("x")
+    z_hat = torch.zeros(B, 7, L, T, H, W)
+    z_hat[:, f_idx] = 1.0  # baseline for f is 1, not 0 -- s already defaults to 0 (baseline)
+    z_hat[:, x_idx, 0, :, 0, 0] = torch.randn(T) * 10  # quiescent voxel, hallucinated x
+
+    loss = host._quiescence_consistency_loss(z_hat, tau_s=0.05, tau_f=0.05, eps_x=0.05)
+    assert loss > 0.0
+
+
+def test_quiescence_consistency_loss_zero_when_all_flat():
+    host = _mk_host()
+    B, L, T, H, W = 1, 1, 20, 4, 4
+    f_idx = host._signal_index("f")
+    z_hat = torch.zeros(B, 7, L, T, H, W)
+    z_hat[:, f_idx] = 1.0  # s=0, f=1, x=0 everywhere -- fully self-consistent quiescence
+
+    loss = host._quiescence_consistency_loss(z_hat, tau_s=0.05, tau_f=0.05, eps_x=0.05)
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
+
+
+def test_quiescence_consistency_loss_exempts_non_quiescent_voxel_regardless_of_x():
+    # A voxel where s (or f) is NOT at baseline is exempt from this term entirely, no
+    # matter what x does there -- that's a real source/diffusion signature, not
+    # hallucination, and is source_activity_loss/physics_loss's job to judge, not this
+    # term's.
+    host = _mk_host()
+    B, L, T, H, W = 1, 1, 20, 4, 4
+    s_idx, f_idx, x_idx = host._signal_index("s"), host._signal_index("f"), host._signal_index("x")
+    z_hat = torch.zeros(B, 7, L, T, H, W)
+    z_hat[:, f_idx] = 1.0
+    z_hat[:, s_idx, 0, :, 2, 3] = 0.5  # s far from baseline at this voxel -> not quiescent
+    z_hat[:, x_idx, 0, :, 2, 3] = torch.randn(T) * 10  # x noisy here too, but must be exempt
+
+    loss = host._quiescence_consistency_loss(z_hat, tau_s=0.05, tau_f=0.05, eps_x=0.05)
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
+
+
+def test_quiescence_consistency_loss_respects_eps_x_tolerance():
+    host = _mk_host()
+    B, L, T, H, W = 1, 1, 20, 4, 4
+    f_idx, x_idx = host._signal_index("f"), host._signal_index("x")
+    z_hat = torch.zeros(B, 7, L, T, H, W)
+    z_hat[:, f_idx] = 1.0
+    z_hat[:, x_idx, 0, :, 0, 0] = 0.02  # quiescent voxel, |x| below eps_x=0.05
+
+    loss = host._quiescence_consistency_loss(z_hat, tau_s=0.05, tau_f=0.05, eps_x=0.05)
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
+
+
+def test_quiescence_consistency_loss_is_time_resolved_not_whole_trajectory():
+    # A voxel quiescent only during PART of the trajectory (correctly flat x there) and
+    # genuinely active later (s/f move off baseline, e.g. reached by real diffusion) must
+    # not be penalized for that later activity -- the gate is evaluated per timestep, not
+    # as a single full-T aggregate, so late-arriving genuine activity is naturally exempt
+    # the moment s/f leave baseline (no need to know anything about pulse timing).
+    host = _mk_host()
+    B, L, T, H, W = 1, 1, 20, 4, 4
+    s_idx, f_idx, x_idx = host._signal_index("s"), host._signal_index("f"), host._signal_index("x")
+    z_hat = torch.zeros(B, 7, L, T, H, W)
+    z_hat[:, f_idx] = 1.0
+    half = T // 2
+    # First half: quiescent (s=0, f=1) and x correctly flat -- no violation.
+    # Second half: genuinely active (s, f move off baseline) and x genuinely nonzero.
+    z_hat[:, s_idx, 0, half:, 1, 1] = 0.5
+    z_hat[:, f_idx, 0, half:, 1, 1] = 1.4
+    z_hat[:, x_idx, 0, half:, 1, 1] = torch.linspace(0, 1, T - half)
+
+    loss = host._quiescence_consistency_loss(z_hat, tau_s=0.05, tau_f=0.05, eps_x=0.05)
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
+
+
+def test_quiescence_consistency_loss_handles_shared_position_scenario_correctly():
+    # Two REAL sources sharing the same (h, w) column but living in different layers --
+    # the config/simulation/three_layer_single_source_shared_position*.yaml scenario,
+    # which is exactly what motivated removing the old cross-layer negative term (it
+    # assumed "other layer, same column" always meant "no source," which is false here).
+    # This term needs no special-casing to get this right: each source's own s/f are
+    # away from baseline (non-quiescent), so neither is checked by the gate at all,
+    # regardless of what the other layer at that same column is doing.
+    host = _mk_host()
+    B, L, T, H, W = 1, 2, 20, 4, 4
+    s_idx, f_idx, x_idx = host._signal_index("s"), host._signal_index("f"), host._signal_index("x")
+    z_hat = torch.zeros(B, 7, L, T, H, W)
+    z_hat[:, f_idx] = 1.0
+    # layer-0 source: real dynamics, s/f away from baseline (non-quiescent)
+    z_hat[:, s_idx, 0, :, 2, 3] = 0.5
+    z_hat[:, x_idx, 0, :, 2, 3] = torch.linspace(0, 1, T)
+    # layer-1 source, SAME (h,w): also real dynamics, also non-quiescent
+    z_hat[:, s_idx, 1, :, 2, 3] = 0.5
+    z_hat[:, x_idx, 1, :, 2, 3] = torch.linspace(1, 0, T)
+
+    loss = host._quiescence_consistency_loss(z_hat, tau_s=0.05, tau_f=0.05, eps_x=0.05)
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
 
 
 # -----------------------------

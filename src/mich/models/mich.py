@@ -133,19 +133,44 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             per_eq_physics = {}
         total_loss = lc.lambda_data * data_loss + lambda_physics_eff * physics_loss
 
-        lambda_antisteady_eff = self._get_scheduled_lambda(
-            getattr(lc, "lambda_antisteady", 0.0),
-            getattr(lc, "warmup_steps_antisteady", 0),
-            getattr(lc, "delay_steps_antisteady", 0),
+        lambda_source_activity_eff = self._get_scheduled_lambda(
+            getattr(lc, "lambda_source_activity", 0.0),
+            getattr(lc, "warmup_steps_source_activity", 0),
+            getattr(lc, "delay_steps_source_activity", 0),
         )
 
-        if lambda_antisteady_eff > 0.0:
-            antisteady_loss = self._antisteady_loss(
-                z_hat, source_position, source_layer, num_sources
+        if lambda_source_activity_eff > 0.0:
+            source_activity_eps = getattr(lc, "source_activity_epsilon", 0.01)
+            source_activity_loss = self._source_activity_loss(
+                z_hat, source_position, source_layer, num_sources, source_activity_eps
             )
-            total_loss = total_loss + lambda_antisteady_eff * antisteady_loss
+            total_loss = total_loss + lambda_source_activity_eff * source_activity_loss
         else:
-            antisteady_loss = None
+            source_activity_loss = None
+
+        # Independent schedule from source_activity above: s=0, f=1 is the trivial
+        # baseline every signal starts near before data_loss/physics_loss have shaped any
+        # real dynamics, so this must ramp in only after those have had time to settle
+        # (see delay_steps_quiescence_consistency's default/comment) -- not gated behind
+        # lambda_source_activity being active at all.
+        lambda_quiescence_consistency_eff = self._get_scheduled_lambda(
+            getattr(lc, "lambda_quiescence_consistency", 0.0),
+            getattr(lc, "warmup_steps_quiescence_consistency", 0),
+            getattr(lc, "delay_steps_quiescence_consistency", 0),
+        )
+
+        if lambda_quiescence_consistency_eff > 0.0:
+            tau_s = getattr(lc, "quiescence_consistency_tau_s", 0.01)
+            tau_f = getattr(lc, "quiescence_consistency_tau_f", 0.01)
+            eps_x = getattr(lc, "quiescence_consistency_eps_x", 0.01)
+            quiescence_consistency_loss = self._quiescence_consistency_loss(
+                z_hat, tau_s, tau_f, eps_x
+            )
+            total_loss = (
+                total_loss + lambda_quiescence_consistency_eff * quiescence_consistency_loss
+            )
+        else:
+            quiescence_consistency_loss = None
 
         supervision_loss = None
         lambda_supervision_eff = 0.0
@@ -350,15 +375,26 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 # scheduled lambdas
                 "parameters/lambda_physics": lambda_physics_eff,
                 "parameters/lambda_smooth": lambda_smooth_eff,
-                "parameters/lambda_antisteady": lambda_antisteady_eff,
+                "parameters/lambda_source_activity": lambda_source_activity_eff,
+                "parameters/lambda_quiescence_consistency": lambda_quiescence_consistency_eff,
                 **(
                     {
-                        "train/loss/antisteady": antisteady_loss.item(),
-                        "train/loss_weighted/antisteady": (
-                            antisteady_loss * lambda_antisteady_eff
+                        "train/loss/source_activity": source_activity_loss.item(),
+                        "train/loss_weighted/source_activity": (
+                            source_activity_loss * lambda_source_activity_eff
                         ).item(),
                     }
-                    if antisteady_loss is not None
+                    if source_activity_loss is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "train/loss/quiescence_consistency": quiescence_consistency_loss.item(),
+                        "train/loss_weighted/quiescence_consistency": (
+                            quiescence_consistency_loss * lambda_quiescence_consistency_eff
+                        ).item(),
+                    }
+                    if quiescence_consistency_loss is not None
                     else {}
                 ),
                 # ODE residuals — own section
