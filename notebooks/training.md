@@ -3,15 +3,17 @@
 
 ## 1. The Fundamental Training Challenge
 
-Before describing the individual loss terms, it is worth being precise about the constraint under which training operates, because it shapes every design decision that follows.
+Before describing the individual loss terms, it is worth being precise about the constraint the model must eventually satisfy, and about how the current training recipe relates to that constraint, because the gap between the two shapes every design decision that follows.
 
-At inference time, we observe only BOLD signal. We have no access to the ground-truth latent states $x$, $s$, $f$, $v$, $q$, $v^*$, $q^*$ that generated those observations. This means we cannot simply train by comparing the network's predicted latents against true latents at every voxel and time point. If we did, the model would depend on supervision that is unavailable when deployed on real data.
+At inference time on real data, we observe only BOLD signal, and we have no access to the ground-truth latent states $x$, $s$, $f$, $v$, $q$, $v^*$, $q^*$ that generated those observations. So whatever lets the model recover the latents at inference time has to come from BOLD alone: the data loss (predicted latents reproduce the observed BOLD through the forward model) and the physics loss (predicted latents satisfy the Heinzle ODEs), both described below, are the two objectives that do not require ground-truth latent trajectories and are the ones the model must ultimately be able to rely on by itself.
 
-The training objective must therefore be *self-supervised with respect to the latents*: the network is trained only on signals that are available during real inference. The primary such signal is the BOLD observation itself. We train the network to produce latent states that are consistent with the observed BOLD in two complementary senses: they should *reproduce* the BOLD when passed through the forward hemodynamic model, and they should *satisfy* the Heinzle ODEs that govern how those states evolve over time.
+A separate caveat applies to both of them as currently implemented: the data loss's dedicated source-voxel term and the physics/data losses' biased collocation sampling (Section 4) all take the known location of the source voxel as an input, not just the BOLD signal. That is a different kind of privileged information from a ground-truth latent trajectory (a location, not a value over time), but it is still something a real, unlabelled scan would not hand you directly; it would need to come from elsewhere, for instance a task localiser or an externally chosen ROI. The one loss term that needs neither ground-truth latent values nor a known source location is the quiescence-consistency loss (Section 6), which is computed purely from the model's own predictions over the whole grid.
 
-This is a considerably harder problem than supervised regression. The BOLD signal underdetermines the latents: many combinations of $v$ and $q$ could reproduce a given BOLD trace. The physics constraints narrow this set substantially, but do not eliminate ambiguity entirely. Understanding this tension is essential to understanding why the training procedure is designed the way it is.
+Training as currently configured does not rely on the data and physics losses alone. Synthetic data carries known ground-truth latents, and the training objective makes substantial, direct use of them: a supervision loss regresses the predicted latents against the true ones at the source voxel, at a weight comparable to the data loss itself, and a derivative-supervision term does the same for the analytic time derivative (Section 7). This is real latent supervision. It means the current training recipe, as configured today, depends on ground-truth latents that will not exist for real fMRI data; that dependency is exactly what motivates the questions in Sections 6, 7, and 10 about how much of it, and of the source-location dependency above, can eventually be removed.
 
-Synthetic data with known ground-truth latents is used during training for a secondary supervision signal and as a held-out evaluation oracle. Crucially, the ground-truth latents are never used in the primary training loss, only in an auxiliary term and for validation. This preserves the validity of the evaluation: a model that has never seen ground-truth latents during training can be fairly evaluated against them at validation time.
+This is a considerably harder problem than supervised regression, even setting the latent-supervision question aside. The BOLD signal underdetermines the latents: many combinations of $v$ and $q$ could reproduce a given BOLD trace. The physics constraints narrow this set substantially, but do not eliminate ambiguity entirely. Understanding this tension is essential to understanding why the training procedure is designed the way it is.
+
+Synthetic data with known ground-truth latents also serves as a held-out evaluation oracle: the same latents used for supervision during training are compared directly against the model's validation-time predictions, since real fMRI offers no equivalent ground truth to validate against.
 
 ---
 
@@ -23,19 +25,21 @@ Normalisation is performed by a Welford online estimator, which computes running
 
 Instead, statistics are computed from a spatial neighbourhood of a fixed radius around each sample's source voxel. This neighbourhood contains the voxels most likely to carry meaningful signal. A single scalar mean and variance is estimated from all voxels in this neighbourhood across all layers, time points, and batch elements. Using a shared scalar rather than per-layer statistics is a deliberate choice: it preserves inter-layer amplitude ratios, which carry information about the relative hemodynamic response across cortical depth.
 
-Once the running statistics have converged, they are frozen after a fixed number of training steps. At validation and inference time, the frozen statistics from training are applied. The normalised signal is clamped to the range $[-10, 10]$ to prevent extreme values from destabilising training.
+The statistics are frozen after a fixed number of training steps (a step count set in config, not a detected convergence point). At validation and inference time, the frozen statistics from training are applied. The normalised signal is clamped to the range $[-10, 10]$ to prevent extreme values from destabilising training.
 
 ---
 
 ## 3. The Overall Loss
 
-The total training loss is a weighted sum of three terms:
+The total training loss is a weighted sum of several terms:
 
-$$\mathcal{L}_{\text{total}} = \lambda_{\text{data}} \cdot \mathcal{L}_{\text{data}} + \lambda_{\text{physics}}(t) \cdot \mathcal{L}_{\text{physics}} + \lambda_{\text{supervision}}(t) \cdot \mathcal{L}_{\text{supervision}}$$
+$$\mathcal{L}_{\text{total}} = \lambda_{\text{data}} \cdot \mathcal{L}_{\text{data}} + \lambda_{\text{physics}}(t) \cdot \mathcal{L}_{\text{physics}} + \lambda_{\text{source-act}}(t) \cdot \mathcal{L}_{\text{source-act}} + \lambda_{\text{quiescence}}(t) \cdot \mathcal{L}_{\text{quiescence}} + \lambda_{\text{supervision}}(t) \cdot \mathcal{L}_{\text{supervision}}$$
 
-where $t$ here denotes the training step rather than physical time. The $\lambda$ coefficients control the relative weight of each term, and those marked with $(t)$ are scheduled rather than fixed: they are ramped up from zero over the course of training for reasons discussed in Section 7.
+where $t$ here denotes the training step rather than physical time. The $\lambda$ coefficients control the relative weight of each term, and those marked with $(t)$ are scheduled rather than fixed: they are ramped up from zero over the course of training for reasons discussed in Section 8. The data loss is the only term that is never scheduled; it is active at full weight from step 0.
 
-Each term plays a distinct role. The data loss anchors the predicted latents to the observed BOLD signal. The physics loss enforces consistency with the Heinzle ODEs. The supervision loss provides direct signal about the latent states at the source voxel, using the synthetic ground truth. These three objectives serve specific purpose, as described below.
+Each term plays a distinct role. The data loss anchors the predicted latents to the observed BOLD signal (Section 4). The physics loss enforces consistency with the Heinzle ODEs (Section 5). The source-activity and quiescence-consistency losses are a pair of auxiliary terms that guard against two different ways the model can collapse to an uninformative solution: predicting flat, constant neural activity even at the labelled source, or hallucinating spurious activity away from it (Section 6). The supervision loss provides direct signal about the latent states at the source voxel, using the synthetic ground truth (Section 7).
+
+Two further, opt-in terms sit alongside these but are not part of the formula above for brevity: a derivative-supervision loss (`supervise_dzdt`, on by default in the  config) that supervises the network's analytic $d\hat{z}/dt$ against an analytic ODE derivative computed from ground-truth latents, and an x-phase loss (`supervise_x_phase`, off by default) that adds a shape/phase-sensitive penalty on the recovered neural activity. Both are described briefly in Section 7 alongside the base supervision loss, since they share its dependence on ground truth. A smoothness term (`lambda_smooth`) also exists in the loss config but is disabled (weight 0) in the  configs.
 
 ---
 
@@ -61,7 +65,7 @@ The BOLD signal as measured by the scanner is not the ideal voxel-level hemodyna
 
 Computing the BOLD loss at every voxel and every time point for every training sample would be computationally prohibitive at the spatial and temporal resolution used here. Instead, a subset of space-time points is sampled at each training step. These are called *collocation points*, and the loss is computed only at these locations.
 
-The sampling is not uniform. A fraction of collocation points are drawn densely from a spatial neighbourhood around the known source voxel and from the time window when the hemodynamic response is active ($5\%$ to $55\%$ of the total duration). The remaining points are drawn uniformly across space and time. This biased sampling ensures that the loss gradient is concentrated where the signal is most informative: near the source, during the response window.
+The sampling can be biased on both the spatial and temporal axes independently, each controlled by its own dense fraction: a configurable share of collocation points is drawn from a spatial neighbourhood around the known source voxel, and separately, a configurable share is drawn from a time window when the hemodynamic response is expected to be active, with the rest drawn uniformly across the full grid or the full duration respectively. When multiple sources are labelled in the same sample, the dense draws are round-robined across them, so no single source dominates the biased points. In the  configs, the spatial bias is active (95% of points drawn near the source) but the temporal bias is currently switched off (its dense fraction is set to 0), so collocation time points are drawn uniformly across the full duration rather than concentrated in a response window. The mechanism supports a biased time window and is exercised by the test suite, but it is not the  operating point.
 
 **Source voxel loss.**
 
@@ -81,17 +85,17 @@ The data loss alone is underdetermined. Many combinations of $v$ and $q$ can rep
 
 **What are the ODEs?**
 
-The Heinzle model describes the temporal evolution of the hemodynamic state through a system of coupled first-order ODEs. Informally, neural activity $x$ drives a vasodilatory signal $s$, which in turn drives blood inflow $f$. Blood inflow drives changes in blood volume $v$ and deoxyhaemoglobin $q$, both of which are influenced by a draining-vein compartment from the deeper layer ($v^*$, $q^*$). Each equation takes the form:
+The Heinzle model describes the temporal evolution of the hemodynamic state through a system of coupled first-order ODEs. Informally, neural activity $x$ drives a vasodilatory signal $s$, which in turn drives blood inflow $f$. Blood inflow drives changes in blood volume $v$ and deoxyhaemoglobin $q$. For datasets with a draining-vein compartment, $v$ and $q$ are additionally influenced by the corresponding states of the deeper layer ($v^*$, $q^*$). Each equation takes the form:
 
-$$\frac{d z_i}{dt} = g_i(z_1, \ldots, z_7; \theta)$$
+$$\frac{d z_i}{dt} = g_i(z_1, \ldots, z_N; \theta)$$
 
 where $\theta$ denotes the haemodynamic parameters (time constants, coupling strengths, and so on) and $g_i$ is a known nonlinear function specific to each state variable.
 
 The physics loss asks: do the predicted state trajectories $\hat{z}(t)$ actually satisfy these equations? It computes the ODE residual for each equation:
 
-$$\mathcal{L}_{\text{phys}, i} = \left\| \frac{d\hat{z}_i}{dt} - g_i(\hat{z}_1, \ldots, \hat{z}_7; \theta) \right\|^2$$
+$$\mathcal{L}_{\text{phys}, i} = \left\| \frac{d\hat{z}_i}{dt} - g_i(\hat{z}_1, \ldots, \hat{z}_N; \theta) \right\|^2$$
 
-where $\frac{d\hat{z}_i}{dt}$ is the analytic time derivative computed through the FiLM pathway (described in the architecture document), and $g_i(\hat{z})$ is the ODE right-hand side evaluated at the predicted states. The total physics loss averages these residuals across all six non-neural equations (the ODE for $x$ is not included because $x$ is the free driving input, not a variable with its own ODE), all three layers, and all collocation points.
+where $\frac{d\hat{z}_i}{dt}$ is the analytic time derivative computed through the FiLM pathway (described in `heinzlenet.md`), and $g_i(\hat{z})$ is the ODE right-hand side evaluated at the predicted states. The ODE for $x$ is never included, since $x$ is the free driving input, not a variable with its own ODE. Whether $v^*$ and $q^*$ have their own ODE residuals depends on the dataset: datasets with a draining-vein compartment contribute six non-neural equations ($s, f, v, q, v^*, q^*$); single-layer datasets without one contribute four ($s, f, v, q$). The total physics loss averages these residuals across all applicable equations, all layers, and all collocation points.
 
 **Numerical stabilisation.**
 
@@ -99,37 +103,61 @@ The ODE right-hand sides involve divisions and fractional exponents that can pro
 
 **The burn-in period.**
 
-The ODE residuals are evaluated only after a short burn-in of initial time steps. This is because the network's predictions near $t = 0$ are unreliable: the temporal encoder has seen very little past context, and the network has not yet established a consistent estimate of the initial state. Including these early time points in the physics loss would introduce noisy gradients. The burn-in discards a fixed number of initial collocation time indices before computing the residual.
+The ODE residuals can be evaluated only after a short burn-in of initial time steps, discarding a fixed number of initial collocation time indices before computing the residual. This exists because the network's predictions near $t = 0$ are unreliable: the temporal encoder has seen very little past context, and the network has not yet established a consistent estimate of the initial state. Including these early time points in the physics loss would introduce noisy gradients. The burn-in length is a config value (`burn_in`), currently set to 0 in the  configs, so this is presently a no-op; the mechanism exists for scenarios where it proves useful.
+
+**Gradient computation.** The decoder's analytic time derivatives (needed for every ODE residual above) are only computed when the model actually requests them; requesting them unconditionally would waste compute whenever nothing needs them. In practice, though, they are computed on nearly every training step in the  configuration, since the derivative-supervision loss (`supervise_dzdt`, Section 7) also needs them and is on by default. See Section 8 for exactly which conditions trigger this.
 
 **Failure mode without this term.** Without the physics loss, the network can produce latent trajectories that reproduce BOLD perfectly but are physically impossible: $v$ and $q$ could oscillate arbitrarily, $s$ could be uncoupled from $x$, and the inversion would have no physical interpretation. The physics loss is what gives the recovered latents their meaning as hemodynamic quantities.
 
 ---
 
-## 6. The Supervision Loss
+## 6. The Source Activity and Quiescence Consistency Losses
 
-**_Note: This is purely a debugging tool, and not a design goal._**
+**What problem do these solve?**
 
-The supervision loss is not a principled component of the final training objective. It is present during the current development phase as a diagnostic: if the model cannot recover the latent states even when given direct supervision at the source voxel, then the failure lies in the architecture or the physics loss, not in the difficulty of the unsupervised problem. Conversely, if the model succeeds under supervision but fails without it, the unsupervised signal (data loss plus physics loss) is insufficient on its own and needs to be strengthened. The supervision loss is therefore a stepping stone: it is used now to establish that the model is *capable* of recovering the latents, before the harder question of whether it can do so without any ground-truth guidance is addressed.
+The data and physics losses alone leave two distinct collapse modes available to the network, both of which satisfy those losses while recovering nothing useful.
 
-The long-term objective is a model that recovers the latent states from BOLD alone, with no access to ground-truth latents at any point during training. The supervision loss will be removed once it has served its diagnostic purpose.
+The first is collapse at the source itself: the network can predict a flat, constant $x$ at the labelled source voxel and still keep the data loss low, if the resulting BOLD is close enough to the observed signal on average. The **source-activity loss** guards against this. It computes the variance of the predicted $x$ over time at each labelled source voxel and penalises it whenever that variance falls below a small threshold $\epsilon$:
 
-**What it computes.**
+$$\mathcal{L}_{\text{source-act}} = \frac{1}{|\text{valid sources}|}\sum_{\text{valid } (b,s)} \max(0,\ \epsilon - \mathrm{Var}_t[\hat{x}_{b,s}(t)])$$
 
-The supervision loss applies MSE between the predicted and ground-truth latent states at the source voxel, across all layers and the full time series. It is applied to $s$, $f$, $v$, $q$, $v^*$, and $q^*$. Note that $x$ is not directly supervised: the neural activity is the quantity the model is ultimately trying to recover, and supervising it directly would bypass the inversion entirely rather than test it.
+averaged only over the valid sources in a batch (samples can have a variable number of sources, padded slots are excluded via a mask). This is a hinge penalty: it costs nothing once the variance clears $\epsilon$, and only pushes back against a genuinely flat prediction.
 
-The supervision is restricted to the source voxel rather than the full spatial grid. This reflects the fact that only one voxel per training sample has a known active neural source; supervising background voxels would provide misleading signal since those voxels should be at or near resting state.
+The second is hallucination away from the source: the network can predict spurious, non-zero neural activity at background voxels that have no real source, since the data and physics losses are both evaluated at collocation points heavily biased toward the known source (Section 4) and rarely constrain the rest of the grid. The **quiescence-consistency loss** guards against this using a self-consistency argument rather than a fixed exclusion radius around each source. The physics loss's own $s$-equation residual implies $ds/dt = x - \kappa s - \gamma(f-1)$; wherever the model's own predicted $s$ and $f$ sit at their resting baseline ($s \approx 0$, $f \approx 1$) for a stretch of time, that residual being small forces $x \approx 0$ there too. The quiescence-consistency loss re-applies this same implied constraint, but densely, over every voxel and timestep, not just the sparse collocation points where the physics loss is actually evaluated:
 
-**What success under supervision would tell us.**
+$$\text{quiescent}(b,\ell,t,h,w) = \big(|\hat{s}| < \tau_s\big) \wedge \big(|\hat{f}-1| < \tau_f\big)$$
+$$\mathcal{L}_{\text{quiescence}} = \frac{1}{|\text{quiescent voxels}|}\sum_{\text{quiescent}} \max(0,\ |\hat{x}| - \epsilon_x)$$
 
-If the model recovers $s$, $f$, $v$, and $q$ accurately at the source voxel under supervision, and the physics loss is also well-satisfied, then the architecture is expressive enough to represent the correct solution. The remaining question is whether the data and physics losses alone, without ground-truth guidance, can steer the network to that solution during unsupervised training on real data. That is the harder and more important question, and it is the one the current development phase is working toward.
+Both $\tau_s, \tau_f$ (how close to baseline counts as "quiescent") and $\epsilon_x$ (how much residual $|\hat{x}|$ is tolerated there) are generic numerical tolerances, not physics constants tied to any particular simulation scenario.
+
+**Why this design, and not something simpler.** An earlier version of this idea used a single loss (informally, "antisteady") that combined two things: a variance-at-source term similar to the one above, and a separate geometric term that penalised activity in a fixed radius around each known source, treating everything outside that radius as presumed-quiescent. That geometric term was abandoned for two reasons. First, the correct radius is scenario-dependent, tied to the neural simulator's diffusion and decay constants, so there is no single safe value across simulation configs. Second, even a correctly-measured radius left very little of the grid penalisable once several sources were active in the same layer (a Monte Carlo check found roughly a 9% chance of zero penalisable coverage at all with four simultaneous sources on this project's grid). A related cross-layer term, which penalised activity at the same spatial column in every layer other than the source's own, was also dropped: it assumed a source's own layer was the only layer allowed to be active at that column, which is false whenever a scenario deliberately places sources at a shared position across layers.
+
+The quiescence-consistency loss avoids both problems by keying off the model's own $s$ and $f$ predictions rather than a fixed geometric radius or an assumption about which layers can be active where. It needs no scenario-specific constant, it is naturally time-resolved (a voxel that is quiescent early but genuinely activated later, for instance by diffusion, is exempted the moment its own $s$/$f$ move off baseline), and it never runs out of coverage regardless of how many sources are active or how close together they sit.
+
+**Status and scheduling.** Both losses are scheduled with the same delay-then-linear-warmup mechanism as the physics loss (Section 8), and independently of each other. The source-activity loss is on by default (its weight is non-zero out of the box, with no delay or warmup currently configured). The quiescence-consistency loss is opt-in (its weight defaults to 0) and, when enabled, is meant to be delayed until well after the physics loss has ramped up: enabling it from step 0 would reward the model for sitting at the trivial $s=0, f=1$ baseline everywhere, including at real sources, since that baseline is exactly where every signal starts before the data and physics losses have shaped any real dynamics. The specific delay/warmup values currently configured for the quiescence-consistency loss are a placeholder chosen only to fall after the physics loss's own delay and warmup, not a value validated against real training curves; treat it as a starting point to tune, not a settled default.
 
 ---
 
-## 7. Loss Scheduling and the Warm-Up Strategy
+## 7. The Supervision Loss
+
+The supervision loss applies a regression loss between the predicted and ground-truth latent states at the source voxel, across all layers and the full time series, using synthetic ground truth available only during training. It is applied to $s$, $f$, $v$, $q$, and, for datasets with a draining-vein compartment, $v^*$ and $q^*$. Note that $x$ is not directly supervised by this base term: the neural activity is the quantity the model is ultimately trying to recover, and supervising it directly would bypass the inversion entirely rather than test it.
+
+The supervision is restricted to the source voxel rather than the full spatial grid. This reflects the fact that only one voxel per training sample has a known active neural source; supervising background voxels would provide misleading signal since those voxels should be at or near resting state.
+
+This term was originally introduced as a diagnostic scaffold, to establish that the architecture and physics loss were capable of recovering the correct latents before asking whether the unsupervised signal (data loss plus physics loss) could do so alone. In the current  configuration it is not scheduled to fade out: it carries a substantial, non-decaying weight, comparable to the data loss itself, active from step 0. Two further terms have since been built on top of it, both also active during training rather than purely diagnostic:
+
+- **Derivative supervision** (`supervise_dzdt`, on by default) supervises the network's analytic $d\hat{z}/dt$ against an ODE derivative computed from the ground-truth latents, at the source voxel. This is more sensitive to timing and phase than the value-only supervision above, which matters because $x$ itself is never directly supervised and is only ever recovered through the physics residual against the (well-supervised) $s$ trajectory. In principle this target is meant to use ground-truth $s, f, v, q$ but not ground-truth $x$, so that it stays applicable in settings without ground-truth neural activity; in the current implementation, the analytic target for the $s$-equation derivative is computed as $\dot s = x_{\text{true}} - \kappa s_{\text{true}} - \gamma(f_{\text{true}}-1)$, which does read ground-truth $x$ directly. This is a real gap between the stated intent and the current code, worth checking before relying on this term's independence from ground-truth neural activity.
+- **X-phase supervision** (`supervise_x_phase`, opt-in) adds a shape- and phase-sensitive penalty (a combination of MSE and a Pearson-correlation term) directly on the recovered neural activity at the source voxel. Its own internal MSE/Pearson balance, and its overall weight, can optionally be annealed over a configured step window rather than held fixed, so that its influence on the total gradient does not fade late in training as other terms grow.
+
+There is also a separate, explicitly temporary ablation switch, `supervise_x`, off by default, that directly supervises $x$ against ground truth. Unlike the terms above, this one is documented in code as existing only to diagnose whether certain neural activity patterns are hard to learn because of the architecture rather than because of identifiability, and is not part of the normal training objective.
+
+---
+
+## 8. Loss Scheduling and the Warm-Up Strategy
 
 **Why scheduling is necessary.**
 
-The three loss terms do not play equally well together at all stages of training. The most dangerous interaction is between the data loss and the physics loss early in training. At initialisation, the network's predictions are essentially random: the latents have no meaningful structure, and the BOLD reconstruction is poor. If the physics loss is applied at full strength from the beginning, it will dominate the gradient signal and drive the network toward the ODE resting-state fixed point, where all variables sit at their equilibrium values. This satisfies the physics loss trivially but destroys the data loss signal. Once the network has converged to the fixed point, escaping it is very difficult.
+The loss terms do not all play well together at every stage of training. The most dangerous interaction is between the data loss and the physics loss early in training. At initialisation, the network's predictions are essentially random: the latents have no meaningful structure, and the BOLD reconstruction is poor. If the physics loss is applied at full strength from the beginning, it will dominate the gradient signal and drive the network toward the ODE resting-state fixed point, where all variables sit at their equilibrium values. This satisfies the physics loss trivially but destroys the data loss signal. Once the network has converged to the fixed point, escaping it is very difficult.
 
 The solution is to delay and ramp the physics loss. During the early phase of training, only the data loss is active. The network is free to find any solution that roughly reproduces the BOLD signal. Once the data loss has established a reasonable initialisation, the physics loss is introduced gradually, so that the network can adapt its predictions toward physical consistency without losing the BOLD signal entirely.
 
@@ -139,28 +167,28 @@ Each scheduled loss term has two parameters: a *delay* and a *warm-up duration*.
 
 $$\lambda(t) = \begin{cases} 0 & t < t_{\text{delay}} \\ \lambda_{\text{target}} \cdot \min\left(1,\, \frac{t - t_{\text{delay}}}{t_{\text{warmup}}}\right) & t \geq t_{\text{delay}} \end{cases}$$
 
-where $t$ is the global training step. The scheduling is applied to both the physics loss and the supervision loss. The data loss is active from the beginning and is not scheduled.
+where $t$ is the global training step. Every scheduled term (physics, source-activity, quiescence-consistency, supervision, derivative-supervision, x-phase) uses this same delay-then-linear-warmup mechanism through one shared helper; only the delay/warmup values differ per term, several of them currently 0 (meaning that term, if enabled, applies its target weight from step 0 with no ramp). The data loss is the one exception: it is active from the beginning and is not scheduled at all.
 
-An important implementation detail: the time derivative computation in the decoder, which is needed for the physics loss, is expensive. If the physics loss weight is zero, computing the derivatives would waste compute. The code therefore checks whether the effective physics weight is positive before requesting gradients from the forward pass, avoiding this cost during the delay period.
+An important implementation detail: the time derivative computation in the decoder, needed for the physics loss, is expensive. The original motivation for gating it was to avoid that cost while the physics loss weight is still zero during its delay period. In the  default configuration, though, this gate rarely actually skips the computation: derivatives are also requested whenever validation is running, or whenever the derivative-supervision loss (`supervise_dzdt`) or the x-phase loss (`supervise_x_phase`) are enabled, and `supervise_dzdt` is on by default. In practice this means derivatives are computed on nearly every training step, not just once the physics loss has ramped up.
 
 ---
 
-## 8. The Validation Procedure
+## 9. The Validation Procedure
 
 At validation time, the model is evaluated on held-out synthetic data with known ground-truth latents. This is the closest available proxy to an oracle evaluation: we can directly compare the predicted latent trajectories against the true ones without any ambiguity.
 
-Validation runs the full forward pass including time derivatives, regardless of the physics loss schedule, since the schedule is a training device and validation should always reflect the full model capability. The same losses as in training are computed and logged, but the primary diagnostic is the visual comparison of predicted and ground-truth trajectories at the source voxel.
+Validation runs the full forward pass including time derivatives, unconditionally, regardless of the physics loss schedule, since the schedule is a training device and validation should always reflect the full model capability. The same losses as in training are computed and logged, but the primary diagnostic is the visual comparison of predicted and ground-truth trajectories at the source voxel.
 
-Two sets of plots are generated at the end of each validation epoch. The first compares predicted and true BOLD signals alongside predicted and true neural activity $x$ across all three layers, for a random subset of validation samples. The second compares the full set of predicted and true latent trajectories ($s$, $f$, $v$, $q$, $v^*$, $q^*$) in the same format. These plots are logged to Weights and Biases and serve as the primary qualitative indicator of training progress.
+Two sets of plots are generated at the end of each validation epoch. The first compares predicted and true BOLD signals alongside predicted and true neural activity $x$ across all layers, for a random subset of validation samples. The second compares the full set of predicted and true latent trajectories ($s$, $f$, $v$, $q$, and $v^*$, $q^*$ where applicable) in the same format. These plots are logged to Weights and Biases and serve as the primary qualitative indicator of training progress, alongside quantitative recovery metrics (R², Pearson correlation, peak cross-correlation lag) computed over the full validation set.
 
 ---
 
-## 9. The Training Objective as a Whole
+## 10. The Training Objective as a Whole
 
-It is worth pausing to appreciate the structure of what has been described. The network is being asked to invert a nonlinear dynamical system from its outputs alone, without direct observation of its internal states. The two principled loss terms define a constrained optimisation problem: find latent trajectories that (a) reproduce the observed BOLD when passed through the forward model, and (b) satisfy the governing ODEs. The supervision loss is present only temporarily as a development scaffold.
+It is worth pausing to appreciate the structure of what has been described. The network is being asked to invert a nonlinear dynamical system from its outputs alone, without direct observation of its internal states. Two principled constraints define this as an optimisation problem: find latent trajectories that (a) reproduce the observed BOLD when passed through the forward model, and (b) satisfy the governing ODEs.
 
-Each of the two principled constraints alone is insufficient. Constraint (a) alone is underdetermined: many latent trajectories can reproduce a given BOLD trace. Constraint (b) alone has a trivial solution at the resting-state fixed point, where all variables sit at equilibrium and nothing is recovered. Together, they triangulate a solution that is simultaneously data-consistent and physically plausible.
+Each constraint alone is insufficient. Constraint (a) alone is underdetermined: many latent trajectories can reproduce a given BOLD trace. Constraint (b) alone has a trivial solution at the resting-state fixed point, where all variables sit at equilibrium and nothing is recovered. Together, they narrow the solution space considerably, but not all the way: the source-activity and quiescence-consistency losses (Section 6) close two further collapse routes that (a) and (b) leave open, a flat prediction at the source and unconstrained hallucination away from it, without requiring ground-truth latents to do so.
 
-The supervision loss currently provides a third constraint that anchors the solution at the source voxel. Its purpose is diagnostic: establishing that the model architecture and physics loss are expressive and well-calibrated enough to recover the correct latents when given some direct guidance. Once that is confirmed, the supervision will be removed and the model will be required to recover the latents from constraints (a) and (b) alone. That is the true objective of the project.
+The supervision loss and its derivative/phase-aligned extensions (Section 7) add a further constraint that anchors the solution at the source voxel using synthetic ground truth, currently present as a standing, substantially-weighted part of the  objective rather than a term scheduled to fade out. The longer-term goal for the project remains a model that recovers the latent states from constraints (a) and (b), plus the source-activity and quiescence-consistency guards, without any ground-truth latent supervision at all; whether that unsupervised signal is sufficient on its own, without the current supervision terms, is the open question the supervision loss was originally introduced to help answer, and remains the harder question this training setup is working toward.
 
 The warm-up scheduling exists because the interaction between the data and physics losses is fragile early in training. The ordering matters: the data loss must first establish a non-trivial solution, then the physics loss can refine it toward physical consistency. Violating this ordering by introducing the physics loss too early tends to collapse training to the resting-state fixed point, from which recovery is very difficult. Understanding this ordering is as important as understanding the individual loss terms themselves.

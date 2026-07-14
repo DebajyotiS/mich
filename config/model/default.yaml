@@ -118,7 +118,7 @@ loss_config:
                                       # 0.0 = off (opt-in). This is the ONLY off-source
                                       # hallucination guard
   warmup_steps_quiescence_consistency: 500  # ramp over 500 steps once active (see delay)
-  delay_steps_quiescence_consistency: 500 
+  delay_steps_quiescence_consistency: 500
   quiescence_consistency_tau_s: 0.05   # |s| below this counts as "s at baseline"
   quiescence_consistency_tau_f: 0.05   # |f - 1| below this counts as "f at baseline"
   quiescence_consistency_eps_x: 0.05   # |x| above this, at a jointly-quiescent (s, f)
@@ -137,7 +137,7 @@ loss_config:
   lambda_supervision: 100.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
-  supervise_x: false 
+  supervise_x: false
   supervise_dzdt: true # MSE/huber between the network's analytic
                       # dz_hat/dt and a finite-difference derivative of the ground-truth
                       # latents (see dzdt_supervision_signals), at each source voxel.
@@ -150,7 +150,7 @@ loss_config:
   warmup_steps_dzdt_supervision: 0
   delay_steps_dzdt_supervision: 0
   dzdt_supervision_signals: ["s", "f", "v", "q"] # which signals to compute dz/dt supervision loss on; must be a subset of the signals in the dataset
-  supervise_x_phase: false 
+  supervise_x_phase: false
   lambda_x_phase: 10.0 # weight applied when supervise_x_phase=true (used as-is unless the
                        # lambda_x_phase_start/_end anneal below is active)
   warmup_steps_x_phase: 0
