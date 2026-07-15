@@ -25,6 +25,7 @@ import h5py
 import numpy as np
 import torch
 from common import rms, write_report
+
 from mich.data.balloon import CortexLayer, HaemodynamicConstants, HaemodynamicState, simulate_cortex
 
 SHIFT_RANGE = range(-3, 4)

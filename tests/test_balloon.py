@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+
 from mich.data.balloon import (  # noqa: F401
     AcquisitionConstants,
     BoldPostProcessingConfig,

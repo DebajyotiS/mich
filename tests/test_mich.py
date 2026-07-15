@@ -21,11 +21,12 @@ import torch
 import torch.optim
 import torch.optim.lr_scheduler
 import wandb
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import Callback
+
 from mich.data.synthetic import SyntheticDataModule
 from mich.models.blocks import HeinzleNet
 from mich.models.mich import MICH
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import Callback
 
 # -------------------------
 # Module-level constants

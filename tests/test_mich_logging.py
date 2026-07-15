@@ -8,8 +8,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import wandb
-from mich.models.mich_logging import MICHLoggingMixin
 from pytorch_lightning.loggers import WandbLogger
+
+from mich.models.mich_logging import MICHLoggingMixin
 
 
 class _LoggingHost(MICHLoggingMixin):
