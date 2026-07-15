@@ -178,9 +178,9 @@ class DepthWiseSeparableConvLayer(nn.Module):
         )
         self.pointwise = nn.Conv2d(cin, cout, kernel_size=pw_kernel, bias=False)
 
-        assert (
-            num_groups > 0 and cout % num_groups == 0
-        ), "num_groups must be a positive divisor of cout"
+        assert num_groups > 0 and cout % num_groups == 0, (
+            "num_groups must be a positive divisor of cout"
+        )
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=cout)
         self.activation = get_activation(activation)
 
@@ -232,9 +232,9 @@ class TemporalDepthWiseTCNLayer(nn.Module):
         )
         self.pointwise = nn.Conv1d(cin, cin, kernel_size=1, bias=False)
 
-        assert (
-            num_groups > 0 and cin % num_groups == 0
-        ), "num_groups must be a positive divisor of cin"
+        assert num_groups > 0 and cin % num_groups == 0, (
+            "num_groups must be a positive divisor of cin"
+        )
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=cin)
         self.activation = get_activation(activation)
 
@@ -381,15 +381,15 @@ class SpatioTemporalDecoder(nn.Module):
     ):
         super().__init__()
 
-        assert all(
-            s in HEINZLE_ACTIVATIONS for s in signals
-        ), f"All signals must be valid Heinzle signals. Got: {signals}"
+        assert all(s in HEINZLE_ACTIVATIONS for s in signals), (
+            f"All signals must be valid Heinzle signals. Got: {signals}"
+        )
         self.signals = signals
         self.signal_idx: dict[HeinzleSignal, int] = {s: i for i, s in enumerate(signals)}
         N_SIG = len(signals)
-        assert (
-            out_channels == N_SIG
-        ), f"out_channels must match len(signals): out_channels={out_channels}, len(signals)={N_SIG}"
+        assert out_channels == N_SIG, (
+            f"out_channels must match len(signals): out_channels={out_channels}, len(signals)={N_SIG}"
+        )
         channel_activations = [HEINZLE_ACTIVATIONS[s] for s in signals]
         self.L = L
         self.layer_embed_dim = layer_embed_dim

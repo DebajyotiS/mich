@@ -4,21 +4,17 @@ L: 3
 C: 32
 c_enc: 64
 c_dec: 64
-c_film: 32           # FiLM bottleneck per signal (~c_dec / 7, rounded up for groups)
+c_film: 32      # FiLM bottleneck per signal
 signal_embed_dim: 8
-num_freqs: 24   # log-spaced between min_freq/max_freq; raised from 20 to keep the same
-                # per-decade resolution now that the range is wider (1-48 vs the old 2-45)
-min_freq: 1.0   # was 2.0 -- skipped the single dominant mode (one cycle over the whole
-                # T-sample window) that carries 30-51% of f/v/q/v*/q*'s total power
-max_freq: 48.0  # was 45.0 -- just under Nyquist ((T-1)/2=49.5), to cover x/s's near-Nyquist
-                # edge content (99.9% of their power sits at ~freq 50)
+num_freqs: 24   # log-spaced between min_freq/max_freq
+min_freq: 1.0
+max_freq: 48.0  # just under Nyquist ((T-1)/2=49.5)
 tcn_kernel: 3
 spatial_radius: 2
 grid_size: 10
 
-embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
-out_channels: 7 # must equal len(signals) (7 with drainage, 5 without) -- NOT multiplied by L;
-                # SpatioTemporalDecoder builds len(signals)*L output heads internally using L separately
+embed_dim: 20   # overridden in SpatioTemporalDecoder.__init__
+out_channels: 7 # must equal len(signals); not multiplied by L
 
 heinzle_net:
   _target_: mich.models.blocks.HeinzleNet
@@ -79,7 +75,7 @@ heinzle_net:
     embed_dim: ${model.embed_dim}  # overridden in SpatioTemporalDecoder.__init__
     hidden_dim: ${model.c_film}
     activation: silu
-    c_dec: ${model.c_film}         # overridden to c_film in SpatioTemporalDecoder.__init__
+    c_dec: ${model.c_film}         # overridden in SpatioTemporalDecoder.__init__
 
   spatial_decoder_config:
     cin: ${model.c_enc}
@@ -96,7 +92,7 @@ normaliser:
   H: ${model.grid_size}
   W: ${model.grid_size}
   eps: 1.0e-6
-  freeze_after_steps: 320  # ~20 epochs of coverage at 16 steps/epoch (batch=128, n_train=2100)
+  freeze_after_steps: 320  # ~20 epochs at 16 steps/epoch (batch=128, n_train=2100)
   neighbourhood_radius: ${model.spatial_radius}
 
 loss_config:
@@ -109,66 +105,38 @@ loss_config:
   lambda_smooth: 0.0
   warmup_steps_smooth: 0
   delay_steps_smooth: 0
-  lambda_source_activity: 0.5   # set 0.0 to disable. Encourages real x dynamics (not a
-                                # flat collapse) at the labelled source voxel.
-  source_activity_epsilon: 0.01  # variance threshold (hinge)
-  warmup_steps_source_activity: 0    # optional warm-up
+  lambda_source_activity: 0.5     # 0.0 disables; penalises flat x collapse at source voxel
+  source_activity_epsilon: 0.01   # variance threshold (hinge)
+  warmup_steps_source_activity: 0
   delay_steps_source_activity: 0
-  lambda_quiescence_consistency: 0.0  # self-consistency off-source hallucination guard;
-                                      # 0.0 = off (opt-in). This is the ONLY off-source
-                                      # hallucination guard
-  warmup_steps_quiescence_consistency: 500  # ramp over 500 steps once active (see delay)
+  lambda_quiescence_consistency: 0.0  # 0.0 = off (opt-in); only off-source hallucination guard
+  warmup_steps_quiescence_consistency: 500
   delay_steps_quiescence_consistency: 500
-  quiescence_consistency_tau_s: 0.05   # |s| below this counts as "s at baseline"
-  quiescence_consistency_tau_f: 0.05   # |f - 1| below this counts as "f at baseline"
-  quiescence_consistency_eps_x: 0.05   # |x| above this, at a jointly-quiescent (s, f)
-                                      # voxel/timestep, is penalised as hallucination
-  # Wherever the model's OWN predicted s and f settle to baseline (s~=0, f~=1), the
-  # s-equation ODE residual (ds/dt = x - kappa*s - gamma*(f-1), already enforced by
-  # physics_loss) implies x must be ~0 there too -- this re-applies that same implied
-  # constraint DENSELY over the whole grid every step, since physics_loss itself is only
-  # evaluated at collocation points heavily biased toward the known source
-  # (dense_spatial_frac). Deliberately NOT a geometric distance-from-source radius (see
-  # git history / project memory for why that approach was abandoned): the correct
-  # radius would have been scenario-dependent (tied to the simulator's diffusion_coeff-
-  # icient_intra/decay_rate) and, even when correctly computed, collapsed grid coverage
-  # to near-zero for multi-source-per-layer scenarios. tau_s/tau_f/eps_x here are generic
-  # numerical tolerances, not physics constants -- no recomputation needed per scenario.
+  quiescence_consistency_tau_s: 0.05   # |s| below this counts as baseline
+  quiescence_consistency_tau_f: 0.05   # |f - 1| below this counts as baseline
+  quiescence_consistency_eps_x: 0.05   # |x| above this at a quiescent (s, f) voxel is hallucination
   lambda_supervision: 100.0
   warmup_steps_supervision: 0
   delay_steps_supervision: 0
   supervise_x: false
-  supervise_dzdt: true # MSE/huber between the network's analytic
-                      # dz_hat/dt and a finite-difference derivative of the ground-truth
-                      # latents (see dzdt_supervision_signals), at each source voxel.
-                      # Unlike value-only supervision_loss, this is sharply sensitive to
-                      # timing/phase, since x is only ever recovered via dz/dt through the
-                      # physics residual and has no direct ground-truth check. Uses the
-                      # same ground-truth latents already used by supervision_loss
-                      # (s/f/v/q), not x itself, so it stays applicable without ground-truth x.
+  supervise_dzdt: true
   lambda_dzdt_supervision: 100.0 # weight applied when supervise_dzdt=true
   warmup_steps_dzdt_supervision: 0
   delay_steps_dzdt_supervision: 0
-  dzdt_supervision_signals: ["s", "f", "v", "q"] # which signals to compute dz/dt supervision loss on; must be a subset of the signals in the dataset
+  dzdt_supervision_signals: ["s", "f", "v", "q"] # subset of dataset signals
   supervise_x_phase: false
-  lambda_x_phase: 10.0 # weight applied when supervise_x_phase=true (used as-is unless the
-                       # lambda_x_phase_start/_end anneal below is active)
+  lambda_x_phase: 10.0 # used unless lambda_x_phase_start/_end anneal is active
   warmup_steps_x_phase: 0
   delay_steps_x_phase: 0
-  # Optional curriculum, shared anneal window for both of the below. No-op (holds the
-  # static values) unless x_phase_ratio_anneal_end_step > x_phase_ratio_anneal_start_step
-  # is set explicitly.
+  # shared anneal window; no-op unless end_step > start_step
   x_phase_ratio_anneal_start_step: 0
   x_phase_ratio_anneal_end_step: 0
-  # (a) x_phase_loss's internal lambda_npearson/lambda_pearson: MSE-favoring (stable,
-  # penalizes overshoot directly) -> pearson-favoring (sharper phase alignment, more ringing).
+  # MSE-favoring (stable) -> pearson-favoring (sharper alignment, more ringing)
   x_phase_npearson_start: 10.0
   x_phase_npearson_end: 1.0
   x_phase_pearson_start: 1.0
   x_phase_pearson_end: 10.0
-  # (b) lambda_x_phase itself, ramped upward so x_phase's share of the total gradient
-  # doesn't fade late in training (measured: ~6.6% of total_loss early -> ~1.9% late,
-  # while dzdt_supervision grew from ~0.3% to ~63% over the same run).
+  # ramped up so x_phase's gradient share doesn't fade late in training
   lambda_x_phase_start: 10.0
   lambda_x_phase_end: 80.0
   n_space: 100 # colocation points
@@ -194,9 +162,7 @@ loss_config:
     type: "mse"
     huber_delta: 0.1 #used if type is "huber"
   dzdt_loss:
-    type: "huber" #  ds/dt at a sharp transition is an outlier relative
-                   # to the near-flat per-index differences elsewhere; squared error over-
-                   # weights it, huber caps its influence past huber_delta.
+    type: "huber" # caps outlier influence of ds/dt at sharp transitions
   x_phase_loss:
     type: "mse+pearson" # pearson is what makes this loss shape/phase-sensitive.
     lambda_npearson: 10.0
@@ -204,10 +170,8 @@ loss_config:
     huber_delta: 0.1
 image_log_every_n_val_calls: 1
 
-# Set any of these to true to make that physiological constant a learnable parameter
-# (initialized from the simulation-injected value above, optimized in log-space so it
-# can't go non-positive) instead of a fixed constant. lambda_d and tau_d are not yet
-# supported here. k1/k2/k3 are recomputed from E0 each forward pass when E0 is learnable.
+# set true to make a physiological constant learnable (optimized in log-space, init
+# from the simulation value). lambda_d/tau_d not yet supported; k1/k2/k3 recompute from E0.
 learnable_physio:
   kappa: false
   gamma: false
@@ -225,7 +189,7 @@ optimizer:
 scheduler:
   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
   _partial_: true
-  T_max: null       # auto-computed by train_mich.py from dataset size, split, batch size, and max_epochs (see _inject_scheduler_steps); set an explicit int to override
+  T_max: null       # auto-computed by train_mich.py (_inject_scheduler_steps); set an int to override
   eta_min: 1.0e-6
 
 lightning:

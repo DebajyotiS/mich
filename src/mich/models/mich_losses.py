@@ -169,52 +169,37 @@ class MICHLossMixin(CollocationMixin):
         tau_f: float,
         eps_x: float,
     ) -> torch.Tensor:
-        """Self-consistency off-source guard, using the model's OWN predicted s/f as the
-        "is this quiescent" signal instead of a geometric distance-from-source radius.
+        """Self-consistency off-source guard. It uses the model's own predicted s and f
+        values as the quiescent signal.
 
-        The s-equation ODE residual (already enforced elsewhere by physics_loss) is
-        ds/dt = x - kappa*s - gamma*(f-1). If s sits at its steady baseline (s~=0) for a
-        stretch of time, ds/dt~=0 there, which forces x = kappa*s + gamma*(f-1) ~= 0
-        whenever f is ALSO at its baseline (f~=1). So wherever the model's own s and f
-        jointly say "nothing is happening here" (pointwise, per voxel per timestep), x
-        should be ~0 too -- and if it isn't, that's an internal inconsistency in the
-        model's own output, not something that needs to be compared against any known
-        source position, diffusion constant, or grid geometry at all.
+        The s-equation ODE residual is ds/dt = x - kappa*s - gamma*(f-1). This residual
+        is already enforced elsewhere by the physics loss. If s sits at its steady
+        baseline of approximately 0 for a stretch of time, then ds/dt is also
+        approximately 0 there. This forces x to equal kappa*s + gamma*(f-1), which is
+        approximately 0 whenever f is also at its baseline of 1. Wherever the model's
+        own s and f jointly indicate that nothing is happening, x should be
+        approximately 0. If x is not near 0, then an internal inconsistency exists in
+        the model's own output. This check does not require comparison against any
+        known source position.
 
-        This replaces an earlier geometric "exclude a radius around each known source"
-        design (see git history / project memory), which had two real problems: (a) the
-        correct radius is scenario-dependent (derived from
-        mich.data.neuronal.LayeredDiffusionSimulator's diffusion_coefficient_intra/
-        decay_rate) and there's no single safe value across all simulation configs in
-        general, and (b) even the correct radius, once measured, collapsed grid coverage
-        to near-zero for multi-source-per-layer scenarios (Monte Carlo: ~9% chance of a
-        *complete* no-op at 4 simultaneous sources on this project's 10x10 grid). This
-        gate has neither problem: it needs no external physics constant (tau_s/tau_f are
-        generic "how close to exact baseline" numerical tolerances, not tied to any
-        scenario's diffusion parameters), and it's evaluated per (voxel, timestep)
-        directly from z_hat, so it never "runs out of coverage" regardless of how many
-        sources are active or how close together they are. It's also naturally time-
-        resolved: a voxel quiescent early but genuinely active later (e.g. reached by
-        real diffusion) is correctly excluded the moment its OWN s/f move off baseline,
-        with no dependence on pulse timing at all.
+        This gate requires no external physics constants. The tolerances tau_s and
+        tau_f are generic numerical parameters. They are not tied to scenario-specific
+        diffusion parameters. The gate is evaluated directly from z_hat at each voxel
+        and timestep. It maintains grid coverage regardless of active source density.
+        The gate is also time-resolved. A voxel that is quiescent early but active
+        later is correctly excluded the moment its own s and f move off baseline.
 
-        It also replaces an earlier cross-layer negative term (same (h, w) in every
-        OTHER layer should be flat, modelling venous drainage without neural activity
-        following it) -- removed because it assumed "not this source's own layer" meant
-        "no source there," which is false for config/simulation/three_layer_single_
-        source_shared_position*.yaml (2-3 layers deliberately share a genuine,
-        independently-active source at the same column), and more generally whenever ANY
-        layer above/below the labelled source has its own source. This gate subsumes
-        that intent correctly with no such assumption: it checks the model's OWN s/f at
-        every voxel (including that same-column-other-layer case), so a genuinely active
-        neighbour layer is naturally exempt (non-baseline s/f) rather than needing to be
-        specially excluded by position.
+        This gate naturally handles multi-layer scenarios. It checks the model's own s
+        and f values at every individual voxel. A genuinely active neighbor layer is
+        exempt because it will have non-baseline s and f values. This avoids the need
+        for manual coordinate exclusions.
 
-        Note this densely re-applies, over the whole grid every step, the exact same
-        constraint the physics loss's s-equation residual already implies -- it's needed
-        in addition because physics_loss is only evaluated at sparse collocation points
-        that are heavily biased toward the known source (dense_spatial_frac), so this
-        constraint is otherwise barely enforced away from the source at all.
+        This gate densely re-applies the constraint that the s-equation residual of
+        the physics loss implies. This dense application happens over the entire grid
+        at every step. It is needed because the physics loss is only evaluated at
+        sparse collocation points. Those points are heavily biased toward the known
+        source due to dense_spatial_frac. The constraint is otherwise barely enforced
+        away from the source.
         """
         x_idx, s_idx, f_idx = (
             self._signal_index("x"),
@@ -311,54 +296,64 @@ class MICHLossMixin(CollocationMixin):
         return states
 
     def _balloon_v_q_dot_targets(
-        self, f: torch.Tensor, v: torch.Tensor, q: torch.Tensor, order: str
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        f: torch.Tensor,
+        v: torch.Tensor,
+        q: torch.Tensor,
+        order: str,
+        need_v: bool = True,
+        need_q: bool = True,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Un-normalised (not yet divided by tau) dv/dt, dq/dt targets from the balloon
         ODE's v/q equations (order in {exact, linear, quadratic}). Shared by
         _compute_physics_layer_loss (evaluated on model states) and
         _derivative_supervision_loss (evaluated on ground-truth states) so the two
         formulas can't drift out of sync with each other.
-        """
-        alpha = self._physio("alpha")
-        E0 = self._physio("E0")
 
-        if order == "exact":
-            target_vdot = f - v ** (1 / alpha)
-        elif order == "linear":
-            f, v, q = f - 1, v - 1, q - 1
-            target_vdot = f - v / alpha
-            f, v, q = f + 1, v + 1, q + 1
-        elif order == "quadratic":
-            f, v, q = f - 1, v - 1, q - 1
-            target_vdot = f - v / alpha - (1 - alpha) / (2 * alpha**2) * v**2
-            f, v, q = f + 1, v + 1, q + 1
-        else:
+        need_v/need_q let a caller that only supervises one of the two skip computing
+        the other; both default to True to preserve the original always-compute-both
+        behaviour for _compute_physics_layer_loss.
+        """
+        if order not in ("exact", "linear", "quadratic"):
             raise ValueError(
                 f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}"
             )
+        alpha = self._physio("alpha")
+        E0 = self._physio("E0")
 
-        if order == "exact":
-            target_qdot = f * (1 - (1 - E0) ** (1 / f)) / E0 - q * v ** (1 / alpha - 1)
-        elif order == "linear":
-            f, v, q = f - 1, v - 1, q - 1
-            log_1mE0 = torch.log(torch.as_tensor(1 - E0, dtype=v.dtype, device=v.device))
-            beta_1 = (1 - E0) * log_1mE0 / E0
-            target_qdot = (1 + beta_1) * f - q - (1 / alpha - 1) * v
-            f, v, q = f + 1, v + 1, q + 1
-        elif order == "quadratic":
-            f, v, q = f - 1, v - 1, q - 1
-            log_1mE0 = torch.log(torch.as_tensor(1 - E0, dtype=v.dtype, device=v.device))
-            beta_1 = (1 - E0) * log_1mE0 / E0
-            beta_2 = beta_1 * log_1mE0 / 2
-            target_qdot = (
-                (1 + beta_1) * f
-                - q
-                - (1 / alpha - 1) * v
-                - beta_2 * f**2
-                - (1 / alpha - 1) * v * q
-                - (1 / 2) * (1 / alpha - 1) * (1 / alpha - 2) * v**2
-            )
-            f, v, q = f + 1, v + 1, q + 1
+        target_vdot = None
+        if need_v:
+            if order == "exact":
+                target_vdot = f - v ** (1 / alpha)
+            elif order == "linear":
+                f_, v_ = f - 1, v - 1
+                target_vdot = f_ - v_ / alpha
+            elif order == "quadratic":
+                f_, v_ = f - 1, v - 1
+                target_vdot = f_ - v_ / alpha - (1 - alpha) / (2 * alpha**2) * v_**2
+
+        target_qdot = None
+        if need_q:
+            if order == "exact":
+                target_qdot = f * (1 - (1 - E0) ** (1 / f)) / E0 - q * v ** (1 / alpha - 1)
+            elif order == "linear":
+                f_, v_, q_ = f - 1, v - 1, q - 1
+                log_1mE0 = torch.log(torch.as_tensor(1 - E0, dtype=v.dtype, device=v.device))
+                beta_1 = (1 - E0) * log_1mE0 / E0
+                target_qdot = (1 + beta_1) * f_ - q_ - (1 / alpha - 1) * v_
+            elif order == "quadratic":
+                f_, v_, q_ = f - 1, v - 1, q - 1
+                log_1mE0 = torch.log(torch.as_tensor(1 - E0, dtype=v.dtype, device=v.device))
+                beta_1 = (1 - E0) * log_1mE0 / E0
+                beta_2 = beta_1 * log_1mE0 / 2
+                target_qdot = (
+                    (1 + beta_1) * f_
+                    - q_
+                    - (1 / alpha - 1) * v_
+                    - beta_2 * f_**2
+                    - (1 / alpha - 1) * v_ * q_
+                    - (1 / 2) * (1 / alpha - 1) * (1 / alpha - 2) * v_**2
+                )
 
         return target_vdot, target_qdot
 
@@ -645,30 +640,35 @@ class MICHLossMixin(CollocationMixin):
         src_w = source_position[..., 1].long()
         mask = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
 
-        x_true = batch["neural"].float()  # [B, L, T_latent, H, W]
         s_true = batch["s"].float()
-        f_true = batch["f"].float()
-        v_true = batch["v"].float()
-        q_true = batch["q"].float()
         T_min = min(dz_hat_dt.shape[3], s_true.shape[2])
-        x_true, s_true, f_true, v_true, q_true = (
-            t[:, :, :T_min] for t in (x_true, s_true, f_true, v_true, q_true)
-        )
+        s_true = s_true[:, :, :T_min]
 
-        kappa = self._physio("kappa")
-        gamma = self._physio("gamma")
-        tau = self._physio("tau")
-        target_vdot, target_qdot = self._balloon_v_q_dot_targets(f_true, v_true, q_true, lc.order)
-        # NOTE: no cross-layer drain coupling here (unlike _compute_physics_layer_loss's
-        # vstar/qstar-deeper term) -- not needed for the currently-configured signals
-        # (s, f, v, q); would need extending before enabling "vstar"/"qstar" here for a
-        # multi-layer, lambda_d != 0 config.
-        analytic_target = {
-            "s": x_true - kappa * s_true - gamma * (f_true - 1.0),
-            "f": s_true,
-            "v": target_vdot / tau,
-            "q": target_qdot / tau,
-        }
+        analytic_target: dict[str, torch.Tensor] = {}
+        if "s" in signals:
+            x_true = batch["neural"].float()[:, :, :T_min]
+            f_true = batch["f"].float()[:, :, :T_min]
+            kappa = self._physio("kappa")
+            gamma = self._physio("gamma")
+            analytic_target["s"] = x_true - kappa * s_true - gamma * (f_true - 1.0)
+        if "f" in signals:
+            analytic_target["f"] = s_true
+        if "v" in signals or "q" in signals:
+            f_true = batch["f"].float()[:, :, :T_min]
+            v_true = batch["v"].float()[:, :, :T_min]
+            q_true = batch["q"].float()[:, :, :T_min]
+            tau = self._physio("tau")
+            # NOTE: no cross-layer drain coupling here (unlike _compute_physics_layer_loss's
+            # vstar/qstar-deeper term) -- not needed for the currently-configured signals
+            # (s, f, v, q); would need extending before enabling "vstar"/"qstar" here for a
+            # multi-layer, lambda_d != 0 config.
+            target_vdot, target_qdot = self._balloon_v_q_dot_targets(
+                f_true, v_true, q_true, lc.order, need_v="v" in signals, need_q="q" in signals
+            )
+            if "v" in signals:
+                analytic_target["v"] = target_vdot / tau
+            if "q" in signals:
+                analytic_target["q"] = target_qdot / tau
 
         per_sig: dict[str, torch.Tensor] = {}
         for sig in signals:
