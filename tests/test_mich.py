@@ -20,10 +20,10 @@ import pytest
 import torch
 import torch.optim
 import torch.optim.lr_scheduler
-import wandb
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import Callback
 
+import wandb
 from mich.data.synthetic import SyntheticDataModule
 from mich.models.blocks import HeinzleNet
 from mich.models.mich import MICH
@@ -555,6 +555,10 @@ class TestMICHSharedStepInternals:
         assert npearson_late == pytest.approx(0.0)
 
     def test_wandb_detailed_train_logging_includes_all_optional_terms(self, monkeypatch):
+        # _shared_step defers this dict to self._pending_train_log rather than logging it
+        # directly -- on_after_backward merges gradient norms in and performs the actual
+        # single wandb.log call for the step (see its own tests in test_mich_logging.py).
+        # This test covers _shared_step's own responsibility: building the right dict.
         fake_run = MagicMock()
         monkeypatch.setattr(wandb, "run", fake_run)
         model = _make_mich(
@@ -573,8 +577,9 @@ class TestMICHSharedStepInternals:
         batch = _make_full_batch()
         model._shared_step(batch, stage="train")
 
-        fake_run.log.assert_called_once()
-        (log_dict,), _ = fake_run.log.call_args
+        fake_run.log.assert_not_called()
+        log_dict = model._pending_train_log
+        assert log_dict is not None
         for key in (
             "train/loss/total",
             "train/loss/data",
@@ -611,7 +616,8 @@ class TestMICHSharedStepInternals:
         batch = _make_full_batch()
         model._shared_step(batch, stage="train")
 
-        (log_dict,), _ = fake_run.log.call_args
+        log_dict = model._pending_train_log
+        assert log_dict is not None
         assert log_dict["parameters/lambda_quiescence_consistency"] == pytest.approx(0.0)
         assert "train/loss/quiescence_consistency" not in log_dict
 
@@ -627,7 +633,8 @@ class TestMICHSharedStepInternals:
         batch = _make_full_batch()
         model._shared_step(batch, stage="train")
 
-        (log_dict,), _ = fake_run.log.call_args
+        log_dict = model._pending_train_log
+        assert log_dict is not None
         assert log_dict["parameters/lambda_quiescence_consistency"] == pytest.approx(1.0)
         assert "train/loss/quiescence_consistency" in log_dict
 
@@ -639,6 +646,7 @@ class TestMICHSharedStepInternals:
         batch = _make_full_batch()
         model._shared_step(batch, stage="train")
         fake_run.log.assert_not_called()
+        assert model._pending_train_log is None
 
     def test_wandb_detailed_logging_noop_on_val_stage(self, monkeypatch):
         """The detailed per-step wandb log is train-only; val stage must not call it

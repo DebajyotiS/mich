@@ -7,9 +7,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-import wandb
 from pytorch_lightning.loggers import WandbLogger
 
+import wandb
 from mich.models.mich_logging import MICHLoggingMixin
 
 
@@ -207,22 +207,38 @@ def test_plot_and_log_predictions_prefers_rank_run_over_wandb_run(monkeypatch):
 # -----------------------------
 
 
-def test_on_after_backward_noop_at_step_zero(monkeypatch):
+# `on_after_backward` no longer self-gates on step/cadence -- _shared_step decides whether
+# this is a logging step and, if so, sets `_pending_train_log` to the dict it built; these
+# tests set that attribute directly to simulate what _shared_step would have produced,
+# rather than relying on on_after_backward to reconstruct that decision itself. This is what
+# lets a real training step produce exactly one wandb history row instead of two -- see the
+# comment on `_pending_train_log`'s assignment in mich.py::_shared_step.
+
+
+def test_on_after_backward_noop_when_nothing_pending(monkeypatch):
+    fake_run = MagicMock()
+    monkeypatch.setattr(wandb, "run", fake_run)
+    trainer = _mk_trainer(log_every_n_steps=1)
+    host = _LoggingHost(trainer=trainer, global_step=3, heinzle_net=_mk_heinzle_net_double())
+    # _pending_train_log deliberately left unset -- mirrors a step _shared_step decided
+    # wasn't a logging step.
+    host.on_after_backward()
+    fake_run.log.assert_not_called()
+
+
+def test_on_after_backward_logs_pending_dict_without_grad_norms_at_step_zero(monkeypatch):
     fake_run = MagicMock()
     monkeypatch.setattr(wandb, "run", fake_run)
     trainer = _mk_trainer(log_every_n_steps=1)
     host = _LoggingHost(trainer=trainer, global_step=0, heinzle_net=_mk_heinzle_net_double())
+    host._pending_train_log = {"global_step": 0, "train/loss/total": 1.23}
     host.on_after_backward()
-    fake_run.log.assert_not_called()
 
-
-def test_on_after_backward_noop_off_logging_cadence(monkeypatch):
-    fake_run = MagicMock()
-    monkeypatch.setattr(wandb, "run", fake_run)
-    trainer = _mk_trainer(log_every_n_steps=5)
-    host = _LoggingHost(trainer=trainer, global_step=3, heinzle_net=_mk_heinzle_net_double())
-    host.on_after_backward()
-    fake_run.log.assert_not_called()
+    fake_run.log.assert_called_once()
+    (log_dict,), kwargs = fake_run.log.call_args
+    assert kwargs["step"] == 0
+    assert log_dict["train/loss/total"] == 1.23
+    assert not any(k.startswith("gradients/") for k in log_dict)
 
 
 def test_on_after_backward_noop_when_no_active_run(monkeypatch):
@@ -231,7 +247,17 @@ def test_on_after_backward_noop_when_no_active_run(monkeypatch):
     net = _mk_heinzle_net_double()
     _set_grad(net.spatial_decoder.time_film.linear)
     host = _LoggingHost(trainer=trainer, global_step=10, heinzle_net=net)
+    host._pending_train_log = {"global_step": 10}
     host.on_after_backward()  # must not raise despite gradients being present
+
+
+def test_on_after_backward_clears_pending_even_when_no_active_run(monkeypatch):
+    monkeypatch.setattr(wandb, "run", None)
+    trainer = _mk_trainer(log_every_n_steps=5, is_global_zero=True)
+    host = _LoggingHost(trainer=trainer, global_step=10, heinzle_net=_mk_heinzle_net_double())
+    host._pending_train_log = {"global_step": 10}
+    host.on_after_backward()
+    assert host._pending_train_log is None
 
 
 def test_on_after_backward_logs_grad_norms_when_run_active(monkeypatch):
@@ -243,11 +269,14 @@ def test_on_after_backward_logs_grad_norms_when_run_active(monkeypatch):
     _set_grad(net.spatial_decoder.time_film.out, 3.0)
     _set_grad(net.spatial_decoder.out_heads[0], 4.0)
     host = _LoggingHost(trainer=trainer, global_step=10, heinzle_net=net)
+    host._pending_train_log = {"global_step": 10, "train/loss/total": 0.5}
     host.on_after_backward()
 
     fake_run.log.assert_called_once()
-    (log_dict,), _ = fake_run.log.call_args
+    (log_dict,), kwargs = fake_run.log.call_args
+    assert kwargs["step"] == 10
     assert log_dict["global_step"] == 10
+    assert log_dict["train/loss/total"] == 0.5
     assert "gradients/film_linear_norm" in log_dict
     assert "gradients/film_out_norm" in log_dict
     assert "gradients/film_grad_norm" in log_dict
@@ -260,6 +289,7 @@ def test_on_after_backward_omits_keys_with_no_gradients(monkeypatch):
     trainer = _mk_trainer(log_every_n_steps=1, is_global_zero=True)
     net = _mk_heinzle_net_double()  # no .grad set on anything
     host = _LoggingHost(trainer=trainer, global_step=1, heinzle_net=net)
+    host._pending_train_log = {"global_step": 1}
     host.on_after_backward()
 
     fake_run.log.assert_called_once()
@@ -274,6 +304,7 @@ def test_on_after_backward_uses_rank_run_when_not_global_zero(monkeypatch):
     net = _mk_heinzle_net_double()
     _set_grad(net.spatial_decoder.time_film.linear)
     host = _LoggingHost(trainer=trainer, global_step=1, heinzle_net=net)
+    host._pending_train_log = {"global_step": 1}
     rank_run = MagicMock()
     host._rank_run = rank_run
     host.on_after_backward()

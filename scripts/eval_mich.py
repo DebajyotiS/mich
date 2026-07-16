@@ -43,14 +43,15 @@ import rich
 import rich.console
 import rich.markup
 import torch
-import wandb
 from hydra.utils import instantiate
 from matplotlib.animation import FuncAnimation, PillowWriter
+from omegaconf import DictConfig, OmegaConf, open_dict
+from torch.utils.data import default_collate
+
+import wandb
 from mich import CONFIG_DIR
 from mich.data.synthetic import SyntheticH5Dataset, discover_layers
 from mich.utils.plotting import LAYER_NAMES, plot_latent_layers, plot_neural_bold_layers
-from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.utils.data import default_collate
 
 console = rich.console.Console()
 
@@ -268,7 +269,7 @@ def grid_metrics_fn(model_cls) -> callable:
 def compute_grid_metrics(
     pred_full: torch.Tensor, true_full: torch.Tensor, metrics_fn, max_rows: int = 20000
 ):
-    """Same R²/Pearson/lag metric, but over every spatial voxel (not just source voxels) --
+    """Same R2/Pearson/lag metric, but over every spatial voxel (not just source voxels) --
     exposes whether the model hallucinates activity in silent background regions."""
     B, L, T, H, W = true_full.shape
     pred = pred_full.permute(0, 1, 3, 4, 2).reshape(-1, T)

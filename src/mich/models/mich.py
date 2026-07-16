@@ -5,9 +5,9 @@ from functools import partial
 from typing import Any, Literal, Mapping
 
 import torch
-import wandb
 from pytorch_lightning import LightningModule
 
+import wandb
 from mich.models.blocks import SpatialDecoderManifest
 from mich.models.mich_logging import MICHLoggingMixin
 from mich.models.mich_losses import MICHLossMixin
@@ -148,11 +148,6 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         else:
             source_activity_loss = None
 
-        # Independent schedule from source_activity above: s=0, f=1 is the trivial
-        # baseline every signal starts near before data_loss/physics_loss have shaped any
-        # real dynamics, so this must ramp in only after those have had time to settle
-        # (see delay_steps_quiescence_consistency's default/comment) -- not gated behind
-        # lambda_source_activity being active at all.
         lambda_quiescence_consistency_eff = self._get_scheduled_lambda(
             getattr(lc, "lambda_quiescence_consistency", 0.0),
             getattr(lc, "warmup_steps_quiescence_consistency", 0),
@@ -207,17 +202,6 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         xp_npearson_eff = None
         xp_pearson_eff = None
         if getattr(lc, "supervise_x_phase", False):
-            # Optional curriculum, shared anneal window for both:
-            #  (a) x_phase_loss's internal mse/pearson balance, MSE-favoring (stable, penalizes
-            #      overshoot directly) -> pearson-favoring (sharper phase alignment, more ringing).
-            #  (b) lambda_x_phase itself, ramped upward so x_phase's share of the total gradient
-            #      doesn't fade late in training even as dzdt_supervision's raw loss comes to
-            #      dominate the (naturally shrinking) other terms -- see the loss-scale audit
-            #      that motivated this: x_phase's weighted share fell from ~6.6% of total_loss
-            #      early in training to ~1.9% late, while dzdt_supervision grew from ~0.3% to
-            #      ~63%, i.e. x_phase's influence was fading exactly when fine phase-alignment
-            #      pressure matters most.
-            # Both are no-ops (hold their static values) unless anneal_end_step > anneal_start_step.
             xp_cfg = getattr(lc, "x_phase_loss", None)
             anneal_start_step = getattr(lc, "x_phase_ratio_anneal_start_step", 0)
             anneal_end_step = getattr(lc, "x_phase_ratio_anneal_end_step", 0)
@@ -355,6 +339,8 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             )
 
         _direct_run = wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
+        if stage == "train":
+            self._pending_train_log = None
         if (
             stage == "train"
             and _direct_run is not None
@@ -430,7 +416,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                         "train/loss_weighted/x_phase": (x_phase_loss * lambda_x_phase_eff).item(),
                     }
                 )
-            _direct_run.log(log_dict)
+            self._pending_train_log = log_dict
 
         if stage == "train":
             return MICHManifest(
@@ -528,10 +514,32 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         metrics = self._neural_recovery_metrics(
             all_pred_neural[src_mask], all_true_neural[src_mask]
         )
+
+        pred_neural_full = z_hat[:, self._signal_index("x")]  # [B, L, T, H, W]
+        T = pred_neural_full.shape[2]
+        pred_flat = pred_neural_full.permute(0, 1, 3, 4, 2).reshape(-1, T)
+        true_flat = neural.permute(0, 1, 3, 4, 2).reshape(-1, T)
+        max_rows = 20000
+        if pred_flat.shape[0] > max_rows:
+            grid_idx = torch.randperm(pred_flat.shape[0], device=pred_flat.device)[:max_rows]
+            pred_flat, true_flat = pred_flat[grid_idx], true_flat[grid_idx]
+            
+        grid_metrics_raw = self._neural_recovery_metrics(pred_flat, true_flat)
+        grid_metrics = {
+            "val/neural/grid_pearson": grid_metrics_raw["val/neural/pearson"],
+        }
+
         run = getattr(self, "_rank_run", None) or wandb.run
         if run is not None:
-            run.log({"global_step": self.global_step, **metrics})
-        for k, v in metrics.items():
+            # commit=False when images follow so this merges into the same wandb history
+            # row as the media logged just below, instead of a separate row -- see the
+            # _pending_train_log comment above for why that matters.
+            run.log(
+                {"global_step": self.global_step, **metrics, **grid_metrics},
+                step=self.global_step,
+                commit=not log_images,
+            )
+        for k, v in {**metrics, **grid_metrics}.items():
             self.log(k, v, on_epoch=True, sync_dist=True, logger=True)
 
         if not log_images:
@@ -547,9 +555,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         subset_src_pos = source_position[random_indices]  # [B, S, 2]
         subset_src_layer = source_layer[random_indices]  # [B, S]
         subset_num_sources = num_sources[random_indices]  # [B]
-        # Trace-extraction below shows one representative voxel per sample (not per
-        # source) to keep the existing single-voxel plot layout; slot 0 is always a
-        # valid source since num_sources >= 1 for every sample.
+
         subset_h = subset_src_pos[:, 0, 0]
         subset_w = subset_src_pos[:, 0, 1]
         batch_idx = torch.arange(subset_bold.shape[0])

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import torch
-import wandb
 from pytorch_lightning.loggers import WandbLogger
 
+import wandb
 from mich.utils.plotting import plot_latent_layers, plot_neural_bold_layers
 
 
@@ -19,14 +19,14 @@ class MICHLoggingMixin:
         pred: torch.Tensor,  # [B, L, T]
         true: torch.Tensor,  # [B, L, T]
     ) -> dict[str, float]:
-        """R², Pearson r, and peak cross-correlation lag averaged over samples and layers."""
+        """R2, Pearson r, and peak cross-correlation lag averaged over samples and layers."""
         pred = pred.float()
         true = true.float()
         T = pred.shape[-1]
         flat_pred = pred.reshape(-1, T)  # [B*L, T]
         flat_true = true.reshape(-1, T)
 
-        # R²
+        # R2
         ss_res = ((flat_true - flat_pred) ** 2).sum(dim=-1)
         ss_tot = ((flat_true - flat_true.mean(dim=-1, keepdim=True)) ** 2).sum(dim=-1)
         r2 = (1 - ss_res / ss_tot.clamp(min=1e-8)).mean().item()
@@ -105,7 +105,11 @@ class MICHLoggingMixin:
             images.append(wandb.Image(fig))
             plt.close(fig)
         if run is not None and images:
-            run.log({"global_step": self.global_step, "media/x_recon": images}, commit=False)
+            run.log(
+                {"global_step": self.global_step, "media/x_recon": images},
+                step=self.global_step,
+                commit=False,
+            )
 
     def _plot_and_log_predictions(
         self,
@@ -132,7 +136,11 @@ class MICHLoggingMixin:
             images.append(wandb.Image(image))
             plt.close(image)
         if run is not None and images:
-            run.log({"global_step": self.global_step, "media/predictions": images}, commit=False)
+            run.log(
+                {"global_step": self.global_step, "media/predictions": images},
+                step=self.global_step,
+                commit=False,
+            )
 
     def _plot_and_log_latents(
         self,
@@ -183,32 +191,36 @@ class MICHLoggingMixin:
             images.append(wandb.Image(image))
             plt.close(image)
         if run is not None and images:
-            run.log({"global_step": self.global_step, "media/latents": images}, commit=True)
+            run.log(
+                {"global_step": self.global_step, "media/latents": images},
+                step=self.global_step,
+                commit=True,
+            )
 
     def on_after_backward(self):
-        if self.global_step == 0:
+
+        pending = getattr(self, "_pending_train_log", None)
+        self._pending_train_log = None
+        if pending is None:
             return
-        if self.global_step % self.trainer.log_every_n_steps == 0:
-            _direct_run = (
-                wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
-            )
-            if _direct_run is None:
-                return
 
-            log_dict = {"global_step": self.global_step}
+        _direct_run = wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
+        if _direct_run is None:
+            return
 
+        if self.global_step != 0:
             # FiLM linear vs output layer grad norms
             decoder = self.heinzle_net.spatial_decoder
             film = decoder.time_film
             linear_norms = [p.grad.norm() for p in film.linear.parameters() if p.grad is not None]
             out_norms = [p.grad.norm() for p in film.out.parameters() if p.grad is not None]
             if linear_norms:
-                log_dict["gradients/film_linear_norm"] = torch.stack(linear_norms).norm().item()
+                pending["gradients/film_linear_norm"] = torch.stack(linear_norms).norm().item()
             if out_norms:
-                log_dict["gradients/film_out_norm"] = torch.stack(out_norms).norm().item()
+                pending["gradients/film_out_norm"] = torch.stack(out_norms).norm().item()
             all_film_norms = linear_norms + out_norms
             if all_film_norms:
-                log_dict["gradients/film_grad_norm"] = torch.stack(all_film_norms).norm().item()
+                pending["gradients/film_grad_norm"] = torch.stack(all_film_norms).norm().item()
 
             # Output head grad norms
             head_norms = [
@@ -218,9 +230,9 @@ class MICHLoggingMixin:
                 if p.grad is not None
             ]
             if head_norms:
-                log_dict["gradients/out_heads_norm"] = torch.stack(head_norms).norm().item()
+                pending["gradients/out_heads_norm"] = torch.stack(head_norms).norm().item()
 
-            _direct_run.log(log_dict)
+        _direct_run.log(pending, step=self.global_step)
 
     def on_fit_start(self) -> None:
         if not isinstance(self.trainer.logger, WandbLogger):

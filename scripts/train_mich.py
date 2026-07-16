@@ -7,6 +7,8 @@ import hydra
 import pytorch_lightning as pl
 import torch
 from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf, open_dict
+
 from mich import CONFIG_DIR
 from mich.data.synthetic import compute_split_counts, discover_layers
 from mich.models.blocks import HEINZLE_SIGNALS, HEINZLE_SIGNALS_SINGLE
@@ -17,7 +19,6 @@ from mich.utils.hydra_utils import (
     reload_original_config,
     save_config,
 )
-from omegaconf import DictConfig, OmegaConf, open_dict
 
 log = logging.getLogger(__name__)
 

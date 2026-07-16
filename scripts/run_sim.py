@@ -8,6 +8,8 @@ from pathlib import Path
 import h5py
 import hydra
 import numpy as np
+from omegaconf import DictConfig, OmegaConf
+
 from mich import CONFIG_DIR
 from mich.data.balloon import (
     AcquisitionConstants,
@@ -22,7 +24,6 @@ from mich.data.balloon import (
 )
 from mich.data.neuronal import LayeredDiffusionSimulator, NeuralSimulatorParams
 from mich.data.signals import Noise, Pulse, Sources
-from omegaconf import DictConfig, OmegaConf
 
 # Maps pulse_type -> ordered extra parameter names (following amplitude and onset).
 _PULSE_EXTRA_PARAMS: dict[str, list[str]] = {
@@ -131,6 +132,7 @@ def _run_neural(
     num_layers: int = sc["num_layers"]
     grid_size = tuple(sc["grid_size"])
     dt: float = sc["dt"]
+    haemo_dt: float = sc.get("haemo_dt", dt)
     time_duration: int = sc["time_duration"]
     max_pulses: int = sc["max_pulses"]
     isi_min: int = sc.get("isi_min", 20)
@@ -190,7 +192,7 @@ def _run_neural(
             width_range,
             isi_min,
             time_duration,
-            dt,
+            haemo_dt,  # generate at fine resolution -- see test_pulse_generation_resolution_bug.py
             baseline_mode,
         )
 
@@ -222,7 +224,7 @@ def _run_neural(
                     width_range,
                     isi_min,
                     time_duration,
-                    dt,
+                    haemo_dt,  # generate at fine resolution -- see test_pulse_generation_resolution_bug.py
                     baseline_mode,
                 )
 
@@ -270,10 +272,11 @@ def _run_haemo_and_bold(
     if haemo_ratio < 1:
         raise ValueError(f"haemo_dt ({haemo_dt}) must be <= dt ({dt})")
 
-    if haemo_ratio > 1:
-        x_inputs_haemo = [np.repeat(xi, haemo_ratio, axis=0) for xi in x_inputs]
-    else:
-        x_inputs_haemo = x_inputs
+    # x_inputs is generated directly at haemo_dt resolution by _run_neural now -- no
+    # upsample-by-repeat needed. (Previously this repeated a coarse-generated pulse, which
+    # quantized pulse edges to the storage grid -- see
+    # tests/diagnostics/test_pulse_generation_resolution_bug.py.)
+    x_inputs_haemo = x_inputs
 
     cortex_layers: list[CortexLayer] = []
     for i, lc in enumerate(layers_cfg):
@@ -352,8 +355,13 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
     num_layers: int = sc["num_layers"]
     grid_size = tuple(sc["grid_size"])
     dt: float = sc["dt"]
+    haemo_dt: float = sc.get("haemo_dt", dt)
     time_duration: int = sc["time_duration"]
-    steps: int = int(time_duration / dt)
+    # Neural/diffusion simulation now runs at haemo_dt (fine) resolution, same as the
+    # balloon stage always did -- generating the pulse at the coarse `dt` first and
+    # upsampling it (the old behavior) quantized pulse edges to the storage grid; see
+    # tests/diagnostics/test_pulse_generation_resolution_bug.py.
+    steps: int = int(round(time_duration / haemo_dt))
 
     layers_cfg: list[dict] = sc["layers"]
     bold_cfg = cfg.get("bold", {})
@@ -377,7 +385,7 @@ def run_simulation(cfg: dict, seed: int | None = None) -> dict:
         grid_size=grid_size,
         diffusion_coefficient_intra=sc["diffusion_coefficient_intra"],
         diffusion_coefficient_inter=sc["diffusion_coefficient_inter"],
-        dt=dt,
+        dt=haemo_dt,
         decay_rate=sc.get("decay_rate", 0.5),
     )
 

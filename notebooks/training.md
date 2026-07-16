@@ -179,7 +179,7 @@ At validation time, the model is evaluated on held-out synthetic data with known
 
 Validation runs the full forward pass including time derivatives, unconditionally, regardless of the physics loss schedule, since the schedule is a training device and validation should always reflect the full model capability. The same losses as in training are computed and logged, but the primary diagnostic is the visual comparison of predicted and ground-truth trajectories at the source voxel.
 
-Two sets of plots are generated at the end of each validation epoch. The first compares predicted and true BOLD signals alongside predicted and true neural activity $x$ across all layers, for a random subset of validation samples. The second compares the full set of predicted and true latent trajectories ($s$, $f$, $v$, $q$, and $v^*$, $q^*$ where applicable) in the same format. These plots are logged to Weights and Biases and serve as the primary qualitative indicator of training progress, alongside quantitative recovery metrics (R², Pearson correlation, peak cross-correlation lag) computed over the full validation set.
+Two sets of plots are generated at the end of each validation epoch. The first compares predicted and true BOLD signals alongside predicted and true neural activity $x$ across all layers, for a random subset of validation samples. The second compares the full set of predicted and true latent trajectories ($s$, $f$, $v$, $q$, and $v^*$, $q^*$ where applicable) in the same format. These plots are logged to Weights and Biases and serve as the primary qualitative indicator of training progress, alongside quantitative recovery metrics (R2, Pearson correlation, peak cross-correlation lag) computed over the full validation set.
 
 ---
 
