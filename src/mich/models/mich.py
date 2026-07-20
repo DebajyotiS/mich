@@ -7,7 +7,6 @@ from typing import Any, Literal, Mapping
 import torch
 from pytorch_lightning import LightningModule
 
-import wandb
 from mich.models.blocks import SpatialDecoderManifest
 from mich.models.mich_logging import MICHLoggingMixin
 from mich.models.mich_losses import MICHLossMixin
@@ -338,12 +337,12 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 logger=_to_logger,
             )
 
-        _direct_run = wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
+        _adapter = getattr(self, "_adapter", None)
         if stage == "train":
             self._pending_train_log = None
         if (
             stage == "train"
-            and _direct_run is not None
+            and _adapter is not None
             and self.global_step % self.trainer.log_every_n_steps == 0
         ):
             log_dict = {
@@ -529,12 +528,12 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             "val/neural/grid_pearson": grid_metrics_raw["val/neural/pearson"],
         }
 
-        run = getattr(self, "_rank_run", None) or wandb.run
-        if run is not None:
+        adapter = getattr(self, "_adapter", None)
+        if adapter is not None:
             # commit=False when images follow so this merges into the same wandb history
             # row as the media logged just below, instead of a separate row -- see the
             # _pending_train_log comment above for why that matters.
-            run.log(
+            adapter.log(
                 {"global_step": self.global_step, **metrics, **grid_metrics},
                 commit=not log_images,
             )
@@ -544,7 +543,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         if not log_images:
             return
 
-        # Each rank logs its own plots to its own W&B run -- no gather needed.
+        # Each rank logs its own plots to its own run -- no gather needed.
         subset = min(10, bold.shape[0])
         random_indices = torch.randperm(bold.shape[0])[:subset]
         subset_bold = bold[random_indices]

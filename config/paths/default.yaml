@@ -2,3 +2,8 @@ output_dir: ${private.output_dir}
 data_dir: ${private.data_dir}
 root_dir: ${private.root_dir}
 full_path: ${private.output_dir}/${project_name}/${network_name}/
+mlflow_tracking_uri: sqlite:///${private.output_dir}/${project_name}/mlflow.db
+# Explicit, not left to mlflow's CWD-relative default (which would otherwise pin
+# artifact storage for an entire project to whichever network dir Hydra happened to
+# chdir into on the run that first created the experiment).
+mlflow_artifact_root: file:${private.output_dir}/${project_name}/mlartifacts

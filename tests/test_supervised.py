@@ -9,10 +9,10 @@ Coverage:
     buffers untouched (via a real Trainer.fit(), since self.log() requires
     an attached Trainer)
   - training_step / validation_step: thin-wrapper delegation to _shared_step
-  - on_validation_epoch_end: empty-buffer no-op, wandb.run is None path,
-    wandb.run mocked path (scalar metrics + image logging + buffer clearing),
-    and an empirical check of the bold/true source-position pairing in the
-    plotting subset (see TestOnValidationEpochEndSourcePairing docstring)
+  - on_validation_epoch_end: empty-buffer no-op, no-adapter path, mocked-adapter
+    path (scalar metrics + image logging + buffer clearing), and an empirical
+    check of the bold/true source-position pairing in the plotting subset (see
+    TestOnValidationEpochEndSourcePairing docstring)
   - configure_optimizers: returned dict structure
   - full Trainer.fit() smoke test (marked slow)
 """
@@ -27,11 +27,11 @@ import pytest
 import torch
 import torch.optim
 import torch.optim.lr_scheduler
-import wandb
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import Callback
 from torch.utils.data import DataLoader, Dataset
 
+from mich.models import supervised
 from mich.models.blocks import FullySupervisedNet
 from mich.models.supervised import SupervisedMICH
 
@@ -384,10 +384,11 @@ class TestOnValidationEpochEnd:
         assert model._pred_buffer == []
 
     @pytest.mark.slow
-    def test_wandb_run_none_runs_fully_without_touching_run(self, monkeypatch):
-        """Default state (no wandb.init() anywhere in this suite): metrics get
-        computed/logged, but the image-logging branch must no-op cleanly."""
-        monkeypatch.setattr(wandb, "run", None)
+    def test_no_adapter_runs_fully_without_touching_it(self, monkeypatch):
+        """Default state (no logger attached, so make_rank_zero_adapter returns
+        None): metrics get computed/logged, but the image-logging branch must
+        no-op cleanly."""
+        monkeypatch.setattr(supervised, "make_rank_zero_adapter", lambda trainer: None)
         model = _make_model()
         val_batches = [_make_batch(), _make_batch()]
 
@@ -413,13 +414,13 @@ class TestOnValidationEpochEnd:
         assert model._pred_buffer == []
 
     @pytest.mark.slow
-    def test_wandb_run_mocked_logs_scalars_and_images_then_clears_buffers(self, monkeypatch):
-        """With a fake wandb.run, run.log() must be called at least twice: once
+    def test_adapter_mocked_logs_scalars_and_images_then_clears_buffers(self, monkeypatch):
+        """With a fake adapter, adapter.log() must be called at least twice: once
         with the scalar recovery metrics, once with 'val/predictions' images.
         A second call with no new validation_step data must early-return
         cleanly (same as the empty-buffer path)."""
         fake_run = MagicMock()
-        monkeypatch.setattr(wandb, "run", fake_run)
+        monkeypatch.setattr(supervised, "make_rank_zero_adapter", lambda trainer: fake_run)
 
         model = _make_model()
         val_batches = [_make_batch(), _make_batch()]
@@ -504,7 +505,7 @@ class TestOnValidationEpochEndSourcePairing:
             return plt.figure()
 
         monkeypatch.setattr("mich.models.supervised.plot_neural_bold_layers", _fake_plot)
-        monkeypatch.setattr(wandb, "run", MagicMock())
+        monkeypatch.setattr(supervised, "make_rank_zero_adapter", lambda trainer: MagicMock())
 
         trainer = Trainer(
             max_epochs=1,

@@ -1,18 +1,18 @@
-"""Validation-time metrics, W&B plotting, and rank-run/gradient-norm hooks for MICH."""
+"""Validation-time metrics, plotting, and rank-run/gradient-norm hooks for MICH."""
 
 from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import torch
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
 
-import wandb
 from mich.utils.plotting import plot_latent_layers, plot_neural_bold_layers
+from mich.utils.run_adapters import gpu_stats, make_run_adapter
 
 
 class MICHLoggingMixin:
-    """Neural-recovery metrics, W&B plot assembly, and the PL hooks that manage per-rank
-    W&B runs and gradient-norm logging. Pure side effects -- no loss/physics math here."""
+    """Neural-recovery metrics, plot assembly, and the PL hooks that manage per-rank
+    runs and gradient-norm logging. Pure side effects -- no loss/physics math here."""
 
     @staticmethod
     def _neural_recovery_metrics(
@@ -57,7 +57,7 @@ class MICHLoggingMixin:
     def _plot_and_log_x_recon(
         self, pred_neural, pred_x_recon, true_x_recon, true_neural, source_layer, num_sources
     ):
-        run = getattr(self, "_rank_run", None) or wandb.run
+        adapter = getattr(self, "_adapter", None)
         layer_names = ["Deep", "Middle", "Superficial"]
         images = []
         for i in range(pred_neural.shape[0]):
@@ -102,13 +102,14 @@ class MICHLoggingMixin:
                 ax.legend(fontsize=6)
             fig.suptitle("x: head vs ODE reconstruction")
             fig.tight_layout()
-            images.append(wandb.Image(fig))
-            plt.close(fig)
-        if run is not None and images:
-            run.log(
+            images.append(fig)
+        if adapter is not None and images:
+            adapter.log(
                 {"global_step": self.global_step, "media/x_recon": images},
                 commit=False,
             )
+        for fig in images:
+            plt.close(fig)
 
     def _plot_and_log_predictions(
         self,
@@ -120,7 +121,7 @@ class MICHLoggingMixin:
         source_pos,
         num_sources,
     ):
-        run = getattr(self, "_rank_run", None) or wandb.run
+        adapter = getattr(self, "_adapter", None)
         images = []
         for i in range(pred_bold.shape[0]):
             image = plot_neural_bold_layers(
@@ -132,13 +133,14 @@ class MICHLoggingMixin:
                 source_pos=source_pos[i],
                 num_sources=num_sources[i],
             )
-            images.append(wandb.Image(image))
-            plt.close(image)
-        if run is not None and images:
-            run.log(
+            images.append(image)
+        if adapter is not None and images:
+            adapter.log(
                 {"global_step": self.global_step, "media/predictions": images},
                 commit=False,
             )
+        for image in images:
+            plt.close(image)
 
     def _plot_and_log_latents(
         self,
@@ -155,7 +157,7 @@ class MICHLoggingMixin:
         pred_q_star=None,
         true_q_star=None,
     ):
-        run = getattr(self, "_rank_run", None) or wandb.run
+        adapter = getattr(self, "_adapter", None)
         images = []
         for i in range(pred_s.shape[0]):
             if pred_v_star is not None:
@@ -186,13 +188,14 @@ class MICHLoggingMixin:
                     true_q=true_q[i],
                     title="Latent States",
                 )
-            images.append(wandb.Image(image))
-            plt.close(image)
-        if run is not None and images:
-            run.log(
+            images.append(image)
+        if adapter is not None and images:
+            adapter.log(
                 {"global_step": self.global_step, "media/latents": images},
                 commit=True,
             )
+        for image in images:
+            plt.close(image)
 
     def on_after_backward(self):
 
@@ -201,8 +204,8 @@ class MICHLoggingMixin:
         if pending is None:
             return
 
-        _direct_run = wandb.run if self.trainer.is_global_zero else getattr(self, "_rank_run", None)
-        if _direct_run is None:
+        adapter = getattr(self, "_adapter", None)
+        if adapter is None:
             return
 
         if self.global_step != 0:
@@ -229,28 +232,17 @@ class MICHLoggingMixin:
             if head_norms:
                 pending["gradients/out_heads_norm"] = torch.stack(head_norms).norm().item()
 
-        _direct_run.log(pending)
+        pending.update(gpu_stats())
+        adapter.log(pending)
 
     def on_fit_start(self) -> None:
-        if not isinstance(self.trainer.logger, WandbLogger):
+        if not isinstance(self.trainer.logger, (WandbLogger, MLFlowLogger)):
             return
-        if self.trainer.is_global_zero:
-            wandb.define_metric("global_step")
-            wandb.define_metric("*", step_metric="global_step")
-            return
-        logger = self.trainer.logger
-        base_name = logger._wandb_init.get("name", logger.name).rsplit(": rank", 1)[0]
-        init_kwargs = {
-            **logger._wandb_init,
-            "name": f"{base_name}: rank {self.global_rank}",
-            "reinit": True,
-        }
-        self._rank_run = wandb.init(**init_kwargs)
-        self._rank_run.define_metric("global_step")
-        self._rank_run.define_metric("*", step_metric="global_step")
+        self._adapter = make_run_adapter(self.trainer, self.global_rank)
+        self._adapter.configure_step_metric()
 
     def on_fit_end(self) -> None:
-        rank_run = getattr(self, "_rank_run", None)
-        if not self.trainer.is_global_zero and rank_run is not None:
-            rank_run.finish()
-            self._rank_run = None
+        adapter = getattr(self, "_adapter", None)
+        if not self.trainer.is_global_zero and adapter is not None:
+            adapter.finish()
+            self._adapter = None

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-import wandb
 from pytorch_lightning import LightningModule
 
 from mich.models.blocks import FullySupervisedNet
 from mich.utils.plotting import plot_neural_bold_layers
+from mich.utils.run_adapters import make_rank_zero_adapter
 
 
 class SupervisedMICH(LightningModule):
@@ -167,9 +167,9 @@ class SupervisedMICH(LightningModule):
         neural_src = neural[b_idx, :, :, src_h, src_w]  # [N, L, T]
 
         metrics = self._neural_recovery_metrics(pred_src, neural_src)
-        run = wandb.run
-        if run is not None:
-            run.log({"global_step": self.global_step, **metrics})
+        adapter = make_rank_zero_adapter(self.trainer)
+        if adapter is not None:
+            adapter.log({"global_step": self.global_step, **metrics})
         for k, v in metrics.items():
             self.log(k, v, on_epoch=True, sync_dist=True, logger=True)
 
@@ -180,8 +180,7 @@ class SupervisedMICH(LightningModule):
         pred_plot = pred_src[idx].float()
         true_plot = neural_src[idx].float()
 
-        run = wandb.run
-        if run is None:
+        if adapter is None:
             return
         images = []
         for i in range(subset):
@@ -193,11 +192,12 @@ class SupervisedMICH(LightningModule):
                 source_layer=torch.zeros(1, dtype=torch.long),
                 source_pos=src_pos[idx[i] : idx[i] + 1],
             )
-            images.append(wandb.Image(fig, caption=f"val sample {i}"))
-            import matplotlib.pyplot as plt
+            images.append(fig)
+        adapter.log({"global_step": self.global_step, "val/predictions": images})
+        import matplotlib.pyplot as plt
 
+        for fig in images:
             plt.close(fig)
-        run.log({"global_step": self.global_step, "val/predictions": images})
 
     # ------------------------------------------------------------------
     # Optimizer

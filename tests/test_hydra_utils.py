@@ -11,9 +11,10 @@ import pytest
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-import wandb
 from omegaconf import OmegaConf
+from pytorch_lightning.loggers import MLFlowLogger
 
+import wandb
 from mich.utils.hydra_utils import (
     instantiate_collection,
     log_hyperparameters,
@@ -37,6 +38,18 @@ def _touch(path, mtime=None):
     path.write_text("")
     if mtime is not None:
         os.utime(path, (mtime, mtime))
+
+
+def _mk_initialized_mlflow_logger(tmp_path, run_id="mlflow-run-abc"):
+    """A real MLFlowLogger with its lazy `.run_id` already resolved, so touching
+    it never hits a real store. tracking_uri still points at a real (tmp_path)
+    sqlite file because MLFlowLogger.__init__ eagerly creates its MlflowClient,
+    which itself eagerly initializes the sqlite store as a side effect."""
+    logger = MLFlowLogger(experiment_name="unused", tracking_uri=f"sqlite:///{tmp_path}/unused.db")
+    logger._initialized = True
+    logger._run_id = run_id
+    logger._experiment_id = "exp-1"
+    return logger
 
 
 class _TinyModule(pl.LightningModule):
@@ -248,6 +261,47 @@ def test_save_config_sets_wandb_id_from_active_run_and_resolves_interpolations(
     assert saved.loggers.wandb.id == "run-abc123"
     # interpolation resolved to its literal value on disk, not left as "${other.field}"
     assert saved.loggers.wandb.note == 42
+
+
+def test_save_config_mlflow_subkey_untouched_without_logger_passed(tmp_path):
+    cfg = OmegaConf.create(
+        {"paths": {"full_path": str(tmp_path)}, "loggers": {"mlflow": {"run_id": "orig-id"}}}
+    )
+    save_config(cfg)  # loggers=None -- no MLFlowLogger instance to read run_id from
+
+    assert cfg.loggers.mlflow.run_id == "orig-id"
+    saved = OmegaConf.load(tmp_path / "full_config.yaml")
+    assert saved.loggers.mlflow.run_id == "orig-id"
+
+
+def test_save_config_sets_mlflow_run_id_from_passed_logger(tmp_path):
+    mlflow_logger = _mk_initialized_mlflow_logger(tmp_path, run_id="mlflow-run-xyz")
+    cfg = OmegaConf.create(
+        {"paths": {"full_path": str(tmp_path)}, "loggers": {"mlflow": {"run_id": None}}}
+    )
+    save_config(cfg, loggers=[mlflow_logger])
+
+    assert cfg.loggers.mlflow.run_id == "mlflow-run-xyz"
+    saved = OmegaConf.load(tmp_path / "full_config.yaml")
+    assert saved.loggers.mlflow.run_id == "mlflow-run-xyz"
+
+
+def test_save_config_wandb_and_mlflow_branches_are_independent(tmp_path, monkeypatch):
+    fake_run = Mock()
+    fake_run.id = "wandb-run-1"
+    monkeypatch.setattr(wandb, "run", fake_run)
+    mlflow_logger = _mk_initialized_mlflow_logger(tmp_path, run_id="mlflow-run-1")
+
+    cfg = OmegaConf.create(
+        {
+            "paths": {"full_path": str(tmp_path)},
+            "loggers": {"wandb": {"id": "placeholder"}, "mlflow": {"run_id": None}},
+        }
+    )
+    save_config(cfg, loggers=[mlflow_logger])
+
+    assert cfg.loggers.wandb.id == "wandb-run-1"
+    assert cfg.loggers.mlflow.run_id == "mlflow-run-1"
 
 
 # -----------------------------

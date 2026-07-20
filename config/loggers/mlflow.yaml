@@ -1,0 +1,10 @@
+mlflow:
+  _target_: pytorch_lightning.loggers.mlflow.MLFlowLogger
+  experiment_name: ${project_name}
+  run_name: "${network_name}: rank 0"
+  tracking_uri: ${paths.mlflow_tracking_uri}
+  artifact_location: ${paths.mlflow_artifact_root}
+  tags:
+    network_name: ${network_name}
+  log_model: False
+  run_id: null

@@ -11,10 +11,12 @@ import hydra
 import rich
 import rich.syntax
 import rich.tree
-import wandb
 from lightning import LightningModule, Trainer
 from lightning_fabric.utilities.rank_zero import rank_zero_only
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from pytorch_lightning.loggers import MLFlowLogger
+
+import wandb
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +111,7 @@ def print_config(
 
 
 @rank_zero_only
-def save_config(cfg: DictConfig) -> None:
+def save_config(cfg: DictConfig, loggers: Sequence[Any] | None = None) -> None:
     """Saves the config to the output directory.
 
     This is necc ontop of hydra's default conf.yaml as it will resolve the entries
@@ -120,11 +122,20 @@ def save_config(cfg: DictConfig) -> None:
     the default config.yaml file on startup, so this backup is needed for resuming.
     """
 
-    # In order to be able to resume the wandb logger session, save the run id
     if hasattr(cfg, "loggers"):
+        # In order to be able to resume the wandb logger session, save the run id
         if hasattr(cfg.loggers, "wandb"):
             if wandb.run is not None:
                 cfg.loggers.wandb.id = wandb.run.id
+
+        # Same idea for mlflow -- unlike wandb.run, mlflow has no ambient global run,
+        # so the active MLFlowLogger has to be handed in explicitly.
+        if hasattr(cfg.loggers, "mlflow"):
+            mlflow_logger = next(
+                (logger for logger in (loggers or []) if isinstance(logger, MLFlowLogger)), None
+            )
+            if mlflow_logger is not None:
+                cfg.loggers.mlflow.run_id = mlflow_logger.run_id
 
     # save config tree to file
     OmegaConf.save(cfg, Path(cfg.paths.full_path, "full_config.yaml"), resolve=True)

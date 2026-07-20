@@ -8,14 +8,15 @@ defaults:
   - trainer: default.yaml
   - model: default.yaml
   - datamodule: default.yaml
-  - loggers: default.yaml
+  - loggers: wandb
   - hydra: default.yaml
   - callbacks: default.yaml
   - experiments: null
 
 seed: null # For reproducibility, remove it for generative models.
-project_name: mich-bold-inversion # Determines output directory path and wandb project
-network_name: single_layer_linearised # Used for both saving and wandb
+project_name: mich-bold-inversion # Determines output directory path and tracking-backend project/experiment
+network_name: single_layer_linearised # Used for both saving and the tracking backend
+wandb_offline: False # Only read by config/loggers/wandb.yaml; ignored when loggers=mlflow
 train: True # Set False to skip model training
 ckpt_path: null # Checkpoint path to resume training
 print_config: False # Print the final config to the console

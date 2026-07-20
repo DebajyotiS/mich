@@ -55,16 +55,31 @@ uv pip install -e ".[notebooks,analysis]"
 
 ## Setup
 
-### Weights & Biases
+### Experiment tracking
 
-Training logs metrics and visualisations to [Weights & Biases](https://wandb.ai/). Create a free account, then log in:
+Training logs metrics, hyperparameters, and visualisations via a Hydra-selectable
+logger backend, `loggers=wandb` (default, unchanged) or `loggers=mlflow`:
+```bash
+python scripts/train_mich.py                  # wandb (default)
+python scripts/train_mich.py loggers=mlflow    # mlflow instead
+```
+
+**Weights & Biases** (default) logs to [wandb.ai](https://wandb.ai/). Create a free account, then log in:
 ```bash
 wandb login
 ```
 
+**MLflow** (`loggers=mlflow`) needs no account or login -- it writes to a local
+SQLite store at `<output_dir>/<project_name>/mlflow.db`, shared across every
+`network_name` run within that project, with artifacts alongside it under
+`<output_dir>/<project_name>/mlartifacts/`. Browse runs with:
+```bash
+mlflow ui --backend-store-uri sqlite:///<output_dir>/<project_name>/mlflow.db
+```
+
 ### Private config
 
-Local paths and your W&B entity are kept out of version control in `config/private/private.yaml`. Copy the template and fill it in:
+Local paths (and your W&B entity, if using `loggers=wandb`) are kept out of version control in `config/private/private.yaml`. Copy the template and fill it in:
 
 ```bash
 cp config/private/default.yaml config/private/private.yaml
@@ -72,8 +87,8 @@ cp config/private/default.yaml config/private/private.yaml
 
 Edit `config/private/private.yaml`:
 ```yaml
-entity: <your-wandb-entity>      # W&B username or team name
-output_dir: <path/to/outputs>    # where checkpoints and logs are saved
+entity: <your-wandb-entity>      # W&B username or team name (only used by loggers=wandb)
+output_dir: <path/to/outputs>    # where checkpoints, logs, and the mlflow store are saved
 data_dir: <path/to/data>         # where HDF5 simulation files are read from
 root_dir: <path/to/repo>         # absolute path to the repo root
 ```
@@ -126,7 +141,7 @@ python scripts/eval_mich.py --project mich-bold-inversion --network <network_nam
 |---|---|
 | `mich.py` | Top-level `MICH` Lightning module. Composed from the mixins below plus `LightningModule`; owns the training/validation step and the scheduled-loss assembly |
 | `mich_losses.py` | `MICHLossMixin`. Every loss term (data, physics, source-activity, quiescence-consistency, supervision and its derivative/phase variants) plus the Gaussian PSF blur. See `training.md` |
-| `mich_logging.py` | `MICHLoggingMixin`. Validation-time metrics, W&B plotting, gradient-norm/rank-run hooks |
+| `mich_logging.py` | `MICHLoggingMixin`. Validation-time metrics, plotting, gradient-norm/rank-run hooks (backend-agnostic via `run_adapters.py`) |
 | `physio.py` | `LearnablePhysioMixin`. Optionally-learnable physiological constants (kappa/gamma/alpha/tau/V0/E0), parameterised in log-space |
 | `collocation.py` | `CollocationMixin`. Collocation-point sampling and gathering into `[B, ..., L, T, H, W]` tensors |
 | `blocks.py` | Network building blocks: `HeinzleNet`, spatial encoder/decoder, temporal mixing, FiLM conditioning. See `heinzlenet.md` |
@@ -170,9 +185,9 @@ All configuration is managed by [Hydra](https://hydra.cc/). The entry point is `
 | `callbacks` | `config/callbacks/default.yaml` | Checkpointing, LR monitor, model summary |
 | `paths` | `config/paths/default.yaml` | Output and data directories |
 | `private` | `config/private/private.yaml` | Local paths and W&B entity (gitignored) |
-| `loggers` | `config/loggers/default.yaml` | Weights & Biases logger settings |
+| `loggers` | `config/loggers/{wandb,mlflow}.yaml` | Logger backend settings, selected via `loggers=wandb` (default) or `loggers=mlflow` |
 | `hydra` | `config/hydra/default.yaml` | Hydra's own behaviour (working-directory change, run-dir location, log formatting) |
-| `experiments` | `config/experiments/{debug_offline,debug_online,default}.yaml` | Optional override bundle applied via `experiment=<name>`, e.g. `experiment=debug_offline` for a fast sanity check |
+| `experiments` | `config/experiments/{debug_offline,debug_online,default}.yaml` | Optional override bundle applied via `experiments=<name>`, e.g. `experiments=debug_offline` for a fast sanity check |
 
 `config/eval/` (e.g. `single_layer_single_source.yaml`) holds saved flat-YAML configs for `scripts/eval_mich.py`. It is read by that script's own `argparse --config` flag, not composed via Hydra.
 

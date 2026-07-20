@@ -15,6 +15,8 @@ dependencies = [
     "hydra-core",
     "omegaconf",
     "wandb",
+    "mlflow",
+    "nvidia-ml-py",
     "colorlog",
     "hydra-colorlog",
     # Visualization (keep only if truly runtime; otherwise move to optional)

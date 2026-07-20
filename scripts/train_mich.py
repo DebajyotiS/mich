@@ -194,7 +194,7 @@ def main(cfg: DictConfig) -> None:
         log_hyperparameters(cfg, model, trainer)  # type: ignore
 
     log.info("Saving configuration")
-    save_config(cfg)
+    save_config(cfg, loggers=loggers)
 
     if cfg.train:
         log.info("MICH training started")

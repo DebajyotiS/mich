@@ -48,10 +48,10 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import default_collate
 
-import wandb
 from mich import CONFIG_DIR
 from mich.data.synthetic import SyntheticH5Dataset, discover_layers
 from mich.utils.plotting import LAYER_NAMES, plot_latent_layers, plot_neural_bold_layers
+from mich.utils.run_adapters import make_standalone_mlflow_adapter, make_standalone_wandb_adapter
 
 console = rich.console.Console()
 
@@ -507,6 +507,24 @@ def evaluate_one(model, model_kind: str, batch: dict, label: str, args, out_dir:
     return metrics, pred_figs, latent_figs, gif_paths
 
 
+def _make_eval_adapter(args: argparse.Namespace, run_dir: Path, banner: dict, compare_banner: dict | None):
+    if args.no_wandb:
+        return None
+    if args.backend == "mlflow":
+        return make_standalone_mlflow_adapter(
+            tracking_uri=args.mlflow_tracking_uri or f"sqlite:///{run_dir.parent}/mlflow.db",
+            experiment_name=args.mlflow_experiment or run_dir.parent.name,
+            run_name=args.mlflow_run_name or f"eval/{run_dir.name}",
+            params={"primary": banner, "compare": compare_banner},
+        )
+    return make_standalone_wandb_adapter(
+        project=args.wandb_project or run_dir.parent.name,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name or f"eval/{run_dir.name}",
+        config={"primary": banner, "compare": compare_banner},
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate MICH / SupervisedMICH checkpoints.")
     parser.add_argument(
@@ -557,15 +575,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many of those samples also get a gif (expensive)",
     )
     parser.add_argument("--no-gif", action="store_true")
-    parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable tracking entirely")
     parser.add_argument(
         "--local-out",
         default=None,
         help="Local output dir (default: <run_dir>/results/ next to the checkpoint being evaluated)",
     )
+    parser.add_argument("--backend", default="wandb", choices=["wandb", "mlflow"])
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--mlflow-experiment", default=None)
+    parser.add_argument("--mlflow-run-name", default=None)
+    parser.add_argument("--mlflow-tracking-uri", default=None)
     return parser
 
 
@@ -616,14 +638,7 @@ def main() -> None:
         json.dump({"primary": banner, "compare": compare_banner}, f, indent=2)
     console.print(f"Local outputs: {local_root}")
 
-    run = None
-    if not args.no_wandb:
-        run = wandb.init(
-            project=args.wandb_project or run_dir.parent.name,
-            entity=args.wandb_entity,
-            name=args.wandb_run_name or f"eval/{run_dir.name}",
-            config={"primary": banner, "compare": compare_banner},
-        )
+    adapter = _make_eval_adapter(args, run_dir, banner, compare_banner)
 
     h5_cache_cfg = OmegaConf.to_container(full_cfg.datamodule.h5_cache, resolve=True)
 
@@ -639,7 +654,7 @@ def main() -> None:
             ("test_split", lambda: load_test_split_batch(full_cfg, args.n_samples, device)[0])
         ]
 
-    all_media, grid_metrics = {}, {}
+    all_media, grid_metrics, figs_to_close = {}, {}, []
     for label, load_fn in data_sources:
         console.print(f"  evaluating {label} ...")
         batch = load_fn()
@@ -658,22 +673,20 @@ def main() -> None:
             summary = "  ".join(f"{k.split('/', 1)[1]}={v:.3f}" for k, v in metrics.items())
             console.print(f"    {kind}: {summary}")
 
-            if run is not None:
-                all_media.setdefault(f"{kind}/{label}/predictions", []).extend(
-                    wandb.Image(fig) for fig in pred_figs
-                )
+            if adapter is not None:
+                all_media.setdefault(f"{kind}/{label}/predictions", []).extend(pred_figs)
                 if latent_figs:
-                    all_media.setdefault(f"{kind}/{label}/latents", []).extend(
-                        wandb.Image(fig) for fig in latent_figs
-                    )
+                    all_media.setdefault(f"{kind}/{label}/latents", []).extend(latent_figs)
                 for gif_path in gif_paths:
-                    all_media[f"{kind}/{label}/gif/{gif_path.stem}"] = wandb.Video(
-                        str(gif_path), fps=6, format="gif"
-                    )
-                run.log({f"{kind}/{label}/{k.split('/', 1)[1]}": v for k, v in metrics.items()})
-
-            for fig in pred_figs + latent_figs:
-                plt.close(fig)
+                    adapter.log_artifact(str(gif_path), f"{kind}/{label}/gif/{gif_path.stem}")
+                adapter.log({f"{kind}/{label}/{k.split('/', 1)[1]}": v for k, v in metrics.items()})
+                # Figures are only serialized when `adapter.log(all_media)` runs at the very
+                # end (single batched call, matching the original one-shot wandb upload) --
+                # closing them here would risk closing before that later serialization.
+                figs_to_close.extend(pred_figs + latent_figs)
+            else:
+                for fig in pred_figs + latent_figs:
+                    plt.close(fig)
 
     # Cross-datafile comparison output goes in the results/ root (not any one file's subfolder):
     # a plain metrics table always, plus a kappa/tau heatmap when filenames follow that convention.
@@ -684,14 +697,18 @@ def main() -> None:
         fig = plot_grid_heatmaps(grid_metrics, metric=metric)
         if fig is not None:
             fig.savefig(local_root / f"grid_{metric}.png", dpi=120)
-            if run is not None:
-                all_media[f"grid/{metric}"] = wandb.Image(fig)
-            plt.close(fig)
+            if adapter is not None:
+                all_media[f"grid/{metric}"] = fig
+                figs_to_close.append(fig)
+            else:
+                plt.close(fig)
 
-    if run is not None:
-        run.log(all_media)
-        run.finish()
-        console.print(f"W&B run: {run.url}")
+    if adapter is not None:
+        adapter.log(all_media)
+        adapter.finish()
+        console.print(adapter.describe())
+    for fig in figs_to_close:
+        plt.close(fig)
 
     console.print(
         f"\nDone. {len(data_sources)} data source(s) evaluated. Local outputs: {local_root}"

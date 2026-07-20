@@ -65,7 +65,5 @@ datamodule:
     val_count: 2
     test_count: null
 
-# ── Logging — wandb fully offline ─────────────────────────────────────────────
-loggers:
-  wandb:
-    offline: True
+# ── Logging — wandb fully offline (ignored when loggers=mlflow) ──────────────
+wandb_offline: True
