@@ -523,7 +523,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         if pred_flat.shape[0] > max_rows:
             grid_idx = torch.randperm(pred_flat.shape[0], device=pred_flat.device)[:max_rows]
             pred_flat, true_flat = pred_flat[grid_idx], true_flat[grid_idx]
-            
+
         grid_metrics_raw = self._neural_recovery_metrics(pred_flat, true_flat)
         grid_metrics = {
             "val/neural/grid_pearson": grid_metrics_raw["val/neural/pearson"],
@@ -536,7 +536,6 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             # _pending_train_log comment above for why that matters.
             run.log(
                 {"global_step": self.global_step, **metrics, **grid_metrics},
-                step=self.global_step,
                 commit=not log_images,
             )
         for k, v in {**metrics, **grid_metrics}.items():

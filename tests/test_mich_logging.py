@@ -236,7 +236,7 @@ def test_on_after_backward_logs_pending_dict_without_grad_norms_at_step_zero(mon
 
     fake_run.log.assert_called_once()
     (log_dict,), kwargs = fake_run.log.call_args
-    assert kwargs["step"] == 0
+    assert "step" not in kwargs
     assert log_dict["train/loss/total"] == 1.23
     assert not any(k.startswith("gradients/") for k in log_dict)
 
@@ -274,7 +274,7 @@ def test_on_after_backward_logs_grad_norms_when_run_active(monkeypatch):
 
     fake_run.log.assert_called_once()
     (log_dict,), kwargs = fake_run.log.call_args
-    assert kwargs["step"] == 10
+    assert "step" not in kwargs
     assert log_dict["global_step"] == 10
     assert log_dict["train/loss/total"] == 0.5
     assert "gradients/film_linear_norm" in log_dict

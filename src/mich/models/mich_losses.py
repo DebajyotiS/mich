@@ -179,10 +179,11 @@ class MICHLossMixin(CollocationMixin):
         approximately 0 whenever f is also at its baseline of 1. Wherever the model's
         own s and f jointly indicate that nothing is happening, x should be
         approximately 0. If x is not near 0, then an internal inconsistency exists in
-        the model's own output. This check does not require comparison against any
+        the model's own output.
+        Note: This check does not require comparison against any
         known source position.
 
-        This gate requires no external physics constants. The tolerances tau_s and
+        This gate does not require physics constants. The tolerances tau_s and
         tau_f are generic numerical parameters. They are not tied to scenario-specific
         diffusion parameters. The gate is evaluated directly from z_hat at each voxel
         and timestep. It maintains grid coverage regardless of active source density.

@@ -107,7 +107,6 @@ class MICHLoggingMixin:
         if run is not None and images:
             run.log(
                 {"global_step": self.global_step, "media/x_recon": images},
-                step=self.global_step,
                 commit=False,
             )
 
@@ -138,7 +137,6 @@ class MICHLoggingMixin:
         if run is not None and images:
             run.log(
                 {"global_step": self.global_step, "media/predictions": images},
-                step=self.global_step,
                 commit=False,
             )
 
@@ -193,7 +191,6 @@ class MICHLoggingMixin:
         if run is not None and images:
             run.log(
                 {"global_step": self.global_step, "media/latents": images},
-                step=self.global_step,
                 commit=True,
             )
 
@@ -232,7 +229,7 @@ class MICHLoggingMixin:
             if head_norms:
                 pending["gradients/out_heads_norm"] = torch.stack(head_norms).norm().item()
 
-        _direct_run.log(pending, step=self.global_step)
+        _direct_run.log(pending)
 
     def on_fit_start(self) -> None:
         if not isinstance(self.trainer.logger, WandbLogger):
