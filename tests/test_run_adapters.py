@@ -14,8 +14,6 @@ from unittest.mock import MagicMock
 
 import matplotlib.pyplot as plt
 import pytest
-from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
-
 from mich.utils import run_adapters
 from mich.utils.run_adapters import (
     _MlflowRunAdapter,
@@ -25,13 +23,18 @@ from mich.utils.run_adapters import (
     make_run_adapter,
     make_standalone_mlflow_adapter,
 )
+from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
 
 
 def _mk_trainer(*, logger=None, world_size=1, is_global_zero=True):
-    return types.SimpleNamespace(logger=logger, world_size=world_size, is_global_zero=is_global_zero)
+    return types.SimpleNamespace(
+        logger=logger, world_size=world_size, is_global_zero=is_global_zero
+    )
 
 
-def _mk_initialized_mlflow_logger(tmp_path, *, run_id="parent-run-id", experiment_id="exp-1", run_name=None):
+def _mk_initialized_mlflow_logger(
+    tmp_path, *, run_id="parent-run-id", experiment_id="exp-1", run_name=None
+):
     """A real MLFlowLogger with its lazy `.experiment`/`.run_id`/`.experiment_id`
     already resolved, so touching those properties never hits a real store.
     tracking_uri still points at a real (tmp_path) sqlite file because
@@ -365,7 +368,9 @@ def test_standalone_adapter_creates_run_with_tags_and_flattened_params(tmp_path)
 def test_standalone_adapter_reuses_existing_experiment_across_calls(tmp_path):
     uri = f"sqlite:///{tmp_path}/mlflow.db"
     first = make_standalone_mlflow_adapter(tracking_uri=uri, experiment_name="exp", run_name="run1")
-    second = make_standalone_mlflow_adapter(tracking_uri=uri, experiment_name="exp", run_name="run2")
+    second = make_standalone_mlflow_adapter(
+        tracking_uri=uri, experiment_name="exp", run_name="run2"
+    )
 
     from mlflow.tracking import MlflowClient
 

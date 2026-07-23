@@ -5,7 +5,6 @@ import types
 
 import pytest
 import torch
-
 from mich.data.balloon import AcquisitionConstants
 from mich.models.physio import LearnablePhysioMixin
 

@@ -471,6 +471,26 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
 
         return manifest.total_loss
 
+    @staticmethod
+    def _pick_off_source_voxel(
+        occupied_h: torch.Tensor, occupied_w: torch.Tensor, H: int, W: int
+    ) -> tuple[int, int]:
+        """Uniformly sample an (h, w) grid position that is NOT any of the given
+        occupied (source) positions -- a deliberate off-source voxel for validation
+        plots, as opposed to the incidental off-source coverage that falls out of
+        plotting every layer at a single source's column."""
+        occupied = {
+            (int(h), int(w)) for h, w in zip(occupied_h.tolist(), occupied_w.tolist(), strict=True)
+        }
+        candidates = [(hh, ww) for hh in range(H) for ww in range(W) if (hh, ww) not in occupied]
+        if not candidates:
+            raise ValueError(
+                f"No off-source voxel available: all {H * W} grid positions are occupied "
+                "by sources."
+            )
+        idx = torch.randint(0, len(candidates), (1,)).item()
+        return candidates[idx]
+
     def on_validation_epoch_end(self):
         bold = torch.cat(self.bold_buffer, dim=0)
         neural = torch.cat(self.neural_buffer, dim=0)
@@ -515,18 +535,41 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         )
 
         pred_neural_full = z_hat[:, self._signal_index("x")]  # [B, L, T, H, W]
-        T = pred_neural_full.shape[2]
+        B_full, L_full, T, H_full, W_full = pred_neural_full.shape
         pred_flat = pred_neural_full.permute(0, 1, 3, 4, 2).reshape(-1, T)
         true_flat = neural.permute(0, 1, 3, 4, 2).reshape(-1, T)
+        layer_ids = (
+            torch.arange(L_full, device=pred_flat.device)
+            .view(1, L_full, 1, 1)
+            .expand(B_full, L_full, H_full, W_full)
+            .reshape(-1)
+        )
         max_rows = 20000
         if pred_flat.shape[0] > max_rows:
             grid_idx = torch.randperm(pred_flat.shape[0], device=pred_flat.device)[:max_rows]
-            pred_flat, true_flat = pred_flat[grid_idx], true_flat[grid_idx]
+            pred_flat, true_flat, layer_ids = (
+                pred_flat[grid_idx],
+                true_flat[grid_idx],
+                layer_ids[grid_idx],
+            )
 
         grid_metrics_raw = self._neural_recovery_metrics(pred_flat, true_flat)
         grid_metrics = {
             "val/neural/grid_pearson": grid_metrics_raw["val/neural/pearson"],
         }
+        # Per-layer breakdown of the same sampled rows -- pooling across layers can hide
+        # a single hallucinating layer behind others that look fine. Always emitted
+        # (including L=1, where it trivially matches the pooled value above) so a
+        # single-layer run's dashboards keep working unchanged.
+        for layer_idx in range(L_full):
+            layer_mask = layer_ids == layer_idx
+            if layer_mask.any():
+                layer_metrics_raw = self._neural_recovery_metrics(
+                    pred_flat[layer_mask], true_flat[layer_mask]
+                )
+                grid_metrics[f"val/neural/grid_pearson_layer{layer_idx}"] = layer_metrics_raw[
+                    "val/neural/pearson"
+                ]
 
         adapter = getattr(self, "_adapter", None)
         if adapter is not None:
@@ -554,8 +597,29 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         subset_src_layer = source_layer[random_indices]  # [B, S]
         subset_num_sources = num_sources[random_indices]  # [B]
 
-        subset_h = subset_src_pos[:, 0, 0]
-        subset_w = subset_src_pos[:, 0, 1]
+        # Split the plotted samples 5 source-voxel / 5 off-source-voxel (fewer off-source
+        # if subset < 10) so validation media always shows both what the model does at real
+        # activity and what it does on quiescent background -- the latter is where
+        # hallucination (grid_pearson dropping despite good source recovery, see above)
+        # would actually be visible, and was previously never plotted at all.
+        n_source = min(5, subset - subset // 2)  # ceil(subset/2) capped at 5; 10 -> 5/5
+        is_source_voxel = torch.zeros(subset, dtype=torch.bool)
+        is_source_voxel[:n_source] = True
+
+        # .clone() -- these are mutated in place below for the off-source samples, and
+        # subset_src_pos (a view these come from) is still needed downstream, unmutated,
+        # to label the samples' TRUE source positions/layers in the plots.
+        subset_h = subset_src_pos[:, 0, 0].clone()
+        subset_w = subset_src_pos[:, 0, 1].clone()
+        H_grid, W_grid = bold.shape[-2], bold.shape[-1]
+        for i in range(n_source, subset):
+            n_valid = int(subset_num_sources[i])
+            h_off, w_off = self._pick_off_source_voxel(
+                subset_src_pos[i, :n_valid, 0], subset_src_pos[i, :n_valid, 1], H_grid, W_grid
+            )
+            subset_h[i] = h_off
+            subset_w[i] = w_off
+
         batch_idx = torch.arange(subset_bold.shape[0])
 
         # Compute pred_bold at full spatial resolution so PSF can be applied before indexing.
@@ -575,6 +639,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         pred_bold = pred_bold_full[batch_idx, :, :, subset_h, subset_w]  # [B, L, T]
 
         pred_neural = subset_z_hat[:, self._signal_index("x")]
+        voxel_pos = torch.stack([subset_h, subset_w], dim=1)  # [B, 2]
 
         self._plot_and_log_predictions(
             pred_bold=pred_bold,
@@ -584,6 +649,8 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             source_layer=subset_src_layer,
             source_pos=subset_src_pos,
             num_sources=subset_num_sources,
+            voxel_pos=voxel_pos,
+            is_source_voxel=is_source_voxel,
         )
         has_drain = subset_z_hat.shape[1] > 5
         if has_drain:
@@ -600,6 +667,8 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 true_v_star=subset_true_z_hat[:, self._signal_index("vstar")],
                 pred_q_star=subset_z_hat[:, self._signal_index("qstar")],
                 true_q_star=subset_true_z_hat[:, self._signal_index("qstar")],
+                voxel_pos=voxel_pos,
+                is_source_voxel=is_source_voxel,
             )
         else:
             self._plot_and_log_latents(
@@ -611,6 +680,8 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 true_v=subset_true_z_hat[:, self._signal_index("v")],
                 pred_q=subset_z_hat[:, self._signal_index("q")],
                 true_q=subset_true_z_hat[:, self._signal_index("q")],
+                voxel_pos=voxel_pos,
+                is_source_voxel=is_source_voxel,
             )
 
     def configure_optimizers(self):

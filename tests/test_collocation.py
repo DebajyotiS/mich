@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from mich.models.collocation import CollocationBatch, CollocationMixin
 
 

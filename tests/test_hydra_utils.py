@@ -11,10 +11,6 @@ import pytest
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from omegaconf import OmegaConf
-from pytorch_lightning.loggers import MLFlowLogger
-
-import wandb
 from mich.utils.hydra_utils import (
     instantiate_collection,
     log_hyperparameters,
@@ -22,6 +18,10 @@ from mich.utils.hydra_utils import (
     reload_original_config,
     save_config,
 )
+from omegaconf import OmegaConf
+from pytorch_lightning.loggers import MLFlowLogger
+
+import wandb
 
 # -----------------------------
 # Test doubles / helpers

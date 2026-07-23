@@ -20,12 +20,11 @@ import pytest
 import torch
 import torch.optim
 import torch.optim.lr_scheduler
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import Callback
-
 from mich.data.synthetic import SyntheticDataModule
 from mich.models.blocks import HeinzleNet
 from mich.models.mich import MICH
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import Callback
 
 # -------------------------
 # Module-level constants
@@ -359,9 +358,9 @@ class TestMICHLosses:
         (data_loss + physics_loss).backward()
         grads_with_value = [p.grad for p in model.parameters() if p.grad is not None]
         assert len(grads_with_value) > 0, "No parameter received a gradient"
-        assert all(torch.isfinite(g).all() for g in grads_with_value), (
-            "At least one parameter gradient contains NaN or Inf"
-        )
+        assert all(
+            torch.isfinite(g).all() for g in grads_with_value
+        ), "At least one parameter gradient contains NaN or Inf"
 
 
 class TestMICHOptionalLossWiring:
@@ -691,6 +690,103 @@ class TestMICHStaticHelpers:
         bold = MICH._compute_bold(v, q, acq, V0)
         expected = V0 * (acq.k1 * (1 - q) + acq.k2 * (1 - q / v) + acq.k3 * (1 - v))
         assert torch.allclose(bold, expected)
+
+    def test_pick_off_source_voxel_avoids_occupied(self):
+        occupied_h = torch.tensor([0, 1])
+        occupied_w = torch.tensor([0, 1])
+        for _ in range(20):
+            h, w = MICH._pick_off_source_voxel(occupied_h, occupied_w, H=2, W=2)
+            assert (h, w) not in {(0, 0), (1, 1)}
+
+    def test_pick_off_source_voxel_handles_no_occupied_sources(self):
+        empty = torch.tensor([], dtype=torch.long)
+        h, w = MICH._pick_off_source_voxel(empty, empty, H=2, W=2)
+        assert 0 <= h < 2
+        assert 0 <= w < 2
+
+    def test_pick_off_source_voxel_raises_when_grid_fully_occupied(self):
+        occupied_h = torch.tensor([0, 0, 1, 1])
+        occupied_w = torch.tensor([0, 1, 0, 1])
+        with pytest.raises(ValueError, match="No off-source voxel"):
+            MICH._pick_off_source_voxel(occupied_h, occupied_w, H=2, W=2)
+
+
+# -------------------------
+# on_validation_epoch_end: grid_pearson per-layer breakdown, source/off-source voxel split
+# -------------------------
+
+
+class TestMICHValidationEpochEnd:
+    @staticmethod
+    def _attach_capturing_trainer(model, *, global_step=0):
+        model.trainer = types.SimpleNamespace(
+            is_global_zero=True, log_every_n_steps=1, global_step=global_step
+        )
+        model.logged = {}
+
+        def _log(name, value, **kwargs):
+            model.logged[name] = value
+
+        model.log = _log
+
+    def _run_validation_step_and_epoch_end(self, model, batch):
+        self._attach_capturing_trainer(model)
+        model.eval()
+        model.validation_step(batch, 0)
+        model.on_validation_epoch_end()
+
+    def test_grid_pearson_per_layer_keys_present_for_multilayer(self):
+        model = _make_mich(L=_L3)
+        batch = _make_full_batch(B=2, L=_L3, T=_T, H=_H, W=_W, S=1)
+        self._run_validation_step_and_epoch_end(model, batch)
+
+        assert "val/neural/grid_pearson" in model.logged
+        for layer_idx in range(_L3):
+            assert f"val/neural/grid_pearson_layer{layer_idx}" in model.logged
+
+    def test_grid_pearson_layer_matches_pooled_for_single_layer(self):
+        """Backward compatibility: for L=1, the per-layer key must equal the pooled
+        key exactly, since they're computed over the same (entire) single layer."""
+        model = _make_mich(L=1, signals=["x", "s", "f", "v", "q"])
+        batch = _make_full_batch(B=2, L=1, T=_T, H=_H, W=_W, S=1)
+        del batch["v_star"], batch["q_star"]  # no-drain batch, matches the 5-signal model
+        self._run_validation_step_and_epoch_end(model, batch)
+
+        assert model.logged["val/neural/grid_pearson_layer0"] == pytest.approx(
+            model.logged["val/neural/grid_pearson"]
+        )
+
+    def test_validation_plots_split_five_source_five_off_source_of_ten(self, monkeypatch):
+        model = _make_mich(L=_L3)
+        batch = _make_full_batch(B=10, L=_L3, T=_T, H=_H, W=_W, S=1)
+
+        captured = {}
+        monkeypatch.setattr(
+            model, "_plot_and_log_predictions", lambda **kw: captured.update(predictions=kw)
+        )
+        monkeypatch.setattr(
+            model, "_plot_and_log_latents", lambda **kw: captured.update(latents=kw)
+        )
+        self._run_validation_step_and_epoch_end(model, batch)
+
+        is_source = captured["predictions"]["is_source_voxel"]
+        voxel_pos = captured["predictions"]["voxel_pos"]
+        source_pos = captured["predictions"]["source_pos"]  # [subset, S, 2]
+        num_sources = captured["predictions"]["num_sources"]
+
+        assert is_source.sum().item() == 5
+        assert (~is_source).sum().item() == 5
+        for i in range(is_source.shape[0]):
+            n_valid = int(num_sources[i])
+            occupied = {tuple(p.tolist()) for p in source_pos[i, :n_valid]}
+            if is_source[i]:
+                assert tuple(voxel_pos[i].tolist()) in occupied
+            else:
+                assert tuple(voxel_pos[i].tolist()) not in occupied
+
+        # Same voxel_pos/is_source_voxel tensors are forwarded to the latents plot call.
+        assert torch.equal(captured["latents"]["voxel_pos"], voxel_pos)
+        assert torch.equal(captured["latents"]["is_source_voxel"], is_source)
 
 
 # -------------------------

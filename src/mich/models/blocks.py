@@ -178,9 +178,9 @@ class DepthWiseSeparableConvLayer(nn.Module):
         )
         self.pointwise = nn.Conv2d(cin, cout, kernel_size=pw_kernel, bias=False)
 
-        assert num_groups > 0 and cout % num_groups == 0, (
-            "num_groups must be a positive divisor of cout"
-        )
+        assert (
+            num_groups > 0 and cout % num_groups == 0
+        ), "num_groups must be a positive divisor of cout"
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=cout)
         self.activation = get_activation(activation)
 
@@ -232,9 +232,9 @@ class TemporalDepthWiseTCNLayer(nn.Module):
         )
         self.pointwise = nn.Conv1d(cin, cin, kernel_size=1, bias=False)
 
-        assert num_groups > 0 and cin % num_groups == 0, (
-            "num_groups must be a positive divisor of cin"
-        )
+        assert (
+            num_groups > 0 and cin % num_groups == 0
+        ), "num_groups must be a positive divisor of cin"
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=cin)
         self.activation = get_activation(activation)
 
@@ -250,22 +250,31 @@ class TemporalDepthWiseTCNLayer(nn.Module):
 
 
 class TemporalMixingEncoder(nn.Module):
-    def __init__(self, module_config: list[Mapping[str, Any]]):
+    def __init__(self, module_config: list[Mapping[str, Any]], auto_dilation: bool = True):
         super().__init__()
         self.num_layers = len(module_config)
         self.module = nn.ModuleList()
-        dilations = [2**i for i in range(self.num_layers)]
+
         for i, config in enumerate(module_config):
-            config = dict(config)
-            config["dilation"] = dilations[i]
-            self.module.append(TemporalDepthWiseTCNLayer(**config))
+            # Create a fresh dict copy to avoid mutating caller arguments
+            layer_config = dict(config)
+            if auto_dilation:
+                layer_config["dilation"] = 2**i
+            self.module.append(TemporalDepthWiseTCNLayer(**layer_config))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, L, C, H, W = x.shape
-        x = x.permute(0, 2, 4, 5, 3, 1).reshape(B * L * H * W, C, T)  # [B*L*H*W, C, T]
+
+        # Flatten spatial and latent dimensions into batch dimension
+        # Shape transition: [B, T, L, C, H, W] -> [B, L, H, W, C, T] -> [B*L*H*W, C, T]
+        x = x.permute(0, 2, 4, 5, 3, 1).contiguous().view(B * L * H * W, C, T)
+
         for layer in self.module:
-            x = checkpoint(layer, x, use_reentrant=False).to(x.dtype)
-        x = x.reshape(B, L, H, W, C, T).permute(0, 5, 1, 4, 2, 3).contiguous()  # [B, T, L, C, H, W]
+            x = checkpoint(layer, x, use_reentrant=False)
+
+        # Restore original tensor dimensions
+        # Shape transition: [B*L*H*W, C, T] -> [B, L, H, W, C, T] -> [B, T, L, C, H, W]
+        x = x.view(B, L, H, W, C, T).permute(0, 5, 1, 4, 2, 3).contiguous()
         return x
 
 
@@ -381,15 +390,15 @@ class SpatioTemporalDecoder(nn.Module):
     ):
         super().__init__()
 
-        assert all(s in HEINZLE_ACTIVATIONS for s in signals), (
-            f"All signals must be valid Heinzle signals. Got: {signals}"
-        )
+        assert all(
+            s in HEINZLE_ACTIVATIONS for s in signals
+        ), f"All signals must be valid Heinzle signals. Got: {signals}"
         self.signals = signals
         self.signal_idx: dict[HeinzleSignal, int] = {s: i for i, s in enumerate(signals)}
         N_SIG = len(signals)
-        assert out_channels == N_SIG, (
-            f"out_channels must match len(signals): out_channels={out_channels}, len(signals)={N_SIG}"
-        )
+        assert (
+            out_channels == N_SIG
+        ), f"out_channels must match len(signals): out_channels={out_channels}, len(signals)={N_SIG}"
         channel_activations = [HEINZLE_ACTIVATIONS[s] for s in signals]
         self.L = L
         self.layer_embed_dim = layer_embed_dim
@@ -702,7 +711,7 @@ class FullySupervisedNet(nn.Module):
         super().__init__()
         self.layer_mixing = MaskedLayerMixing(**layer_mixing_config)
         self.spatial_encoder = SpatialEncoder(spatial_encoder_config)
-        self.temporal_mixing = TemporalMixingEncoder(temporal_mixing_config)
+        self.temporal_mixing = TemporalMixingEncoder(temporal_mixing_config, auto_dilation=True)
         self.head = nn.Conv2d(c_enc, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -730,11 +739,14 @@ class HeinzleNet(nn.Module):
         time_embedding_config: Mapping[str, Any],
         time_film_config: Mapping[str, Any],
         spatial_decoder_config: Mapping[str, Any],
+        auto_dilation: bool = False,
     ):
         super().__init__()
         self.layer_mixing = MaskedLayerMixing(**layer_mixing_config)
         self.spatial_encoder = SpatialEncoder(spatial_encoder_config)
-        self.temporal_mixing = TemporalMixingEncoder(temporal_mixing_config)
+        self.temporal_mixing = TemporalMixingEncoder(
+            temporal_mixing_config, auto_dilation=auto_dilation
+        )
         self.spatial_decoder = SpatioTemporalDecoder(
             **spatial_decoder_config,
             temporal_embedding_config=time_embedding_config,

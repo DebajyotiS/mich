@@ -39,33 +39,53 @@ heinzle_net:
       pw_kernel: 1
       num_groups: 8
       activation: silu
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
+      stride: 1
+      dw_kernel: 3
+      pw_kernel: 1
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
+      stride: 1
+      dw_kernel: 3
+      pw_kernel: 1
+      num_groups: 8
+      activation: silu
 
   temporal_mixing_config:
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 1
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 2
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 4
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 8
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 16
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
-
+      dilation: 16
+  auto_dilation: false
   time_embedding_config:
     num_freqs: ${model.num_freqs}
     min_freq: ${model.min_freq}

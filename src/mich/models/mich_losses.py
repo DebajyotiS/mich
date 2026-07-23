@@ -630,9 +630,17 @@ class MICHLossMixin(CollocationMixin):
         normalised [0, 1] time grid): dz_hat_dt is d(z_hat)/d(t_norm), so it's divided by
         (T_min - 1) to undo that normalisation, matching _compute_physics_layer_loss's
         identical convention.
+
+        Layers > 0 get the same drain-coupling term _compute_physics_layer_loss adds to
+        its v/q ODE residual target (+ lambda_d * vstar/qstar from the layer below), built
+        here from ground-truth v_star/q_star (batch["v_star"]/["q_star"]) rather than the
+        model's own prediction, since every target in this loss is ground-truth-derived.
+        vstar/qstar's own analytic targets, (-v_star + v - 1)/tau_d and (-q_star + q - 1)/tau_d,
+        mirror _compute_physics_layer_loss's per-layer vstar/qstar targets exactly.
         """
         lc = self.hparams.loss_config
         signals = tuple(getattr(lc, "dzdt_supervision_signals", ("s",)))
+        has_drain = dz_hat_dt.shape[1] > 5
         B = dz_hat_dt.shape[0]
         S = source_position.shape[1]
         device = dz_hat_dt.device
@@ -659,17 +667,40 @@ class MICHLossMixin(CollocationMixin):
             v_true = batch["v"].float()[:, :, :T_min]
             q_true = batch["q"].float()[:, :, :T_min]
             tau = self._physio("tau")
-            # NOTE: no cross-layer drain coupling here (unlike _compute_physics_layer_loss's
-            # vstar/qstar-deeper term) -- not needed for the currently-configured signals
-            # (s, f, v, q); would need extending before enabling "vstar"/"qstar" here for a
-            # multi-layer, lambda_d != 0 config.
             target_vdot, target_qdot = self._balloon_v_q_dot_targets(
                 f_true, v_true, q_true, lc.order, need_v="v" in signals, need_q="q" in signals
             )
+            if has_drain:
+                lambda_d = self.hparams.haemo.lambda_d
+                if "v" in signals:
+                    v_star_true = batch["v_star"].float()[:, :, :T_min]
+                    drain_v = torch.zeros_like(target_vdot)
+                    drain_v[:, 1:] = lambda_d * v_star_true[:, :-1]
+                    target_vdot = target_vdot + drain_v
+                if "q" in signals:
+                    q_star_true = batch["q_star"].float()[:, :, :T_min]
+                    drain_q = torch.zeros_like(target_qdot)
+                    drain_q[:, 1:] = lambda_d * q_star_true[:, :-1]
+                    target_qdot = target_qdot + drain_q
             if "v" in signals:
                 analytic_target["v"] = target_vdot / tau
             if "q" in signals:
                 analytic_target["q"] = target_qdot / tau
+        if "vstar" in signals or "qstar" in signals:
+            if not has_drain:
+                raise ValueError(
+                    "dzdt_supervision_signals includes vstar/qstar but dz_hat_dt has only "
+                    "5 channels -- these signals only exist in multi-layer/drain mode"
+                )
+            tau_d = self.hparams.haemo.tau_d
+            v_true = batch["v"].float()[:, :, :T_min]
+            q_true = batch["q"].float()[:, :, :T_min]
+            if "vstar" in signals:
+                v_star_true = batch["v_star"].float()[:, :, :T_min]
+                analytic_target["vstar"] = (-v_star_true + v_true - 1) / tau_d
+            if "qstar" in signals:
+                q_star_true = batch["q_star"].float()[:, :, :T_min]
+                analytic_target["qstar"] = (-q_star_true + q_true - 1) / tau_d
 
         per_sig: dict[str, torch.Tensor] = {}
         for sig in signals:

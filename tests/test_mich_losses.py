@@ -6,7 +6,6 @@ import types
 
 import pytest
 import torch
-
 from mich.models.mich_losses import MICHLossMixin
 from mich.models.physio import LearnablePhysioMixin
 
@@ -765,6 +764,69 @@ def test_derivative_supervision_loss_respects_custom_signal_list():
     num_sources = torch.ones(B, dtype=torch.long)
     _, per_sig = host._derivative_supervision_loss(dz_hat_dt, batch, source_position, num_sources)
     assert set(per_sig.keys()) == {"s", "f"}
+
+
+def test_derivative_supervision_loss_drain_coupling_matches_analytic_target():
+    """Multi-layer (has_drain) case: layer>0's v/q analytic target must pick up the
+    same lambda_d * vstar/qstar-from-the-layer-below term _compute_physics_layer_loss
+    adds, and vstar/qstar get their own ground-truth-only analytic targets."""
+    host = _mk_host(order="linear", dzdt_supervision_signals=("v", "q", "vstar", "qstar"))
+    B, L, T, H, W = 2, 2, 10, 5, 5
+    lambda_d, tau_d, tau = 0.2, 1.0, 1.0  # matches _mk_haemo() defaults
+
+    f_true = torch.rand(B, L, T, H, W) + 0.5
+    v_true = torch.rand(B, L, T, H, W) + 0.5
+    q_true = torch.rand(B, L, T, H, W) + 0.5
+    v_star_true = torch.rand(B, L, T, H, W) + 0.5
+    q_star_true = torch.rand(B, L, T, H, W) + 0.5
+    batch = {
+        "s": torch.randn(B, L, T, H, W),
+        "f": f_true,
+        "v": v_true,
+        "q": q_true,
+        "v_star": v_star_true,
+        "q_star": q_star_true,
+    }
+
+    vdot, qdot = host._balloon_v_q_dot_targets(f_true, v_true, q_true, "linear")
+    drain_v = torch.zeros_like(vdot)
+    drain_v[:, 1:] = lambda_d * v_star_true[:, :-1]
+    drain_q = torch.zeros_like(qdot)
+    drain_q[:, 1:] = lambda_d * q_star_true[:, :-1]
+    analytic = {
+        "v": (vdot + drain_v) / tau,
+        "q": (qdot + drain_q) / tau,
+        "vstar": (-v_star_true + v_true - 1) / tau_d,
+        "qstar": (-q_star_true + q_true - 1) / tau_d,
+    }
+    dz_hat_dt = torch.zeros(B, 7, L, T, H, W)
+    t_norm_to_physical = T - 1
+    for sig in ("v", "q", "vstar", "qstar"):
+        dz_hat_dt[:, host._signal_index(sig)] = analytic[sig] * t_norm_to_physical
+
+    source_position = torch.randint(0, 5, (B, 1, 2))
+    num_sources = torch.ones(B, dtype=torch.long)
+    total, per_sig = host._derivative_supervision_loss(
+        dz_hat_dt, batch, source_position, num_sources
+    )
+    assert torch.isclose(total, torch.tensor(0.0), atol=1e-4)
+    assert set(per_sig.keys()) == {"v", "q", "vstar", "qstar"}
+
+
+def test_derivative_supervision_loss_vstar_qstar_without_drain_raises():
+    host = _mk_host(order="linear", dzdt_supervision_signals=("vstar",))
+    B, L, T, H, W = 2, 1, 10, 5, 5
+    batch = {
+        "s": torch.randn(B, L, T, H, W),
+        "f": torch.rand(B, L, T, H, W) + 0.5,
+        "v": torch.rand(B, L, T, H, W) + 0.5,
+        "q": torch.rand(B, L, T, H, W) + 0.5,
+    }
+    dz_hat_dt = torch.randn(B, 5, L, T, H, W)  # no drain channels
+    source_position = torch.randint(0, 5, (B, 1, 2))
+    num_sources = torch.ones(B, dtype=torch.long)
+    with pytest.raises(ValueError, match="vstar/qstar"):
+        host._derivative_supervision_loss(dz_hat_dt, batch, source_position, num_sources)
 
 
 def test_x_phase_loss_zero_when_x_matches_its_reconstruction():

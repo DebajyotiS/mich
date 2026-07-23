@@ -7,10 +7,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
-
 from mich.models import mich_logging
 from mich.models.mich_logging import MICHLoggingMixin
+from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
 
 
 class _LoggingHost(MICHLoggingMixin):
@@ -117,6 +116,29 @@ def test_plot_and_log_predictions_logs_one_image_per_sample():
     assert payload["global_step"] == 10
     assert len(payload["media/predictions"]) == B
     assert kwargs.get("commit") is False
+    # No voxel_pos/is_source_voxel given -- no suptitle set, matches pre-existing behaviour.
+    assert payload["media/predictions"][0]._suptitle is None
+
+
+def test_plot_and_log_predictions_sets_suptitle_from_voxel_kind():
+    host = _LoggingHost(global_step=10)
+    host._adapter = MagicMock()
+    B, L, T = 2, 2, 5
+    host._plot_and_log_predictions(
+        pred_bold=torch.randn(B, L, T),
+        true_bold=torch.randn(B, L, T),
+        pred_neural=torch.randn(B, L, T),
+        true_neural=torch.randn(B, L, T),
+        source_layer=torch.zeros(B, 1, dtype=torch.long),
+        source_pos=torch.zeros(B, 1, 2, dtype=torch.long),
+        num_sources=torch.ones(B, dtype=torch.long),
+        voxel_pos=torch.tensor([[1, 2], [3, 4]]),
+        is_source_voxel=torch.tensor([True, False]),
+    )
+    (payload,), _ = host._adapter.log.call_args
+    images = payload["media/predictions"]
+    assert images[0]._suptitle.get_text() == "Source voxel @ (1, 2)"
+    assert images[1]._suptitle.get_text() == "Off-source voxel @ (3, 4)"
 
 
 def test_plot_and_log_latents_without_drain_logs_and_commits():
@@ -132,6 +154,27 @@ def test_plot_and_log_latents_without_drain_logs_and_commits():
     (payload,), call_kwargs = host._adapter.log.call_args
     assert len(payload["media/latents"]) == B
     assert call_kwargs.get("commit") is True
+    # No voxel_pos/is_source_voxel given -- title falls back to the plain default.
+    assert payload["media/latents"][0]._suptitle.get_text() == "Latent States"
+
+
+def test_plot_and_log_latents_sets_title_from_voxel_kind():
+    host = _LoggingHost(global_step=20)
+    host._adapter = MagicMock()
+    B, L, T = 2, 2, 5
+    kwargs = {
+        k: torch.randn(B, L, T)
+        for k in ("pred_s", "true_s", "pred_f", "true_f", "pred_v", "true_v", "pred_q", "true_q")
+    }
+    host._plot_and_log_latents(
+        **kwargs,
+        voxel_pos=torch.tensor([[1, 2], [3, 4]]),
+        is_source_voxel=torch.tensor([True, False]),
+    )
+    (payload,), _ = host._adapter.log.call_args
+    images = payload["media/latents"]
+    assert images[0]._suptitle.get_text() == "Latent States -- Source voxel @ (1, 2)"
+    assert images[1]._suptitle.get_text() == "Latent States -- Off-source voxel @ (3, 4)"
 
 
 def test_plot_and_log_latents_with_drain_branch_runs():
@@ -265,12 +308,7 @@ def test_on_after_backward_omits_keys_with_no_gradients():
     assert "gradients/out_heads_norm" not in log_dict
 
 
-def test_on_after_backward_merges_gpu_stats_into_payload(monkeypatch):
-    monkeypatch.setattr(
-        mich_logging,
-        "gpu_stats",
-        lambda: {"gpu/utilization_pct": 55.0, "gpu/memory_used_mb": 1024.0},
-    )
+def test_on_after_backward_no_gpu_keys_in_payload():
     trainer = _mk_trainer(log_every_n_steps=1, is_global_zero=True)
     host = _LoggingHost(trainer=trainer, global_step=1, heinzle_net=_mk_heinzle_net_double())
     host._adapter = MagicMock()
@@ -279,21 +317,8 @@ def test_on_after_backward_merges_gpu_stats_into_payload(monkeypatch):
 
     host._adapter.log.assert_called_once()
     (log_dict,), _ = host._adapter.log.call_args
-    assert log_dict["gpu/utilization_pct"] == 55.0
-    assert log_dict["gpu/memory_used_mb"] == 1024.0
-    assert log_dict["train/loss/total"] == 0.5  # existing keys untouched
-
-
-def test_on_after_backward_no_gpu_keys_when_gpu_stats_empty(monkeypatch):
-    monkeypatch.setattr(mich_logging, "gpu_stats", lambda: {})
-    trainer = _mk_trainer(log_every_n_steps=1, is_global_zero=True)
-    host = _LoggingHost(trainer=trainer, global_step=1, heinzle_net=_mk_heinzle_net_double())
-    host._adapter = MagicMock()
-    host._pending_train_log = {"global_step": 1}
-    host.on_after_backward()
-
-    (log_dict,), _ = host._adapter.log.call_args
     assert not any(k.startswith("gpu/") for k in log_dict)
+    assert log_dict["train/loss/total"] == 0.5
 
 
 # -----------------------------

@@ -7,7 +7,7 @@ import torch
 from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
 
 from mich.utils.plotting import plot_latent_layers, plot_neural_bold_layers
-from mich.utils.run_adapters import gpu_stats, make_run_adapter
+from mich.utils.run_adapters import make_run_adapter
 
 
 class MICHLoggingMixin:
@@ -120,10 +120,17 @@ class MICHLoggingMixin:
         source_layer,
         source_pos,
         num_sources,
+        voxel_pos=None,  # [B, 2] optional -- (h, w) actually plotted, for the suptitle below
+        is_source_voxel=None,  # [B] bool optional -- whether voxel_pos is a true source
     ):
         adapter = getattr(self, "_adapter", None)
         images = []
         for i in range(pred_bold.shape[0]):
+            suptitle = None
+            if voxel_pos is not None and is_source_voxel is not None:
+                h, w = int(voxel_pos[i, 0]), int(voxel_pos[i, 1])
+                kind = "Source" if bool(is_source_voxel[i]) else "Off-source"
+                suptitle = f"{kind} voxel @ ({h}, {w})"
             image = plot_neural_bold_layers(
                 pred_bold=pred_bold[i],
                 true_bold=true_bold[i],
@@ -132,6 +139,7 @@ class MICHLoggingMixin:
                 source_layer=source_layer[i],
                 source_pos=source_pos[i],
                 num_sources=num_sources[i],
+                suptitle=suptitle,
             )
             images.append(image)
         if adapter is not None and images:
@@ -156,10 +164,17 @@ class MICHLoggingMixin:
         true_v_star=None,
         pred_q_star=None,
         true_q_star=None,
+        voxel_pos=None,  # [B, 2] optional -- (h, w) actually plotted, for the title below
+        is_source_voxel=None,  # [B] bool optional -- whether voxel_pos is a true source
     ):
         adapter = getattr(self, "_adapter", None)
         images = []
         for i in range(pred_s.shape[0]):
+            title = "Latent States"
+            if voxel_pos is not None and is_source_voxel is not None:
+                h, w = int(voxel_pos[i, 0]), int(voxel_pos[i, 1])
+                kind = "Source" if bool(is_source_voxel[i]) else "Off-source"
+                title = f"Latent States -- {kind} voxel @ ({h}, {w})"
             if pred_v_star is not None:
                 image = plot_latent_layers(
                     pred_f=pred_f[i],
@@ -174,7 +189,7 @@ class MICHLoggingMixin:
                     true_v_star=true_v_star[i],
                     pred_q_star=pred_q_star[i],
                     true_q_star=true_q_star[i],
-                    title="Latent States",
+                    title=title,
                 )
             else:
                 image = plot_latent_layers(
@@ -186,7 +201,7 @@ class MICHLoggingMixin:
                     true_v=true_v[i],
                     pred_q=pred_q[i],
                     true_q=true_q[i],
-                    title="Latent States",
+                    title=title,
                 )
             images.append(image)
         if adapter is not None and images:
@@ -198,7 +213,6 @@ class MICHLoggingMixin:
             plt.close(image)
 
     def on_after_backward(self):
-
         pending = getattr(self, "_pending_train_log", None)
         self._pending_train_log = None
         if pending is None:
@@ -232,7 +246,7 @@ class MICHLoggingMixin:
             if head_norms:
                 pending["gradients/out_heads_norm"] = torch.stack(head_norms).norm().item()
 
-        pending.update(gpu_stats())
+        # pending.update(gpu_stats())
         adapter.log(pending)
 
     def on_fit_start(self) -> None:

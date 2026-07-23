@@ -27,6 +27,7 @@ def plot_neural_bold_layers(
     source_pos: torch.Tensor,
     num_sources: int | torch.Tensor = 1,
     tr: float = 1.0,
+    suptitle: str | None = None,
 ) -> Figure:
     """
     Plot predicted and true BOLD and neural activity for a single sample.
@@ -41,6 +42,8 @@ def plot_neural_bold_layers(
         num_sources:  number of valid entries in source_layer/source_pos
                       (S=1, num_sources=1 for single-source data)
         tr:           repetition time in seconds (default 1.0s)
+        suptitle:     optional figure-level title (e.g. which voxel this is,
+                      source vs off-source) -- omitted (no suptitle) by default
     """
     n_layers = pred_bold.shape[0]
     times = np.arange(pred_bold.shape[-1]) * tr
@@ -61,6 +64,8 @@ def plot_neural_bold_layers(
     fig, axes = plt.subplots(nrows=n_layers, figsize=(10, 4 * n_layers), constrained_layout=True)
     if n_layers == 1:
         axes = [axes]
+    if suptitle is not None:
+        fig.suptitle(suptitle, fontfamily="monospace", fontsize=13)
 
     for i in range(n_layers):
         layer_idx = n_layers - i - 1
