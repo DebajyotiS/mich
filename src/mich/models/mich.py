@@ -1,3 +1,17 @@
+"""MICH: the physics-informed BOLD-to-neural-activity inversion Lightning module.
+
+Assembled from `mich.models.physio.LearnablePhysioMixin`,
+`mich.models.mich_losses.MICHLossMixin` (which itself brings in
+`mich.models.collocation.CollocationMixin`), and `mich.models.mich_logging.MICHLoggingMixin`
+-- see each module's own docstring for the vocabulary/conventions its methods
+follow (Heinzle signal channels and axis order in `mich.models.blocks`; the
+governing ODEs, time-derivative units, and source-metadata convention in
+`mich_losses`). `MICH` itself only owns `__init__`, `forward`, the training/
+validation step, and `configure_optimizers`; every loss term and every metric/
+plot is implemented by one of the mixins above. See `notebooks/training.md` for
+which loss terms are on by default and what each one penalises.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,17 +29,44 @@ from mich.models.physio import LearnablePhysioMixin
 
 @dataclass(frozen=True)
 class MICHManifest:
+    """Return value of `MICH._shared_step`.
+
+    `bold`, `neural`, and `z_hat` are populated only for `stage="val"` (needed
+    there for `on_validation_epoch_end`'s metrics/plots); the training path
+    leaves them None since only `total_loss` is used for backprop.
+    `grid_supervision_loss` is None whenever `lambda_grid_supervision` is 0 for
+    both stages.
+    """
+
     data_loss: torch.Tensor
     physics_loss: torch.Tensor
     total_loss: torch.Tensor
-    supervision_loss: torch.Tensor | None = None
+    grid_supervision_loss: torch.Tensor | None = None
     bold: torch.Tensor | None = None  # [B, L, T, H, W]
     neural: torch.Tensor | None = None  # [B, L, T, H, W]
     z_hat: torch.Tensor | None = None  # [B, 7, L, T, H, W]
 
 
 class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModule):
-    # CollocationMixin comes in transitively via MICHLossMixin.
+    """Physics-informed model: BOLD in, Heinzle latent states out, trained
+    against a scheduled combination of data/physics/supervision loss terms
+    (see `_shared_step`).
+
+    Cooperating mixins (this class's MRO), each contributing methods this
+    class calls but does not itself define:
+      - `LearnablePhysioMixin`: `_physio`, `_current_acquisition`,
+        `_setup_learnable_physio` (called in `__init__`, below).
+      - `MICHLossMixin` (and, transitively -- not in this class's own MRO
+        entry, but inherited through `MICHLossMixin` -- `CollocationMixin`):
+        every `_*_loss`/`_compute_*`/`_gather_*`/`_sample_collocation_*`
+        method `_shared_step` and the loss helpers below call.
+      - `MICHLoggingMixin`: `_neural_recovery_metrics`, `_plot_and_log_*`, and
+        the `on_after_backward`/`on_fit_start`/`on_fit_end` PL hooks.
+      - `LightningModule`: `self.log`, `self.hparams`/`save_hyperparameters`,
+        `self.global_step`, `self.trainer`, and (via `nn.Module`)
+        `register_parameter` -- used by `LearnablePhysioMixin`.
+    """
+
     def __init__(
         self,
         heinzle_net: partial,
@@ -38,7 +79,31 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         *args,
         **kwargs: Any,
     ):
+        """
+        Args:
+            heinzle_net: Partially-applied `blocks.HeinzleNet` factory (config
+                already bound; called here with no further args).
+            normaliser: Partially-applied `normaliser.LayerwiseBOLDNormalizer`
+                factory, or None to skip normalisation entirely.
+            optimizer, scheduler: Partially-applied optimizer factory and a
+                scheduler config mapping consumed by `configure_optimizers`
+                (`scheduler` must have a `lightning` key with the PL
+                `lr_scheduler` dict's non-`scheduler` fields).
+            loss_config: All loss weights/schedules; read throughout
+                `_shared_step` and the loss mixin as `self.hparams.loss_config`.
+            learnable_physio: Forwarded to `_setup_learnable_physio`.
+            image_log_every_n_val_calls: Validation plots are logged only
+                every this-many `on_validation_epoch_end` calls (see
+                `on_validation_epoch_end`'s `log_images` gate); metrics are
+                still logged every call regardless.
+            *args, **kwargs: Unused; absorbs extra scalar config keys (e.g.
+                architecture dims also needed by sibling config groups) that
+                Hydra's `instantiate` would otherwise error on passing through.
+        """
         super().__init__()
+        # TODO(doc): rationale unknown -- why this specific autograd warning needs
+        # suppressing (process-wide, not scoped to this model) isn't recorded; likely
+        # related to the checkpoint/vmap/jacrev usage in blocks.py, but unconfirmed.
         torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
         self.save_hyperparameters(logger=False, ignore=["heinzle_net", "normaliser"])
         self.heinzle_net = heinzle_net
@@ -46,10 +111,18 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         self._val_call_count = 0
         lc = self.hparams.loss_config
         self._bold_loss_fn = self._make_loss_fn(getattr(lc, "bold_loss", None))
+        self._bold_grid_loss_fn = self._make_grid_loss_fn(getattr(lc, "bold_loss", None))
         self._ode_loss_fn = self._make_loss_fn(getattr(lc, "ode_loss", None))
         self._supervision_loss_fn = self._make_loss_fn(getattr(lc, "supervision_loss", None))
+        self._supervision_grid_loss_fn = self._make_grid_loss_fn(
+            getattr(lc, "supervision_loss", None)
+        )
         self._dzdt_loss_fn = self._make_loss_fn(getattr(lc, "dzdt_loss", None))
         self._x_phase_loss_fn = self._make_loss_fn(getattr(lc, "x_phase_loss", None))
+        # Buffered across validation_step calls (up to 100 samples, see validation_step)
+        # and drained by on_validation_epoch_end -- PL's validation_step only sees one
+        # batch at a time, but the epoch-end metrics/plots need the whole (sub)epoch's
+        # worth of predictions at once.
         self.pred_buffer = []
         self.neural_buffer = []
         self.bold_buffer = []
@@ -69,6 +142,29 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         return_gradients: bool = False,
         normalise: bool = False,
     ) -> SpatialDecoderManifest:
+        """Run `heinzle_net` on (optionally normalised) BOLD.
+
+        Args:
+            bold: [B, L, T, H, W].
+            time: [B, T], the [0, 1]-normalised time grid (see
+                `CollocationMixin._make_time_grid`).
+            return_gradients: Forwarded to `HeinzleNet.forward`.
+            normalise: If True and `self.normaliser` is set, normalise `bold`
+                first via `self.normaliser(bold)` with no `source_position` --
+                which raises (per `LayerwiseBOLDNormalizer.forward`) unless
+                the model is in eval mode or the normaliser is already
+                frozen, since only then does it fall back to the running
+                statistics instead of requiring source metadata to compute a
+                fresh batch statistic. `_shared_step` never uses this path: it
+                normalises itself (with source metadata) and always calls this
+                with `normalise=False`. This flag exists for callers outside
+                the training loop (e.g. eval-mode inference) with no source
+                metadata to pass.
+
+        Returns:
+            `SpatialDecoderManifest` with `z_hat`: [B, 7, L, T, H, W] (5
+            channels in single-layer/no-drain mode).
+        """
         if self.normaliser is not None and normalise:
             bold_norm = self.normaliser(bold)
         else:
@@ -76,6 +172,47 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         return self.heinzle_net(bold_norm, time, return_gradients=return_gradients)
 
     def _shared_step(self, batch, stage: Literal["train", "val"]) -> MICHManifest:
+        """Forward pass, then assemble `total_loss` as a sum of scheduled loss
+        terms, log every term, and return a stage-shaped `MICHManifest`.
+
+        Every optional term below follows the same pattern: compute its
+        scheduled weight via `_get_scheduled_lambda` (0 before `delay_steps_*`,
+        linearly ramping to the configured target over `warmup_steps_*`), and
+        only compute and add the term itself if that weight is > 0 -- so a
+        term with weight 0 (including one still inside its own delay window)
+        costs nothing beyond the scalar schedule check. `data_loss` and
+        `physics_loss` are the only two always computed (their own lambdas
+        can still be configured to 0, which zeroes their contribution to
+        `total_loss` without skipping the compute). See `mich_losses`'s module
+        docstring and `notebooks/training.md` for what each term penalises
+        and which are on by default.
+
+        `need_grads` (physics loss active, or `stage == "val"`, or either
+        dzdt/x-phase supervision requested) controls whether the decoder
+        computes `dz_hat_dt` at all -- the analytic-derivative branch in
+        `SpatioTemporalDecoder.forward` is the most expensive part of a
+        forward pass, so this call is skipped whenever nothing this step
+        needs it.
+
+        Args:
+            batch: "bold", "neural": [B, L, T, H, W]. "source_position": [B,
+                S, 2], "source_layer": [B, S], "num_sources": [B] (see
+                *Source metadata convention* in `mich_losses`'s module
+                docstring). Optionally "s"/"f"/"v"/"q"[/"v_star"/"q_star"]
+                latents ([B, L, T_latent, H, W]) -- required only if
+                `lambda_grid_supervision` or `supervise_dzdt` is active.
+            stage: "train" or "val" -- controls logging on_step/on_epoch/logger
+                flags, whether this batch is buffered for
+                `on_validation_epoch_end`, and which `MICHManifest` fields are
+                populated (see its docstring).
+
+        Returns:
+            `MICHManifest`; see its docstring for which fields are populated
+            per `stage`.
+
+        Raises:
+            ValueError: If `stage` is neither "train" nor "val".
+        """
         bold, neural = batch["bold"], batch["neural"]
         source_position = batch["source_position"]  # [B, S, 2]
         source_layer = batch["source_layer"]  # [B, S]
@@ -116,7 +253,11 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         dz_hat_dt = sd_manifest.grads  # None when need_grads=False
 
         data_loss, _colloc_loss, src_loss = self._data_loss(
-            z_hat, bold_norm, source_position=source_position, num_sources=num_sources
+            z_hat,
+            bold_norm,
+            source_position=source_position,
+            source_layer=source_layer,
+            num_sources=num_sources,
         )
         if need_grads:
             physics_loss, per_eq_physics = self._physics_loss(
@@ -124,6 +265,7 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 dz_hat_dt,
                 lambda_smooth=lambda_smooth_eff,
                 source_position=source_position,
+                source_layer=source_layer,
                 num_sources=num_sources,
                 order=self.hparams.loss_config.order,
             )
@@ -166,21 +308,6 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         else:
             quiescence_consistency_loss = None
 
-        supervision_loss = None
-        lambda_supervision_eff = 0.0
-        per_sig_supervision: dict = {}
-        if batch.get("s") is not None and lc.lambda_supervision > 0:
-            lambda_supervision_eff = self._get_scheduled_lambda(
-                lc.lambda_supervision,
-                getattr(lc, "warmup_steps_supervision", 0),
-                getattr(lc, "delay_steps_supervision", 0),
-            )
-            if lambda_supervision_eff > 0:
-                supervision_loss, per_sig_supervision = self._source_supervision_loss(
-                    z_hat, batch, source_position, num_sources
-                )
-                total_loss = total_loss + lambda_supervision_eff * supervision_loss
-
         dzdt_supervision_loss = None
         lambda_dzdt_eff = 0.0
         per_sig_dzdt: dict = {}
@@ -192,9 +319,24 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             )
             if lambda_dzdt_eff > 0:
                 dzdt_supervision_loss, per_sig_dzdt = self._derivative_supervision_loss(
-                    dz_hat_dt, batch, source_position, num_sources
+                    dz_hat_dt, batch, source_position, num_sources, source_layer
                 )
                 total_loss = total_loss + lambda_dzdt_eff * dzdt_supervision_loss
+
+        grid_supervision_loss = None
+        lambda_grid_supervision_eff = 0.0
+        per_sig_grid_supervision: dict = {}
+        if batch.get("s") is not None and getattr(lc, "lambda_grid_supervision", 0.0) > 0:
+            lambda_grid_supervision_eff = self._get_scheduled_lambda(
+                lc.lambda_grid_supervision,
+                getattr(lc, "warmup_steps_grid_supervision", 0),
+                getattr(lc, "delay_steps_grid_supervision", 0),
+            )
+            if lambda_grid_supervision_eff > 0:
+                grid_supervision_loss, per_sig_grid_supervision = self._supervision_loss(
+                    z_hat, batch, source_position, source_layer, num_sources
+                )
+                total_loss = total_loss + lambda_grid_supervision_eff * grid_supervision_loss
 
         x_phase_loss = None
         lambda_x_phase_eff = 0.0
@@ -278,20 +420,20 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 sync_dist=True,
                 logger=_to_logger,
             )
-        if supervision_loss is not None:
+        if dzdt_supervision_loss is not None:
             self.log(
-                f"{stage}/loss/supervision",
-                supervision_loss,
+                f"{stage}/loss/dzdt_supervision",
+                dzdt_supervision_loss,
                 on_step=on_step,
                 on_epoch=on_epoch,
                 prog_bar=False,
                 sync_dist=True,
                 logger=_to_logger,
             )
-        if dzdt_supervision_loss is not None:
+        if grid_supervision_loss is not None:
             self.log(
-                f"{stage}/loss/dzdt_supervision",
-                dzdt_supervision_loss,
+                f"{stage}/loss/grid_supervision",
+                grid_supervision_loss,
                 on_step=on_step,
                 on_epoch=on_epoch,
                 prog_bar=False,
@@ -385,19 +527,6 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 # ODE residuals — own section
                 **{f"ode/{k}": v.item() for k, v in per_eq_physics.items()},
             }
-            if supervision_loss is not None:
-                log_dict.update(
-                    {
-                        "train/loss/supervision": supervision_loss.item(),
-                        "train/loss_weighted/supervision": (
-                            supervision_loss * lambda_supervision_eff
-                        ).item(),
-                        # latent supervision per signal — own section
-                        **{
-                            f"supervision/src_{k}": v.item() for k, v in per_sig_supervision.items()
-                        },
-                    }
-                )
             if dzdt_supervision_loss is not None:
                 log_dict.update(
                     {
@@ -406,6 +535,19 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                             dzdt_supervision_loss * lambda_dzdt_eff
                         ).item(),
                         **{f"dzdt_supervision/src_{k}": v.item() for k, v in per_sig_dzdt.items()},
+                    }
+                )
+            if grid_supervision_loss is not None:
+                log_dict.update(
+                    {
+                        "train/loss/grid_supervision": grid_supervision_loss.item(),
+                        "train/loss_weighted/grid_supervision": (
+                            grid_supervision_loss * lambda_grid_supervision_eff
+                        ).item(),
+                        **{
+                            f"grid_supervision/src_{k}": v.item()
+                            for k, v in per_sig_grid_supervision.items()
+                        },
                     }
                 )
             if x_phase_loss is not None:
@@ -422,14 +564,14 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
                 data_loss=data_loss,
                 physics_loss=physics_loss,
                 total_loss=total_loss,
-                supervision_loss=supervision_loss,
+                grid_supervision_loss=grid_supervision_loss,
             )
         elif stage == "val":
             return MICHManifest(
                 data_loss=data_loss,
                 physics_loss=physics_loss,
                 total_loss=total_loss,
-                supervision_loss=supervision_loss,
+                grid_supervision_loss=grid_supervision_loss,
                 z_hat=z_hat,
                 bold=bold,
                 neural=neural,
@@ -438,9 +580,29 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
             raise ValueError(f"Invalid stage: {stage}")
 
     def training_step(self, batch, batch_idx) -> torch.Tensor:
+        """`_shared_step(batch, stage="train").total_loss` -- see `_shared_step`."""
         return self._shared_step(batch, stage="train").total_loss
 
     def validation_step(self, batch, batch_idx):
+        """`_shared_step(batch, stage="val")`, plus buffering this batch (up to
+        the first 100 val batches this epoch, across all val batches
+        regardless of size) for `on_validation_epoch_end`.
+
+        Also builds `true_z_hat`, a `MICHManifest.z_hat`-shaped stack of the
+        ground-truth latents for later plotting.
+
+        Warning:
+            `true_z_hat`'s x channel (index 0) is `torch.empty_like(true_s)`
+            -- uninitialised memory, not ground-truth x (there is no
+            per-channel ground-truth x in the same z_hat-indexed convention;
+            true x lives separately in `batch["neural"]`). Nothing currently
+            reads `true_z_hat`'s x channel (`_plot_and_log_latents` only reads
+            s/f/v/q[/vstar/qstar]), but a future caller that did would get
+            garbage silently, not an error.
+
+        Returns:
+            `manifest.total_loss` (the val-stage `MICHManifest`'s total loss).
+        """
         source_layer, source_position, num_sources = (
             batch["source_layer"],
             batch["source_position"],
@@ -492,6 +654,34 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
         return candidates[idx]
 
     def on_validation_epoch_end(self):
+        """Drain this epoch's buffers, log neural-recovery metrics over the
+        full buffered val set, and (every `image_log_every_n_val_calls`th
+        call) log prediction/latent plots for a small random subset.
+
+        Metrics logged (all via `_neural_recovery_metrics`):
+          - `val/neural/*`: at each sample's own real source(s) only (padded
+            source slots masked out), averaged over every real source.
+          - `val/neural/grid_pearson[_layer{i}]`: pooled (and per-layer)
+            Pearson r over the whole grid, not just source voxels -- capped
+            to `max_rows=20000` randomly-sampled (voxel, layer) rows if the
+            full grid exceeds that, to bound this computation's cost. The
+            per-layer breakdown exists because pooling across layers can hide
+            one hallucinating layer behind others that look fine; it's always
+            emitted (even at L=1, trivially equal to the pooled value) so a
+            single-layer run's dashboards don't need special-casing.
+
+        Plots (only if this call logs images): a random subset of up to 10
+        samples, split as close to half source-voxel / half off-source-voxel
+        as `_pick_off_source_voxel` allows -- deliberately covering an
+        off-source voxel per sample, not just whatever off-source pixels
+        happen to fall out of plotting a source's own row, since that's where
+        hallucination (grid_pearson dropping despite good source recovery)
+        would actually be visible.
+
+        Note:
+            The buffers this drains are populated by `validation_step` and
+            cleared here every call, even on calls that don't log images.
+        """
         bold = torch.cat(self.bold_buffer, dim=0)
         neural = torch.cat(self.neural_buffer, dim=0)
         z_hat = torch.cat(self.pred_buffer, dim=0)

@@ -44,7 +44,7 @@ model:
     lambda_physics: 1.0     # off while debugging forward pass
     lambda_src: 0.0
     lambda_smooth: 0.0
-    lambda_supervision: 1.0
+    lambda_grid_supervision: 1.0
     warmup_steps_physics: 0
     warmup_steps_smooth: 0
     delay_steps_physics: 0

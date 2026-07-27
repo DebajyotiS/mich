@@ -1,3 +1,18 @@
+"""Heinzle/Balloon-Windkessel forward simulation: RHS + RK4 integration + BOLD readout.
+
+This is the numpy/scipy side of the same ODEs `mich.models.mich_losses` implements
+in torch for the physics loss -- see that module's docstring for the governing
+equations themselves (`balloon_derivatives`/`delay_filter_derivatives` here
+correspond to `mich_losses.MICHLossMixin._balloon_v_q_dot_targets`/the vstar/qstar
+target in `_compute_physics_layer_loss`). The two are independent implementations
+that must be kept in sync by hand.
+
+Every state array/tensor here is a `Timecourse`: either a numpy array or a torch
+tensor, of shape `(T, *spatial_shape)` unless documented otherwise -- functions
+that accept a `Timecourse` generally dispatch on `isinstance(x, torch.Tensor)` to
+pick the numpy or torch code path, rather than requiring one or the other.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -200,6 +215,7 @@ class BoldPostProcessingConfig:
 
 
 def _gaussian_kernel_1d(sigma: float, truncate: float = 4.0) -> np.ndarray:
+    """1-D Gaussian kernel, normalised to sum to 1, truncated at `truncate` sigmas."""
     radius = int(truncate * sigma + 0.5)
     x = np.arange(-radius, radius + 1, dtype=np.float64)
     kernel = np.exp(-0.5 * (x / sigma) ** 2)
@@ -207,6 +223,9 @@ def _gaussian_kernel_1d(sigma: float, truncate: float = 4.0) -> np.ndarray:
 
 
 def _apply_psf_numpy(data: np.ndarray, sigma: float, *, boundary: str = "absorbing") -> np.ndarray:
+    """Gaussian-blur `data`'s trailing spatial axes (axis 0 is assumed time and
+    left unblurred); no-op if `data` has 0 or 1 dims. `boundary`: "absorbing"
+    zero-pads at the edge, anything else reflects."""
     if data.ndim <= 1:
         return data
     # sigma=0 on the time axis, blur only spatial axes
@@ -229,6 +248,14 @@ def _reflect_pad(x: torch.Tensor, pad: int, dim: int) -> torch.Tensor:
 def _apply_psf_torch(
     data: torch.Tensor, sigma: float, *, boundary: str = "absorbing"
 ) -> torch.Tensor:
+    """Torch equivalent of `_apply_psf_numpy`, for 1-D or 2-D trailing spatial
+    dims only ("absorbing" pads with zeros via conv `padding=`; the reflect
+    path pads manually via `_reflect_pad` first, since torch's own conv padding
+    modes don't offer this kernel's exact reflect convention).
+
+    Raises:
+        NotImplementedError: If `data` has more than 2 trailing spatial dims.
+    """
     if data.ndim <= 1:
         return data
     kernel_np = _gaussian_kernel_1d(sigma)
@@ -254,6 +281,27 @@ def _apply_psf_torch(
 
 
 def _generate_bold_noise(shape: tuple[int, ...], noise: Noise, amplitude: float) -> np.ndarray:
+    """Additive BOLD-readout noise: white/uniform/pink, seeded from `noise.seed`.
+
+    Pink noise is generated per spatial location independently (1/f-shaped via
+    `1/sqrt(freq)` in the FFT domain along `shape[0]`, the time axis), each then
+    rescaled to zero-mean/unit-std before applying `amplitude`.
+
+    Args:
+        shape: `(T, *spatial_shape)`; must match the BOLD signal it's added to.
+        noise: `noise.type` selects white/uniform/pink; `noise.seed` seeds the
+            RNG (None -> non-reproducible).
+        amplitude: Target noise std (white/pink) or half-width (uniform).
+
+    Raises:
+        ValueError: If `noise.type` isn't "white", "uniform", or "pink".
+
+    Note:
+        This re-implements the same white/uniform/pink generation as
+        `mich.data.signals.Noise.generate`/`generate_temporal`, independently
+        (this one is unconditionally per-voxel spatial; `Noise.generate*`
+        dispatches on `noise.domain`) -- the two are not shared code.
+    """
     rng = np.random.default_rng(noise.seed)
 
     if noise.type == "white":
@@ -324,6 +372,28 @@ def sanitize_state(
     positive: tuple[str, ...] = ("f", "v", "q"),
     signed: tuple[str, ...] = ("x", "s", "v*", "q*"),
 ) -> dict[str, Timecourse | None]:
+    """Clamp state values to finite ranges before they're used in an RHS that
+    divides or raises to fractional/negative powers (e.g. `v**(1/alpha)`).
+
+    Args:
+        values: Signal name -> value (or None, passed through unchanged).
+        eps: Positive floor for `positive` keys (never exactly 0, to keep
+            `1/v`-style divisions finite).
+        max_abs: Absolute-value ceiling applied to both groups (and the
+            floor/ceiling NaN/+-inf are mapped to before clamping).
+        positive: Keys clamped to `[eps, max_abs]`.
+        signed: Keys clamped to `[-max_abs, max_abs]`.
+
+    Returns:
+        A new dict with the same keys as `values`; entries not in `positive`
+        or `signed` are copied through unclamped.
+
+    Warning:
+        NaN is silently mapped to 0 and +-inf to +-`max_abs` before clamping
+        (`_finite`), for every key regardless of group. A genuine solver
+        divergence upstream will not raise here -- it surfaces as a
+        suspiciously saturated-at-`max_abs` or exactly-zero state instead.
+    """
     out: dict[str, Timecourse | None] = dict(values)
 
     for k in positive:
@@ -342,6 +412,29 @@ def sanitize_state(
 def balloon_derivatives(
     layer: CortexLayer, c: HaemodynamicConstants, order: str
 ) -> dict[str, Timecourse]:
+    """RHS of the Balloon-Windkessel ODEs (see module docstring) for one layer's
+    current state, for one RK4 stage.
+
+    `layer.state` is read via `sanitize_state` (see its Warning) but not
+    mutated; `x` in particular is treated as a forcing input, not integrated.
+    If `layer.drain_from` is set and `layer.lambda_d != 0`, adds `lambda_d *
+    v_star / tau` (resp. `q_star`) from the deeper layer's *current* delayed
+    state to dv/dt, dq/dt.
+
+    Args:
+        layer: Layer whose state to evaluate the RHS at.
+        c: Shared physiological constants (kappa, gamma, alpha, E0).
+        order: "exact", "linear", or a second-order Taylor expansion about
+            v=f=q=1 ("quadratic").
+
+    Returns:
+        {"ds_dt", "df_dt", "dv_dt", "dq_dt"} -- each same shape as the state.
+
+    Raises:
+        ValueError: If `order` isn't one of the three above, or if
+            `layer.drain_from` is set with a nonzero `lambda_d` but its state's
+            v_star/q_star are None.
+    """
     clean = sanitize_state(layer.state.as_dict())
     x = clean["x"]  # type: ignore[assignment]
     s = clean["s"]  # type: ignore[assignment]
@@ -407,6 +500,18 @@ def balloon_derivatives(
 
 
 def delay_filter_derivatives(layer: CortexLayer, *, tau_d: float) -> dict[str, Timecourse]:
+    """RHS of the vascular-drainage delay filter: `d(v*)/dt = (-v* + (v-1)) /
+    tau_d` (same form for q*) -- a first-order low-pass tracking `v - 1`/`q - 1`
+    with time constant `tau_d`.
+
+    Returns:
+        {"dv_star_dt", "dq_star_dt"}.
+
+    Raises:
+        ValueError: If `layer.state.v_star`/`q_star` are None (this layer was
+            never allocated delay-filter state -- call sites should only
+            reach here for layers with drainage enabled).
+    """
     if layer.state.v_star is None or layer.state.q_star is None:
         raise ValueError("Delayed states are None. Allocate v_star and q_star before calling.")
 
@@ -428,6 +533,7 @@ def delay_filter_derivatives(layer: CortexLayer, *, tau_d: float) -> dict[str, T
 def get_inversion_derivatives(
     layer: CortexLayer, c: HaemodynamicConstants, tau_d: float, order: str
 ) -> dict[str, Timecourse]:
+    """`balloon_derivatives` and `delay_filter_derivatives` combined into one dict."""
     delayed_derivs = delay_filter_derivatives(layer, tau_d=tau_d)
     balloon_derivs = balloon_derivatives(layer, c, order)
     return {**balloon_derivs, **delayed_derivs}
@@ -441,6 +547,28 @@ def rk4_step(
     state_keys: tuple[str, ...],
     deriv_keys: dict[str, str],
 ) -> dict[str, Timecourse]:
+    """Generic classical RK4 step for a dict-valued ODE state.
+
+    Args:
+        y: Current state, one entry per key in `state_keys` (plus any other
+            keys `dy_fn` needs but doesn't advance, e.g. a forcing input --
+            passed through unchanged in the output).
+        dy_fn: State dict -> derivative dict (e.g. `balloon_derivatives`
+            partially applied). Called 4 times (k1..k4) at RK4's intermediate
+            states.
+        dt: Step size.
+        state_keys: Which keys of `y` this call advances.
+        deriv_keys: `state_keys` entry -> the corresponding key `dy_fn`'s
+            output uses for that state's derivative (e.g. "s" -> "ds_dt").
+
+    Returns:
+        A new dict, same keys as `y`, with `state_keys` entries advanced by
+        one RK4 step and every other key copied through from `y` unchanged.
+
+    Raises:
+        KeyError: If `dy_fn`'s output is missing a key `deriv_keys` expects --
+            fails fast rather than silently skipping that state's update.
+    """
     k1 = dy_fn(y)
 
     # fail fast if derivative dict doesn't match mapping
@@ -486,6 +614,37 @@ def simulate_cortex(
     tau_d: float,
     order: str,
 ) -> dict[int, dict[str, Timecourse]]:
+    """RK4-integrate every layer's Balloon-Windkessel state over T steps, given a
+    per-layer forcing input `x_inputs`, mutating each `CortexLayer.state` in place
+    as it goes and returning the full recorded history.
+
+    Each timestep does, in order: (1) advance every layer's delay filter
+    (`v_star`/`q_star`, if allocated) via `delay_filter_derivatives`; (2) advance
+    every layer's `s, f, v, q` via `balloon_derivatives`; (3) record. Because (1)
+    runs for every layer before (2) runs for any layer, `balloon_derivatives`'s
+    drain term at layer i (which reads `layer.drain_from.state.v_star/q_star`)
+    sees the deeper layer's delay-filter state already advanced to the current
+    step, not the previous step's value -- callers relying on `drain_from` should
+    order `layers` so a layer's `drain_from` appears earlier in the list.
+
+    Args:
+        layers: One `CortexLayer` per depth, `layer.state` mutated in place.
+        constants: Shared physiological constants for `balloon_derivatives`.
+        x_inputs: Per-layer forcing input, `x_inputs[i]` is `layer[i]`'s `x`
+            timecourse, each shaped `(T, *D)` (same `T`, `D` across all).
+        dt: Integration step size.
+        tau_d: Delay-filter time constant, shared across every layer.
+        order: Forwarded to `balloon_derivatives`.
+
+    Returns:
+        `{layer.depth: {"x","s","f","v","q"[,"v*","q*"]: (T, *D) array}}` --
+        `"v*"/"q*"` present only for layers whose state was allocated with
+        v_star/q_star.
+
+    Raises:
+        ValueError: If `len(layers) != len(x_inputs)`, or if any `x_inputs[i]`
+            doesn't match the common `(T, *D)` shape.
+    """
     if len(layers) != len(x_inputs):
         raise ValueError(f"len(layers)={len(layers)} must match len(x_inputs)={len(x_inputs)}")
 
@@ -609,6 +768,30 @@ def get_bold_from_state(
     layer_depth: int | None = None,
     params: BoldPostProcessingConfig | None = None,
 ) -> Timecourse:
+    """BOLD readout from a haemodynamic state, plus optional PSF blur and noise.
+
+    Readout formula: `V0 * (k1*(1-q) + k2*(1-q/v) + k3*(1-v))` -- the same
+    formula `mich.models.mich_losses.MICHLossMixin._compute_bold` re-implements
+    in torch on model predictions; the two must stay in sync.
+
+    Args:
+        state: Must have "q", "v" keys (any other keys ignored).
+        acq, c: Acquisition (k1/k2/k3) and physiological (V0) constants.
+        layer_depth: Which `params.layer_psf` entry to use; ignored if
+            `params.layer_psf` or this is None.
+        params: If None, returns the raw readout with no PSF/noise applied.
+
+    Returns:
+        Same shape as `state["q"]`/`state["v"]`.
+
+    Note:
+        If `params` is given, processing order is fixed: PSF blur first, then
+        noise added on top -- matches `BoldPostProcessingConfig`'s documented
+        order. Noise amplitude is resolved with a fixed priority regardless of
+        which fields are set: `snr_db` (derived from this call's own signal
+        power) overrides `noise_models` (sum of `noise_std * scale`), which
+        overrides a direct `noise_amplitude`. `snr_db == inf` means zero noise.
+    """
     k1 = acq.k1
     k2 = acq.k2
     k3 = acq.k3

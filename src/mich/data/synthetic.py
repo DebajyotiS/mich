@@ -1,3 +1,19 @@
+"""HDF5-backed dataset/datamodule for training on `run_sim.py`-generated simulations.
+
+HDF5 layout (see `SyntheticH5Dataset`'s docstring for per-layer dataset shapes):
+one `/layer_k/` group per cortical layer (bold, x, and -- if latents were saved --
+s, f, v, q[, v_star, q_star]), plus a `/meta` group with per-sample source
+metadata and the exact simulation config as a JSON string attribute (read by
+`SyntheticDataModule.sim_config`).
+
+Worker-local file handles: `h5py.File` handles aren't safely shareable across a
+`DataLoader` worker-process fork, so `SyntheticH5Dataset` opens its file lazily,
+per-process, via `_ensure_open` (called at the top of every `__getitem__`) rather
+than in `__init__`, and `__getstate__` nulls out any handles already open in the
+main process before a worker is forked, so each worker starts with none and opens
+its own on first access.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -15,6 +31,12 @@ except Exception:
 
 
 def _torch_dtype(dtype_str: str) -> torch.dtype:
+    """Config string ("float16"/"fp16"/"half", "float32"/"fp32"/"float",
+    case-insensitive) -> torch dtype.
+
+    Raises:
+        ValueError: If `dtype_str` doesn't match one of the names above.
+    """
     s = str(dtype_str).lower()
     if s in ("float16", "fp16", "half"):
         return torch.float16
@@ -24,6 +46,11 @@ def _torch_dtype(dtype_str: str) -> torch.dtype:
 
 
 def _np_dtype(torch_dtype: torch.dtype) -> np.dtype:
+    """`_torch_dtype`'s inverse, restricted to the two dtypes it can produce.
+
+    Raises:
+        ValueError: If `torch_dtype` isn't `torch.float16` or `torch.float32`.
+    """
     if torch_dtype == torch.float16:
         return np.float16
     if torch_dtype == torch.float32:
@@ -44,10 +71,15 @@ def discover_layers(path: str) -> Tuple[str, ...]:
 
 
 def _open_h5(path: str, cache_cfg: Mapping[str, Any]) -> h5py.File:
-    """
-    Notes:
-    - swmr=False is typically faster if you are not writing during training.
-    - rdcc_* controls HDF5 chunk cache per file handle (thus per worker).
+    """Open `path` read-only with per-handle HDF5 chunk-cache settings from
+    `cache_cfg` (each `DataLoader` worker gets its own handle and thus its own
+    cache -- see `SyntheticH5Dataset`'s worker-local-handle note).
+
+    Args:
+        cache_cfg: `swmr` (default False -- typically faster if nothing is
+            writing to the file during training), `rdcc_nbytes` (default
+            256 MiB), `rdcc_nslots` (default 200_003), `rdcc_w0` (default
+            0.75). See h5py's `File` docs for what each controls.
     """
     return h5py.File(
         path,
@@ -61,10 +93,27 @@ def _open_h5(path: str, cache_cfg: Mapping[str, Any]) -> h5py.File:
 
 
 def compute_split_counts(n: int, split: Mapping[str, Any]) -> Tuple[int, int, int]:
-    """
-    Supports either explicit counts (train_count/val_count/test_count)
-    OR fraction-based (train_frac/val_frac/test_frac). If both are present,
-    counts take precedence when any count is provided.
+    """(train, val, test) example counts summing to `n`.
+
+    Supports either explicit counts (train_count/val_count/test_count) OR
+    fraction-based (train_frac/val_frac/test_frac). If both are present,
+    counts take precedence when any count is provided. In the count-based
+    path, an unset `train_count` gets the remainder (`n - val - test`); in the
+    fraction-based path, an unset `train_frac` gets the remainder fraction
+    (val/test are rounded independently and train absorbs the rounding
+    error), while a given `train_frac` requires all three to sum to 1
+    (rounding errors go entirely to test, the remainder term).
+
+    Args:
+        n: Total example count to split.
+        split: See above -- `test_frac`/`val_frac` default to 0.1 each in the
+            fraction-based path if unset.
+
+    Raises:
+        ValueError: If the counts exceed `n`; if `val_frac`/`test_frac` are
+            negative; if `train_frac` is unset and `val_frac + test_frac >
+            1`; or if `train_frac` is set and the three fractions don't sum
+            to 1 (within 1e-6).
     """
     train_count = split.get("train_count", None)
     val_count = split.get("val_count", None)
@@ -134,6 +183,25 @@ class SyntheticH5Dataset(Dataset):
         return_meta: bool = False,
         return_latents: bool = False,
     ):
+        """
+        Args:
+            path: HDF5 simulation file (see module docstring for layout).
+            cache_cfg: Forwarded to `_open_h5` for every worker's file handle.
+            layers: Which `/layer_k/` groups to read, in the order stacked
+                into this dataset's layer axis.
+            dtype: Output tensor dtype for bold/neural (and latents, if
+                requested); the HDF5 arrays are read directly into a numpy
+                buffer of the matching numpy dtype (`_np_dtype(dtype)`), not
+                cast after the fact.
+            return_meta: If True, also return per-sample source metadata.
+            return_latents: If True, also return s/f/v/q(/v_star/q_star)
+                ground-truth latents.
+
+        Note:
+            Latents can have a different recorded length than bold/x
+            (`self.lt` vs the bold/x time length in `self._window_shape`) --
+            `__getitem__` allocates each accordingly, not assuming they match.
+        """
         super().__init__()
         self.path = str(path)
         self.layers = tuple(layers)
@@ -169,6 +237,11 @@ class SyntheticH5Dataset(Dataset):
         return self.N
 
     def __getstate__(self) -> dict:
+        """Pickling support: strip every open HDF5 handle before this instance
+        is sent to a `DataLoader` worker process, so each worker calls
+        `_ensure_open` itself on first access instead of inheriting (or trying
+        to pickle) the main process's handles. See the module docstring's
+        *Worker-local file handles* note."""
         # null all file handles so workers always start fresh
         d = dict(self.__dict__)
         for k in (
@@ -190,6 +263,14 @@ class SyntheticH5Dataset(Dataset):
         return d
 
     def __del__(self) -> None:
+        """Close this instance's own HDF5 handle, if it opened one.
+
+        Warning:
+            `ImportError` during close is silently swallowed -- at interpreter
+            shutdown, `h5py`'s own internals may already be unloaded, and a
+            `__del__` that raises there produces a spurious, unhelpful
+            "exception ignored in __del__" warning rather than a real error.
+        """
         try:
             if self._h5 is not None:
                 self._h5.close()
@@ -198,6 +279,17 @@ class SyntheticH5Dataset(Dataset):
             pass  # interpreter shutting down, h5py already unloaded
 
     def _ensure_open(self) -> None:
+        """Open this process's own HDF5 handle and per-layer dataset refs, if
+        not already open (idempotent no-op otherwise). See the module
+        docstring's *Worker-local file handles* note for why this exists
+        instead of opening in `__init__`.
+
+        Note:
+            v_star/q_star are only opened if `len(self.layers) > 1` (matching
+            the drain-mode-is-multi-layer convention elsewhere) -- a
+            single-layer dataset never reads them even if `return_latents`
+            and the file happens to have them.
+        """
         if self._h5 is not None:
             return
         self._h5 = _open_h5(self.path, self.cache_cfg)
@@ -218,6 +310,19 @@ class SyntheticH5Dataset(Dataset):
                 self._m_latent_q_star = [self._h5[lyr]["q_star"] for lyr in self.layers]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """One sample, read directly from HDF5 into pre-allocated numpy buffers
+        (`Dataset.read_direct`, one layer at a time -- avoids an intermediate
+        per-layer array before stacking).
+
+        Returns:
+            Always: "bold", "neural" ([L, T, H, W], `self.dtype`).
+            If `return_meta`: "num_sources" (int), "source_layer" ([max_sources]),
+            "source_position" ([max_sources, 2]), "num_pulses" ([max_sources])
+            -- only the first `num_sources` entries of each padded array are
+            valid; the rest are whatever `run_sim.py` padded them with.
+            If `return_latents`: "s", "f", "v", "q" ([L, self.lt, H, W]), plus
+            "v_star", "q_star" (same shape) if `len(self.layers) > 1`.
+        """
         self._ensure_open()
 
         L = len(self.layers)
@@ -284,6 +389,15 @@ class SyntheticH5Dataset(Dataset):
 
 
 class SyntheticDataModule(pl.LightningDataModule):
+    """Splits one HDF5 simulation file into train/val/test `SyntheticH5Dataset`
+    subsets, and builds their `DataLoader`s.
+
+    Each split gets its own `SyntheticH5Dataset` instance (see `_make_dataset`),
+    not a shared one -- so `data`'s per-split override keys ("train"/"val"/"test",
+    see `_resolve_split_cfg`) can give each split different `return_meta`/
+    `return_latents`/`dtype`/etc, e.g. only requesting latents for validation.
+    """
+
     def __init__(
         self,
         data: Mapping[str, Any],
@@ -314,6 +428,18 @@ class SyntheticDataModule(pl.LightningDataModule):
         return cfg
 
     def _make_dataset(self, cfg: dict) -> SyntheticH5Dataset:
+        """Build a `SyntheticH5Dataset` from a resolved (post-`_resolve_split_cfg`)
+        config dict.
+
+        Args:
+            cfg: Must have "path"; "layers" of "auto"/None (default) discovers
+                every `layer_*` group via `discover_layers` instead of taking
+                an explicit list. "dtype"/"return_meta"/"return_latents" as in
+                `SyntheticH5Dataset.__init__` (string dtype, resolved here).
+
+        Raises:
+            ValueError: If `cfg["path"]` is missing.
+        """
         data_path = cfg.get("path")
         if data_path is None:
             raise ValueError("data.path must be set")
@@ -332,6 +458,23 @@ class SyntheticDataModule(pl.LightningDataModule):
         )
 
     def setup(self, stage: str | None = None) -> None:
+        """Build `ds_train`/`ds_val`/`ds_test` as disjoint, reproducibly-seeded
+        `Subset`s of the total sample count.
+
+        A throwaway dataset (built from the base, non-split-specific config)
+        is opened only to read its length; a fresh dataset is then built per
+        split (via `_make_dataset(self._resolve_split_cfg(<split>))`), so each
+        split can have its own `return_meta`/`return_latents`/etc, and none of
+        the three share an open file handle. Indices are assigned contiguously
+        after an optional `torch.Generator`-seeded shuffle: `[0:n_train)` ->
+        train, `[n_train:n_train+n_val)` -> val, the rest (up to `n_test`) ->
+        test -- so train/val/test are always disjoint regardless of shuffling.
+
+        Note:
+            `self.dataset_full` (declared in `__init__`) is never assigned
+            here or anywhere else in this class; the throwaway dataset above
+            is a local variable, not stored on `self`.
+        """
         # Use a temporary dataset to get N and compute split indices
         base_cfg = self._resolve_split_cfg("__none__")
         _tmp = self._make_dataset(base_cfg)
@@ -356,6 +499,11 @@ class SyntheticDataModule(pl.LightningDataModule):
         self.ds_test = Subset(self._make_dataset(self._resolve_split_cfg("test")), test_idx)
 
     def _make_loader(self, ds: Subset, *, shuffle: bool, drop_last: bool) -> DataLoader:
+        """Build a `DataLoader` over `ds` from `self.loader_config` (batch_size
+        default 2, num_workers default 0, pin_memory default False,
+        persistent_workers default False -- forced False if num_workers=0,
+        prefetch_factor default 2 -- forced None if num_workers=0, since torch
+        rejects a non-None prefetch_factor with no workers)."""
         bs = int(self.loader_config.get("batch_size", 2))
         num_workers = int(self.loader_config.get("num_workers", 0))
 
@@ -402,6 +550,13 @@ class SyntheticDataModule(pl.LightningDataModule):
 
     @property
     def sim_config(self) -> dict:
+        """The exact `run_sim.py` config that produced this datamodule's HDF5
+        file, read fresh from `/meta`'s "config" JSON attribute on every
+        access (not cached).
+
+        Raises:
+            ValueError: If `self.data_config["path"]` is unset.
+        """
         import json
 
         path = self.data_config.get("path")

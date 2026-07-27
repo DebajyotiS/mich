@@ -1,3 +1,13 @@
+"""Pulse waveform and noise generators for synthetic neural-source signals.
+
+Every `*Pulse` dataclass is a named forcing-signal shape: `generate(t)` returns
+the pulse's amplitude at each time in `t` (zero outside its support), so all of
+them share the interface `Pulse`'s factory (`_make_pulse`) dispatches over.
+`ExpDecayPulse` and `RectPulse` are the two currently-recommended shapes;
+`TriangularPulse`, `SincPulse`, and `AlphaPulse` are deprecated in favour of
+those two (see each class's `@deprecated` reason).
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,6 +19,9 @@ from deprecated import deprecated
 
 @dataclass(frozen=True, slots=True)
 class ExpDecayPulse:
+    """Exponential decay starting at `t_onset`: `amplitude * exp(-decay_rate *
+    (t - t_onset))` for `t >= t_onset`, else 0."""
+
     amplitude: float
     t_onset: float
     decay_rate: float
@@ -22,6 +35,9 @@ class ExpDecayPulse:
 
 @dataclass(frozen=True, slots=True)
 class RectPulse:
+    """Rectangular (boxcar) pulse: `amplitude` for `t` in `[t_onset, t_onset +
+    width)`, else 0."""
+
     amplitude: float
     t_onset: float
     width: float
@@ -36,6 +52,9 @@ class RectPulse:
 @deprecated(reason="TriangularPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
 @dataclass(frozen=True, slots=True)
 class TriangularPulse:
+    """Symmetric triangular pulse of `width` centred at `t_peak`, linearly
+    ramping 0 -> `amplitude` -> 0."""
+
     amplitude: float
     t_peak: float
     width: float
@@ -60,6 +79,9 @@ class TriangularPulse:
 @deprecated(reason="TriangularPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
 @dataclass(frozen=True, slots=True)
 class SincPulse:
+    """Hamming-windowed sinc pulse of `width` centred at `t_center`, oscillating
+    `cycles` full periods within that width."""
+
     amplitude: float
     t_center: float
     width: float
@@ -86,6 +108,9 @@ class SincPulse:
 @deprecated(reason="TriangularPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
 @dataclass(frozen=True, slots=True)
 class AlphaPulse:
+    """Alpha-function pulse starting at `t_onset`: `amplitude * alpha * t' *
+    exp(-beta * t')` where `t' = t - t_onset`, for `t >= t_onset`."""
+
     amplitude: float
     t_onset: float
     alpha: float
@@ -109,6 +134,24 @@ class Pulse:
     rng: np.random.Generator | None = None
 
     def generate(self) -> tuple[np.ndarray, np.ndarray]:
+        """Sum every peak's pulse waveform onto a shared `[0, duration)` time
+        grid, then optionally inject a random baseline.
+
+        Each entry of `peaks` is passed as positional args to the
+        `pulse_type`-selected pulse dataclass (via `_make_pulse`), so its
+        length/order must match that dataclass's fields.
+
+        If `pulse_type == "rect"` and `baseline == "random"`, every
+        *interior* zero-signal run (i.e. excluding the leading run before the
+        first pulse and the trailing run after the last, via the `[1:-1]`
+        slice below) gets an i.i.d. `Uniform(-0.1, 0.1) * median(peak
+        amplitudes)` offset added across its whole span. TODO(doc): rationale
+        unknown -- why those two boundary runs are excluded from baseline
+        injection isn't stated.
+
+        Returns:
+            (t, signal), both `[N]` where `N = len(arange(0, duration, dt))`.
+        """
         # NOTE: preserves old functionality: fixed dt=0.01 here
         t = np.arange(0, self.duration, self.dt)
         signal = np.zeros_like(t)
@@ -133,6 +176,16 @@ class Pulse:
 
 
 def _make_pulse(pulse_type: str, peak: Sequence[Any]) -> Any:
+    """Build the pulse dataclass named by `pulse_type`, from positional args `peak`.
+
+    Args:
+        pulse_type: One of "exp_decay", "rect", "gaussian" (maps to
+            `TriangularPulse`, not a Gaussian pulse), "sinc", "alpha".
+        peak: Positional constructor args for that pulse dataclass.
+
+    Raises:
+        ValueError: If `pulse_type` doesn't match one of the names above.
+    """
     # Factory preserves same mapping from pulse_type to dataclass
     if pulse_type == "exp_decay":
         return ExpDecayPulse(*peak)
@@ -148,14 +201,21 @@ def _make_pulse(pulse_type: str, peak: Sequence[Any]) -> Any:
 
 
 class Sources:
+    """Accumulates source specs as plain dicts, in the `{"layer", "position",
+    "signal"}` shape `LayeredDiffusionSimulator.simulate` expects for its
+    `sources` argument."""
+
     def __init__(self) -> None:
         self.source_list: list[dict[str, Any]] = []
 
     def add_source(self, layer: int, position: tuple[int, int], signal: np.ndarray) -> None:
+        """Append one source: `layer` index, `(h, w)` grid `position`, and its
+        1-D `signal` timecourse."""
         # preserves old structure: dict with keys 'layer', 'position', 'signal'
         self.source_list.append({"layer": layer, "position": position, "signal": signal})
 
     def get_sources(self) -> list[dict[str, Any]]:
+        """All sources added so far, in `add_source` order."""
         return self.source_list
 
 
@@ -165,11 +225,37 @@ NoiseType = Literal["white", "pink", "uniform"]
 
 @dataclass(frozen=True, slots=True)
 class Noise:
+    """White/uniform/pink noise generator for either the spatial grid
+    (`generate`) or per-source temporal traces (`generate_temporal`).
+
+    `domain` records which of the two a caller should use (and, for "both",
+    that both should be combined) -- neither `generate` nor `generate_temporal`
+    reads `domain` itself; dispatching on it is the caller's responsibility
+    (see `mich.data.neuronal.LayeredDiffusionSimulator.simulate`).
+    """
+
     type: NoiseType
     seed: int | None = None
     domain: NoiseDomain = "spatial"
 
     def generate(self, amplitude: float, layers: int, grid_size: tuple[int, int]) -> np.ndarray:
+        """Spatial noise field, one independent draw per layer.
+
+        Pink noise is shaped per layer via `1/sqrt(|f|)` in the 2-D FFT domain
+        (`|f|` = radial spatial frequency magnitude, DC bin left at 1.0 to
+        avoid dividing by 0), then rescaled to zero-mean/unit-std before
+        applying `amplitude` -- except when a layer's pink draw has near-zero
+        variance (`std < 1e-12`), which returns exact zeros for that layer
+        instead of amplifying near-nothing by dividing by a near-zero std.
+
+        Args:
+            amplitude: Target noise std (white/pink) or half-width (uniform);
+                0 short-circuits to exact zeros without drawing any randomness.
+            layers, grid_size: Output shape is `(layers, *grid_size)`.
+
+        Raises:
+            ValueError: If `self.type` isn't "white", "uniform", or "pink".
+        """
         rng = np.random.default_rng(self.seed)
 
         if amplitude == 0.0:
@@ -210,6 +296,23 @@ class Noise:
     def generate_temporal(
         self, amplitude: float, n_sources: int, steps: int, dt: float
     ) -> np.ndarray:
+        """Temporal noise trace per source, one independent draw per source.
+
+        Pink noise is shaped via `1/sqrt(freq)` in the 1-D (real) FFT domain
+        (DC bin left at the first nonzero frequency to avoid dividing by 0),
+        then rescaled to zero-mean/unit-std before applying `amplitude` --
+        unlike `generate`'s spatial pink noise, there is no near-zero-std
+        fallback here (a near-constant draw is divided by its own near-zero
+        std as-is).
+
+        Args:
+            amplitude: Target noise std; 0 short-circuits to exact zeros.
+            n_sources, steps: Output shape is `(n_sources, steps)`.
+            dt: Sample spacing, used only for pink noise's frequency axis.
+
+        Raises:
+            ValueError: If `self.type` isn't "white", "uniform", or "pink".
+        """
         rng = np.random.default_rng(self.seed)
 
         if amplitude == 0.0:

@@ -44,6 +44,10 @@ class SupervisedMICH(LightningModule):
 
     @staticmethod
     def _pearson_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+        """`1 - Pearson correlation` over the last dim, averaged over every
+        other dim -- equivalent to `mich.models.mich_losses.MICHLossMixin
+        ._make_loss_fn`'s `_pearson` helper (dim=1 there vs dim=-1 here;
+        independent implementations of the same formula)."""
         pred_c = pred - pred.mean(dim=-1, keepdim=True)
         true_c = true - true.mean(dim=-1, keepdim=True)
         num = (pred_c * true_c).sum(dim=-1)
@@ -51,6 +55,9 @@ class SupervisedMICH(LightningModule):
         return (1.0 - num / denom).mean()
 
     def _loss(self, pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+        """`mse(pred, true) + lambda_pearson * _pearson_loss(pred, true)`;
+        `lambda_pearson` from `self.hparams.loss_config` (default 1.0 if unset
+        or `loss_config` is None)."""
         lc = self.hparams.loss_config
         lambda_pearson = getattr(lc, "lambda_pearson", 1.0)
         return F.mse_loss(pred, true) + lambda_pearson * self._pearson_loss(pred, true)
@@ -61,6 +68,10 @@ class SupervisedMICH(LightningModule):
 
     @staticmethod
     def _neural_recovery_metrics(pred: torch.Tensor, true: torch.Tensor) -> dict[str, float]:
+        """R2, Pearson r, and peak cross-correlation lag; verbatim duplicate of
+        `mich.models.mich_logging.MICHLoggingMixin._neural_recovery_metrics`
+        (see its docstring for the lag computation and the near-constant-row
+        Warning) -- not shared code between the two models."""
         pred, true = pred.float(), true.float()
         T = pred.shape[-1]
         flat_pred = pred.reshape(-1, T)
@@ -96,10 +107,26 @@ class SupervisedMICH(LightningModule):
     # ------------------------------------------------------------------
 
     def forward(self, bold: torch.Tensor) -> torch.Tensor:
+        """[B, L, T, H, W] BOLD -> [B, L, T, H, W] predicted neural activity,
+        normalising with `self.normaliser.normalize` (the running statistics,
+        no update) if a normaliser is set."""
         bold_norm = self.normaliser.normalize(bold) if self.normaliser is not None else bold
         return self.net(bold_norm)  # [B, L, T, H, W]
 
     def _shared_step(self, batch, stage: str) -> torch.Tensor:
+        """Forward pass, loss at the single source voxel only (this model has
+        no per-layer source metadata, unlike `mich.MICH`: `batch["source_position"]`
+        here is `[B, 2]`, not `[B, S, 2]`), and (for `stage="val"`) buffer this
+        batch for `on_validation_epoch_end`.
+
+        Args:
+            batch: "bold", "neural": [B, L, T, H, W]; "source_position": [B, 2].
+            stage: "train" or "val" -- controls `self.log`'s on_step/on_epoch/
+                logger flags and whether this batch is buffered.
+
+        Returns:
+            Scalar loss (`self._loss` on the source-voxel slice).
+        """
         bold = batch["bold"]
         true_neural = batch["neural"]
         source_position = batch["source_position"]
@@ -145,6 +172,18 @@ class SupervisedMICH(LightningModule):
         self._shared_step(batch, stage="val")
 
     def on_validation_epoch_end(self):
+        """Aggregate the epoch's buffered validation batches, log recovery
+        metrics (`_neural_recovery_metrics`) at the source voxel over the full
+        val set, and log a `plot_neural_bold_layers` plot for up to 10 random
+        samples -- BOLD input is plotted in both the "pred" and "true" BOLD
+        slots (this model has no BOLD prediction of its own to show).
+
+        Note:
+            Unlike `mich.MICH`'s version, this uses `make_rank_zero_adapter`
+            (rank-0-only, no per-rank DDP coordination) rather than the
+            `on_fit_start`/`on_fit_end`-managed per-rank adapter -- this class
+            implements neither of those hooks.
+        """
         if not self._pred_buffer:
             return
 

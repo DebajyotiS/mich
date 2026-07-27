@@ -28,13 +28,13 @@ model:
     lambda_physics: 1.0
     lambda_src: 10.0
     lambda_smooth: 0.0
-    lambda_supervision: 1.0
+    lambda_grid_supervision: 1.0
     warmup_steps_physics: 500    # short so physics kicks in quickly
     delay_steps_physics: 100
     warmup_steps_smooth: 0
     delay_steps_smooth: 0
-    warmup_steps_supervision: 0
-    delay_steps_supervision: 0
+    warmup_steps_grid_supervision: 0
+    delay_steps_grid_supervision: 0
     n_time: 80
     n_space: 450
 

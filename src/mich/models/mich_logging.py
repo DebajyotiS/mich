@@ -12,14 +12,50 @@ from mich.utils.run_adapters import make_run_adapter
 
 class MICHLoggingMixin:
     """Neural-recovery metrics, plot assembly, and the PL hooks that manage per-rank
-    runs and gradient-norm logging. Pure side effects -- no loss/physics math here."""
+    runs and gradient-norm logging. Pure side effects -- no loss/physics math here.
+
+    Reads/uses, none of which this class defines itself (mixed in alongside this
+    class at the concrete model's `LightningModule` base, not inherited by it):
+      - `self.global_step`, `self.trainer` (`LightningModule`); `self.log(...)`
+        (`LightningModule`, via PyTorch Lightning).
+      - `self.heinzle_net` (set in `mich.MICH.__init__`): `.spatial_decoder.time_film`,
+        `.spatial_decoder.out_heads` -- read for their parameters' `.grad` in
+        `on_after_backward`.
+      - `self._pending_train_log` (dict or None): built by `mich.MICH._shared_step`
+        each training step and consumed (then reset to None) by
+        `on_after_backward` below -- the two must run in that order within a
+        step, which Lightning's training loop guarantees (backward always
+        follows the step that sets it).
+
+    Also sets/owns `self._adapter` (a `RunAdapter` or None) via `on_fit_start`,
+    read by every plotting/logging method below.
+    """
 
     @staticmethod
     def _neural_recovery_metrics(
         pred: torch.Tensor,  # [B, L, T]
         true: torch.Tensor,  # [B, L, T]
     ) -> dict[str, float]:
-        """R2, Pearson r, and peak cross-correlation lag averaged over samples and layers."""
+        """R2, Pearson r, and peak cross-correlation lag, each averaged over every
+        (batch, layer) pair.
+
+        Peak lag is the argmax of the circular cross-correlation (computed via
+        FFT, zero-padded to `2*T` to approximate a linear, non-wraparound
+        correlation over the range it's evaluated at) between `true` and
+        `pred`, in samples; positive means `pred` lags `true`.
+
+        Args:
+            pred, true: [B, L, T].
+
+        Returns:
+            {"val/neural/r2", "val/neural/pearson", "val/neural/lag_samples"}.
+
+        Warning:
+            `ss_tot`/pearson's denominator are `.clamp(min=1e-8)`, so a
+            near-constant `true`/`pred` row doesn't raise but instead produces
+            a very large-magnitude (not NaN/inf) R2 or an ~0 Pearson
+            contribution for that row.
+        """
         pred = pred.float()
         true = true.float()
         T = pred.shape[-1]
@@ -57,6 +93,24 @@ class MICHLoggingMixin:
     def _plot_and_log_x_recon(
         self, pred_neural, pred_x_recon, true_x_recon, true_neural, source_layer, num_sources
     ):
+        """Per-sample, per-layer plot of x (head prediction) against its ODE-residual
+        reconstruction from s/f (`_x_phase_loss`'s `x_rhs`), both against ground
+        truth, logged as `media/x_recon`.
+
+        Args:
+            pred_neural, true_neural: [B, L, T] -- head's x prediction / ground truth.
+            pred_x_recon, true_x_recon: [B, L, T-1] -- reconstruction from
+                predicted/true s,f (one shorter than T; presumably a
+                finite-difference reconstruction, though nothing here computes
+                it, so the T-1 convention is only enforced by the caller).
+            source_layer, num_sources: See *Source metadata convention* in
+                `mich.models.mich_losses`'s module docstring; used only to
+                annotate each subplot's title with its source count.
+
+        Note:
+            Not called from `mich.MICH`'s validation path -- exercised only by
+            `tests/test_mich_logging.py`.
+        """
         adapter = getattr(self, "_adapter", None)
         layer_names = ["Deep", "Middle", "Superficial"]
         images = []
@@ -123,6 +177,21 @@ class MICHLoggingMixin:
         voxel_pos=None,  # [B, 2] optional -- (h, w) actually plotted, for the suptitle below
         is_source_voxel=None,  # [B] bool optional -- whether voxel_pos is a true source
     ):
+        """Per-sample BOLD+neural plot (`plot_neural_bold_layers`) for every
+        sample in the batch, logged as `media/predictions` with `commit=False`
+        -- relies on a later `commit=True` call (`_plot_and_log_latents`) in
+        the same validation epoch to flush this into the same logged row; see
+        `mich.MICH.on_validation_epoch_end`'s comment on why that matters for
+        W&B history alignment.
+
+        Args:
+            pred_bold, true_bold, pred_neural, true_neural: [B, L, T].
+            source_layer, source_pos, num_sources: Per-sample source metadata,
+                forwarded to `plot_neural_bold_layers` (see its docstring).
+            voxel_pos, is_source_voxel: If both given, each plot's suptitle
+                names which (h, w) was actually plotted and whether it's a
+                true source voxel; omitted (no suptitle) if either is None.
+        """
         adapter = getattr(self, "_adapter", None)
         images = []
         for i in range(pred_bold.shape[0]):
@@ -167,6 +236,19 @@ class MICHLoggingMixin:
         voxel_pos=None,  # [B, 2] optional -- (h, w) actually plotted, for the title below
         is_source_voxel=None,  # [B] bool optional -- whether voxel_pos is a true source
     ):
+        """Per-sample latent-state plot (`plot_latent_layers`) for every sample,
+        logged as `media/latents` with `commit=True` -- flushes this step's
+        logged row (see `_plot_and_log_predictions`'s docstring on why the
+        commit flag matters here).
+
+        Args:
+            pred_s, true_s, pred_f, true_f, pred_v, true_v, pred_q, true_q: [B, L, T].
+            pred_v_star, true_v_star, pred_q_star, true_q_star: [B, L, T] each,
+                or all four None (drain mode is all-or-nothing here, forwarded
+                to `plot_latent_layers` accordingly).
+            voxel_pos, is_source_voxel: As in `_plot_and_log_predictions`, but
+                for each plot's title rather than a suptitle.
+        """
         adapter = getattr(self, "_adapter", None)
         images = []
         for i in range(pred_s.shape[0]):
@@ -213,6 +295,17 @@ class MICHLoggingMixin:
             plt.close(image)
 
     def on_after_backward(self):
+        """PL hook: flush `self._pending_train_log` (built by
+        `mich.MICH._shared_step` this step) to `self._adapter`, appending FiLM
+        and output-head gradient-norm metrics first -- run here rather than in
+        `_shared_step` because gradients don't exist until after `backward()`.
+
+        No-op if there's no pending log (e.g. this wasn't a training step) or
+        no adapter (non-W&B/MLflow logger, or a rank `on_fit_start` didn't set
+        one up for). Gradient norms are skipped at `global_step == 0` (no
+        `.grad` yet on the very first step) and, per parameter group, only
+        include parameters that currently have a non-None `.grad`.
+        """
         pending = getattr(self, "_pending_train_log", None)
         self._pending_train_log = None
         if pending is None:
@@ -250,12 +343,23 @@ class MICHLoggingMixin:
         adapter.log(pending)
 
     def on_fit_start(self) -> None:
+        """PL hook: set `self._adapter` for this rank (see `make_run_adapter`),
+        or leave it unset if the trainer's logger is neither W&B nor MLflow --
+        every other method here treats a missing `self._adapter` as "logging
+        disabled" via `getattr(self, "_adapter", None)`, not as an error."""
         if not isinstance(self.trainer.logger, (WandbLogger, MLFlowLogger)):
             return
         self._adapter = make_run_adapter(self.trainer, self.global_rank)
         self._adapter.configure_step_metric()
 
     def on_fit_end(self) -> None:
+        """PL hook: finish and clear this rank's adapter, but only on non-zero
+        ranks. Rank 0's adapter wraps the trainer's own primary logger
+        connection (`trainer.logger`'s underlying W&B/MLflow run), which
+        Lightning finishes itself; non-zero ranks' adapters wrap a separate,
+        Lightning-invisible run (see `make_run_adapter`) that would otherwise
+        never be closed.
+        """
         adapter = getattr(self, "_adapter", None)
         if not self.trainer.is_global_zero and adapter is not None:
             adapter.finish()

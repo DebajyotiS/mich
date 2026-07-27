@@ -21,6 +21,15 @@ _pynvml_ready = False
 
 
 def _ensure_pynvml() -> bool:
+    """Import and `nvmlInit()` pynvml once per process; cached in the module-level
+    `_pynvml_ready` flag so later calls skip re-initialising.
+
+    Returns:
+        True if pynvml is importable and `nvmlInit()` succeeded (this call or
+        a previous one); False otherwise -- any exception during import/init
+        is swallowed, not raised, since this is only ever used to decide
+        whether `gpu_stats` can report anything.
+    """
     global _pynvml_ready
     if _pynvml_ready:
         return True
@@ -68,14 +77,21 @@ class RunAdapter(Protocol):
 
 
 class _WandbRunAdapter:
+    """`RunAdapter` over a live `wandb.Run`."""
+
     def __init__(self, run) -> None:
         self._run = run
 
     def configure_step_metric(self) -> None:
+        """Make every future `wandb.log` metric use `global_step` as its x-axis,
+        instead of wandb's own internal log-call counter."""
         self._run.define_metric("global_step")
         self._run.define_metric("*", step_metric="global_step")
 
     def log(self, payload: dict[str, Any], commit: bool = True) -> None:
+        """`wandb.run.log(payload, commit=commit)`, converting any `matplotlib.figure.Figure`
+        value (or list of them) to `wandb.Image`(s) first; every other value
+        type is passed through as-is."""
         import wandb
 
         prepared = {}
@@ -89,6 +105,9 @@ class _WandbRunAdapter:
         self._run.log(prepared, commit=commit)
 
     def log_artifact(self, local_path: str, artifact_path: str) -> None:
+        """Log the file at `local_path` as a `wandb.Video`, under key
+        `artifact_path`, using `local_path`'s own extension as the video
+        format (defaulting to "mp4" if it has none)."""
         import wandb
 
         suffix = Path(local_path).suffix.lstrip(".") or "mp4"
@@ -102,6 +121,8 @@ class _WandbRunAdapter:
 
 
 class _MlflowRunAdapter:
+    """`RunAdapter` over an MLflow run, identified by `run_id`."""
+
     def __init__(self, client, run_id: str, is_child: bool) -> None:
         self._client = client
         self._run_id = run_id
@@ -111,6 +132,18 @@ class _MlflowRunAdapter:
         pass  # Metric.step is a native x-axis; nothing to configure.
 
     def log(self, payload: dict[str, Any], commit: bool = True) -> None:
+        """Log `payload`'s int/float entries as MLflow metrics (step =
+        `payload["global_step"]`, default 0) and any `matplotlib.figure.Figure`
+        (or list of them) as a PNG artifact under `<key>/step_<step>_<i>.png`.
+
+        Warning:
+            `commit` has no MLflow analog (no row-merge concept) and is
+            accepted but ignored, kept only so both adapters share one call
+            signature. Any payload value that is neither numeric nor a
+            figure/figure-list (e.g. a string) is silently dropped -- neither
+            logged nor raised on -- unlike `_WandbRunAdapter.log`, which passes
+            everything else through as-is.
+        """
         # `commit` has no MLflow analog (no row-merge concept) -- accepted and
         # ignored, kept only so both adapters share one call signature.
         from mlflow.entities import Metric
@@ -134,12 +167,17 @@ class _MlflowRunAdapter:
                 )
 
     def log_artifact(self, local_path: str, artifact_path: str) -> None:
+        """`MlflowClient.log_artifact` -- uploads the file at `local_path` under
+        `artifact_path` in this run's artifact store."""
         self._client.log_artifact(self._run_id, str(local_path), artifact_path=artifact_path)
 
     def describe(self) -> str:
         return f"MLflow run: {self._run_id} (tracking_uri={self._client.tracking_uri})"
 
     def finish(self) -> None:
+        """Terminate this run, but only if `is_child` -- a non-child (top-level)
+        run's lifecycle is left to whatever created it (e.g. `MLFlowLogger`
+        itself for rank 0; see `on_fit_end` in `mich.models.mich_logging`)."""
         if self._is_child:
             self._client.set_terminated(self._run_id, "FINISHED")
 
@@ -173,6 +211,12 @@ def make_rank_zero_adapter(trainer: Trainer) -> RunAdapter | None:
 
 
 def _make_wandb_adapter(logger: WandbLogger, global_rank: int) -> _WandbRunAdapter:
+    """Rank 0 wraps the trainer's own `wandb.run` (already created by
+    `WandbLogger`); every other rank starts its own separate, `reinit=True`
+    run (name suffixed `": rank {global_rank}"`), invisible to Lightning's own
+    logger bookkeeping -- which is why `on_fit_end` (`mich.models.mich_logging`)
+    explicitly finishes non-zero ranks' adapters but not rank 0's.
+    """
     import wandb
 
     if global_rank == 0:
@@ -185,6 +229,17 @@ def _make_wandb_adapter(logger: WandbLogger, global_rank: int) -> _WandbRunAdapt
 def _make_mlflow_adapter(
     logger: MLFlowLogger, trainer: Trainer, global_rank: int
 ) -> _MlflowRunAdapter:
+    """Rank 0 wraps the trainer's own MLflow run (`is_child=False`, matching
+    `_make_wandb_adapter`'s rank-0 case); every other rank creates a genuine
+    MLflow child run (tagged `MLFLOW_PARENT_RUN_ID`) under it, since MLflow --
+    unlike wandb -- has no equivalent of a `reinit`-style sibling run.
+
+    Warning:
+        Calls `dist.broadcast_object_list` when `world_size > 1`, to hand
+        rank 0's `run_id`/`experiment_id` to every other rank. This is a
+        collective call: every rank in the process group must reach this
+        function (not just rank 0) or the others will hang waiting for it.
+    """
     from mlflow.tracking import MlflowClient
 
     world_size = trainer.world_size

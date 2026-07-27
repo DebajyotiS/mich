@@ -135,11 +135,16 @@ loss_config:
   quiescence_consistency_tau_s: 0.05   # |s| below this counts as baseline
   quiescence_consistency_tau_f: 0.05   # |f - 1| below this counts as baseline
   quiescence_consistency_eps_x: 0.05   # |x| above this at a quiescent (s, f) voxel is hallucination
-  lambda_supervision: 100.0
-  warmup_steps_supervision: 0
-  delay_steps_supervision: 0
+  lambda_grid_supervision: 100.0  # s/f/v/q(/vstar/qstar) MSE+Pearson supervision: a dense
+  # component at each source's own (layer, h, w) across all T (weighted by lambda_src),
+  # plus a sparse collocation component across the whole grid, one draw per layer
+  # restricted to that layer's own sources (see _sample_collocation_indices_per_layer).
+  # Replaces the old, source-voxel-only lambda_supervision -- having this supervision
+  # computed twice (once dense-only, once grid-only) made no sense.
+  warmup_steps_grid_supervision: 0
+  delay_steps_grid_supervision: 0
   supervise_x: false
-  supervise_dzdt: true
+  supervise_dzdt: false
   lambda_dzdt_supervision: 100.0 # weight applied when supervise_dzdt=true
   warmup_steps_dzdt_supervision: 0
   delay_steps_dzdt_supervision: 0

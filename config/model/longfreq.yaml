@@ -1,21 +1,32 @@
 _target_: mich.models.mich.MICH
 
-L: 1
-C: 32
-c_enc: 64
-c_dec: 64
-c_film: 32           # FiLM bottleneck per signal (~c_dec / 7, rounded up for groups)
+# -----------------------------------------------------------------------------
+# 1. CORE ARCHITECTURE & SHAPES
+# -----------------------------------------------------------------------------
+L: 3                      # Number of cortical layers
+C: 32                     # Channel dimension
+c_enc: 64                 # Encoder channel dimension
+c_dec: 64                 # Decoder channel dimension
+c_film: 32                # FiLM feature dimension
+out_channels: 7           # Target signal count (equals len(signals))
+
+# -----------------------------------------------------------------------------
+# 2. SPATIAL & TEMPORAL GRID PROPERTIES
+# -----------------------------------------------------------------------------
+grid_size: 10             # Spatial grid size (H = W)
+spatial_radius: 2         # Neighborhood radius for spatial operations
+tcn_kernel: 3             # Temporal Convolutional Network kernel size
+
+num_freqs: 24             # Log-spaced frequencies for time embedding
+min_freq: 1.0
+max_freq: 48.0            # Upper frequency bound near Nyquist limit
+
 signal_embed_dim: 8
-num_freqs: 10
-min_freq: 5.0
-max_freq: 20.0
-tcn_kernel: 3
-spatial_radius: 1
-grid_size: 10 # this was 32
+embed_dim: 20             # Overridden during SpatioTemporalDecoder setup
 
-embed_dim: 20 # overridden in SpatioTemporalDecoder.__init__; kept for reference
-out_channels: 5
-
+# -----------------------------------------------------------------------------
+# 3. NEURAL NETWORK MODULES
+# -----------------------------------------------------------------------------
 heinzle_net:
   _target_: mich.models.blocks.HeinzleNet
 
@@ -39,32 +50,54 @@ heinzle_net:
       pw_kernel: 1
       num_groups: 8
       activation: silu
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
+      stride: 1
+      dw_kernel: 3
+      pw_kernel: 1
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
+      stride: 1
+      dw_kernel: 3
+      pw_kernel: 1
+      num_groups: 8
+      activation: silu
 
   temporal_mixing_config:
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 1
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 2
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 4
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 8
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 16
     - cin: ${model.c_enc}
       kernel_size: ${model.tcn_kernel}
       num_groups: 8
       activation: silu
+      dilation: 16
+
+  auto_dilation: false
 
   time_embedding_config:
     num_freqs: ${model.num_freqs}
@@ -72,10 +105,10 @@ heinzle_net:
     max_freq: ${model.max_freq}
 
   time_film_config:
-    embed_dim: ${model.embed_dim}  # overridden in SpatioTemporalDecoder.__init__
+    embed_dim: ${model.embed_dim}
     hidden_dim: ${model.c_film}
     activation: silu
-    c_dec: ${model.c_film}         # overridden to c_film in SpatioTemporalDecoder.__init__
+    c_dec: ${model.c_film}
 
   spatial_decoder_config:
     cin: ${model.c_enc}
@@ -86,59 +119,18 @@ heinzle_net:
     activation: silu
     L: ${model.L}
     layer_embed_dim: 8
-    signals: [x, s, f, v, q]
 
 normaliser:
   _target_: mich.models.normaliser.LayerwiseBOLDNormalizer
   H: ${model.grid_size}
   W: ${model.grid_size}
   eps: 1.0e-6
-  freeze_after_steps: 5000
+  freeze_after_steps: 320   # Freeze normalisation after ~20 epochs
   neighbourhood_radius: ${model.spatial_radius}
 
-loss_config:
-  order: linear # choose between linear, quadratic, exact
-  lambda_data: 100.0
-  lambda_physics: 1000.0
-  warmup_steps_physics: 20
-  delay_steps_physics: 10
-  lambda_src: 10.0
-  lambda_smooth: 0.0
-  warmup_steps_smooth: 0
-  delay_steps_smooth: 0
-  lambda_supervision: 10.0
-  warmup_steps_supervision: 0
-  delay_steps_supervision: 0
-  n_space: 225
-  dense_spatial_frac: 0.95
-  dense_spatial_radius: ${model.spatial_radius}
-  n_time: 100
-  dense_time_frac: 0.0
-  dense_time_lo: 0.0
-  dense_time_hi: 0.70
-  uniform_time_lo: 0.0
-  burn_in: 0
-  supervision_loss:
-    type: "mse+pearson"
-    lambda_npearson: 100.0
-    lambda_pearson: 1.0
-    huber_delta: 0.1
-  bold_loss:
-    type: "mse+pearson"
-    lambda_npearson: 10.0
-    lambda_pearson: 1
-    huber_delta: 0.1 #used if type is "huber" or "huber+pearson"
-  ode_loss:
-    type: "mse"
-    huber_delta: 0.1 #used if type is "huber"
-
-# haemo, acquisition, V0, psf_fwhm are injected at runtime from the simulation
-# HDF5 by _inject_sim_physics() in train_mich.py — do not set them here.
-
-# Set any of these to true to make that physiological constant a learnable parameter
-# (initialized from the simulation-injected value above, optimized in log-space so it
-# can't go non-positive) instead of a fixed constant. lambda_d and tau_d are not yet
-# supported here. k1/k2/k3 are recomputed from E0 each forward pass when E0 is learnable.
+# -----------------------------------------------------------------------------
+# 4. PHYSIOLOGICAL PARAMETERS
+# -----------------------------------------------------------------------------
 learnable_physio:
   kappa: false
   gamma: false
@@ -147,6 +139,109 @@ learnable_physio:
   V0: false
   E0: false
 
+# -----------------------------------------------------------------------------
+# 5. LOSS & REGULARISATION CONFIGURATION
+# -----------------------------------------------------------------------------
+loss_config:
+  order: linear           # Options: linear, quadratic, exact
+
+  # Data & Physics Term Weights
+  lambda_data: 100.0
+  lambda_physics: 1000.0
+  warmup_steps_physics: 100
+  delay_steps_physics: 50
+
+  # Source Regularisation
+  lambda_src: 10.0
+  lambda_smooth: 0.0
+  warmup_steps_smooth: 0
+  delay_steps_smooth: 0
+
+  lambda_source_activity: 0.5     # Penalises flat activity collapse at source voxel (0.0 disables)
+  source_activity_epsilon: 0.01   # Hinge variance threshold
+  warmup_steps_source_activity: 0
+  delay_steps_source_activity: 0
+
+  # Quiescence Regularisation
+  lambda_quiescence_consistency: 0.0  # Guard against off-source hallucinations (0.0 disables)
+  warmup_steps_quiescence_consistency: 500
+  delay_steps_quiescence_consistency: 500
+  quiescence_consistency_tau_s: 0.05
+  quiescence_consistency_tau_f: 0.05
+  quiescence_consistency_eps_x: 0.05
+
+  # Supervision (dense at each source's own voxel + sparse grid-wide collocation,
+  # combined in one term -- see _supervision_loss)
+  lambda_grid_supervision: 100.0
+  warmup_steps_grid_supervision: 0
+  delay_steps_grid_supervision: 0
+
+  supervise_x: false
+
+  supervise_dzdt: false
+  lambda_dzdt_supervision: 100.0
+  warmup_steps_dzdt_supervision: 0
+  delay_steps_dzdt_supervision: 0
+  dzdt_supervision_signals: ["s", "f", "v", "q"]
+
+  # Phase Alignment & Annealing
+  supervise_x_phase: false
+  lambda_x_phase: 10.0
+  warmup_steps_x_phase: 0
+  delay_steps_x_phase: 0
+
+  x_phase_ratio_anneal_start_step: 0
+  x_phase_ratio_anneal_end_step: 0
+
+  x_phase_npearson_start: 10.0
+  x_phase_npearson_end: 1.0
+  x_phase_pearson_start: 1.0
+  x_phase_pearson_end: 10.0
+
+  lambda_x_phase_start: 10.0
+  lambda_x_phase_end: 80.0
+
+  # Spatiotemporal Sampling Points
+  n_space: 100
+  dense_spatial_frac: 0.95
+  dense_spatial_radius: ${model.spatial_radius}
+
+  n_time: 100
+  dense_time_frac: 0.0
+  dense_time_lo: 0.0
+  dense_time_hi: 0.70
+  uniform_time_lo: 0.0
+  burn_in: 0
+
+  # Loss Component Specifications
+  supervision_loss:
+    type: "mse+pearson"
+    lambda_npearson: 10.0
+    lambda_pearson: 1.0
+    huber_delta: 0.1
+
+  bold_loss:
+    type: "mse+pearson"
+    lambda_npearson: 10.0
+    lambda_pearson: 1.0
+    huber_delta: 0.1
+
+  ode_loss:
+    type: "mse"
+    huber_delta: 0.1
+
+  dzdt_loss:
+    type: "huber"         # Caps outlier influence during sharp transitions
+
+  x_phase_loss:
+    type: "mse+pearson"
+    lambda_npearson: 10.0
+    lambda_pearson: 1.0
+    huber_delta: 0.1
+
+# -----------------------------------------------------------------------------
+# 6. OPTIMISATION & LIGHTNING TRAINER
+# -----------------------------------------------------------------------------
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
@@ -156,10 +251,12 @@ optimizer:
 scheduler:
   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
   _partial_: true
-  T_max: 125000
+  T_max: null             # Set dynamically at runtime unless explicitly overridden
   eta_min: 1.0e-6
 
 lightning:
   interval: step
   frequency: 1
   monitor: val/loss/total
+
+image_log_every_n_val_calls: 1

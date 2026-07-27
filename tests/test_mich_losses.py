@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import types
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -25,8 +26,12 @@ class _LossHost(MICHLossMixin, LearnablePhysioMixin, torch.nn.Module):
         )
         self.global_step = global_step
         self._bold_loss_fn = self._make_loss_fn(getattr(loss_config, "bold_loss", None))
+        self._bold_grid_loss_fn = self._make_grid_loss_fn(getattr(loss_config, "bold_loss", None))
         self._ode_loss_fn = self._make_loss_fn(getattr(loss_config, "ode_loss", None))
         self._supervision_loss_fn = self._make_loss_fn(
+            getattr(loss_config, "supervision_loss", None)
+        )
+        self._supervision_grid_loss_fn = self._make_grid_loss_fn(
             getattr(loss_config, "supervision_loss", None)
         )
         self._dzdt_loss_fn = self._make_loss_fn(getattr(loss_config, "dzdt_loss", None))
@@ -135,6 +140,39 @@ def test_make_loss_fn_huber_plus_pearson_combines_both_terms():
 def test_make_loss_fn_unknown_type_raises():
     with pytest.raises(ValueError, match="Unrecognised loss type"):
         MICHLossMixin._make_loss_fn(types.SimpleNamespace(type="bogus"))
+
+
+# -----------------------------
+# _make_grid_loss_fn
+# -----------------------------
+
+
+def test_make_grid_loss_fn_none_defaults_to_mse():
+    fn = MICHLossMixin._make_grid_loss_fn(None)
+    assert fn is torch.nn.functional.mse_loss
+
+
+def test_make_grid_loss_fn_mse_plus_pearson_drops_pearson_term():
+    cfg = types.SimpleNamespace(type="mse+pearson", lambda_npearson=2.0, lambda_pearson=0.5)
+    fn = MICHLossMixin._make_grid_loss_fn(cfg)
+    pred, true = torch.randn(3, 5), torch.randn(3, 5)
+    expected = 2.0 * torch.nn.functional.mse_loss(pred, true)
+    assert torch.isclose(fn(pred, true), expected, atol=1e-5)
+
+
+def test_make_grid_loss_fn_huber_plus_pearson_drops_pearson_term():
+    cfg = types.SimpleNamespace(
+        type="huber+pearson", huber_delta=0.2, lambda_npearson=1.5, lambda_pearson=0.7
+    )
+    fn = MICHLossMixin._make_grid_loss_fn(cfg)
+    pred, true = torch.randn(3, 5), torch.randn(3, 5)
+    expected = 1.5 * torch.nn.functional.huber_loss(pred, true, delta=0.2)
+    assert torch.isclose(fn(pred, true), expected, atol=1e-5)
+
+
+def test_make_grid_loss_fn_plain_mse_unaffected():
+    fn = MICHLossMixin._make_grid_loss_fn(types.SimpleNamespace(type="mse"))
+    assert fn is torch.nn.functional.mse_loss
 
 
 # -----------------------------
@@ -622,6 +660,28 @@ def test_physics_loss_multilayer_has_drain_per_eq_keys():
     assert set(per_eq.keys()) == {"s", "f", "v", "q", "vstar", "qstar"}
 
 
+def test_physics_loss_with_source_layer_uses_per_layer_collocation():
+    """Passing source_layer takes the per-layer collocation path and still produces a
+    finite loss with the expected per-eq keys."""
+    host = _mk_host()
+    B, L, T, H, W = 2, 2, 10, 20, 20
+    z_hat, dz_hat_dt = _mk_zhat_dzdt(B, 7, L, T, H, W)
+    source_position = torch.tensor([[[2, 2], [15, 15]]] * B, dtype=torch.long)  # [B, S=2, 2]
+    source_layer = torch.tensor([[0, 1]] * B)
+    num_sources = torch.full((B,), 2, dtype=torch.long)
+    loss, per_eq = host._physics_loss(
+        z_hat,
+        dz_hat_dt,
+        order="linear",
+        lambda_smooth=0.0,
+        source_position=source_position,
+        source_layer=source_layer,
+        num_sources=num_sources,
+    )
+    assert torch.isfinite(loss)
+    assert set(per_eq.keys()) == {"s", "f", "v", "q", "vstar", "qstar"}
+
+
 # -----------------------------
 # _supervision_keys
 # -----------------------------
@@ -644,7 +704,7 @@ def test_supervision_keys_prepends_x_when_supervise_x_true():
 
 
 # -----------------------------
-# _supervision_loss / _source_supervision_loss / _derivative_supervision_loss / _x_phase_loss
+# _supervision_loss / _derivative_supervision_loss / _x_phase_loss
 # -----------------------------
 
 
@@ -663,8 +723,11 @@ def test_supervision_loss_perfect_match_gives_zero():
     for sig, bk in MICHLossMixin._SUPERVISION_KEYS_FULL:
         z_hat[:, host._signal_index(sig)] = batch[bk]
     source_position = torch.randint(0, 5, (B, 1, 2))
+    source_layer = torch.zeros(B, 1, dtype=torch.long)
     num_sources = torch.ones(B, dtype=torch.long)
-    total, per_sig = host._supervision_loss(z_hat, batch, source_position, num_sources)
+    total, per_sig = host._supervision_loss(
+        z_hat, batch, source_position, source_layer, num_sources
+    )
     assert torch.isclose(total, torch.tensor(0.0), atol=1e-6)
     assert set(per_sig.keys()) == {"s", "f", "v", "q", "vstar", "qstar"}
 
@@ -675,8 +738,9 @@ def test_supervision_loss_nonzero_for_mismatched_signals():
     batch = _mk_supervision_batch(B, L, T, H, W)
     z_hat = torch.randn(B, 7, L, T, H, W)  # unrelated to batch
     source_position = torch.randint(0, 5, (B, 1, 2))
+    source_layer = torch.zeros(B, 1, dtype=torch.long)
     num_sources = torch.ones(B, dtype=torch.long)
-    total, _ = host._supervision_loss(z_hat, batch, source_position, num_sources)
+    total, _ = host._supervision_loss(z_hat, batch, source_position, source_layer, num_sources)
     assert total > 0.0
 
 
@@ -686,35 +750,122 @@ def test_supervision_loss_handles_t_min_mismatch():
     z_hat = torch.randn(B, 7, L, 12, H, W)  # T=12
     batch = _mk_supervision_batch(B, L, 8, H, W)  # T_latent=8 < z_hat's T
     source_position = torch.randint(0, 5, (B, 1, 2))
+    source_layer = torch.zeros(B, 1, dtype=torch.long)
     num_sources = torch.ones(B, dtype=torch.long)
-    total, _ = host._supervision_loss(z_hat, batch, source_position, num_sources)
+    total, _ = host._supervision_loss(z_hat, batch, source_position, source_layer, num_sources)
     assert torch.isfinite(total)
 
 
-def test_source_supervision_loss_perfect_match_gives_zero():
-    host = _mk_host()
-    B, L, T, H, W = 2, 1, 10, 5, 5
+def test_supervision_loss_perfect_match_gives_zero_multilayer_distinct_sources():
+    """Per-layer collocation + dense-source components, both zero on a perfect match,
+    across multiple layers each with their own distinct source."""
+    host = _mk_host(supervision_loss=None)
+    B, L, T, H, W = 2, 2, 10, 20, 20
     batch = _mk_supervision_batch(B, L, T, H, W)
     z_hat = torch.zeros(B, 7, L, T, H, W)
     for sig, bk in MICHLossMixin._SUPERVISION_KEYS_FULL:
         z_hat[:, host._signal_index(sig)] = batch[bk]
-    source_position = torch.randint(0, 5, (B, 1, 2))
-    num_sources = torch.ones(B, dtype=torch.long)
-    total, per_sig = host._source_supervision_loss(z_hat, batch, source_position, num_sources)
+    source_position = torch.tensor([[[2, 2], [15, 15]]] * B, dtype=torch.long)  # [B, S=2, 2]
+    source_layer = torch.tensor([[0, 1]] * B)  # source 0 in layer 0, source 1 in layer 1
+    num_sources = torch.full((B,), 2, dtype=torch.long)
+    total, per_sig = host._supervision_loss(
+        z_hat, batch, source_position, source_layer, num_sources
+    )
     assert torch.isclose(total, torch.tensor(0.0), atol=1e-6)
+    assert set(per_sig.keys()) == {"s", "f", "v", "q", "vstar", "qstar"}
 
 
-def test_source_supervision_loss_masks_padded_sources_and_batch_entries():
-    host = _mk_host()
+def test_supervision_loss_dense_component_masks_padded_sources_and_batch_entries():
+    """The dense (source-voxel) component ignores padded source slots and samples with
+    zero valid sources, same masking guarantee the old _source_supervision_loss had."""
+    host = _mk_host(supervision_loss=None)
     B, S, L, T, H, W = 2, 2, 1, 10, 5, 5
     batch = _mk_supervision_batch(B, L, T, H, W)
     z_hat = torch.zeros(B, 7, L, T, H, W)
     for sig, bk in MICHLossMixin._SUPERVISION_KEYS_FULL:
         z_hat[:, host._signal_index(sig)] = batch[bk]
     source_position = torch.randint(0, 5, (B, S, 2))
+    source_layer = torch.zeros(B, S, dtype=torch.long)
     num_sources = torch.tensor([1, 0])  # sample 1 has zero valid sources
-    total, _ = host._source_supervision_loss(z_hat, batch, source_position, num_sources)
+    total, _ = host._supervision_loss(z_hat, batch, source_position, source_layer, num_sources)
     assert torch.isclose(total, torch.tensor(0.0), atol=1e-6)
+
+
+def test_supervision_loss_dense_component_is_layer_scoped():
+    """A source's dense component only compares its own layer -- a mismatch confined to
+    a different layer at the same (h, w) must not affect the loss. The grid/collocation
+    component is mocked to a fixed point well away from the corruption, since its own
+    random draws could otherwise legitimately land on the same (h, w) in that other
+    layer and pick up the same mismatch for an unrelated (correct) reason."""
+    host = _mk_host(supervision_loss=None)
+    B, L, T, H, W = 1, 2, 10, 10, 10
+    batch = _mk_supervision_batch(B, L, T, H, W)
+    z_hat = torch.zeros(B, 7, L, T, H, W)
+    for sig, bk in MICHLossMixin._SUPERVISION_KEYS_FULL:
+        z_hat[:, host._signal_index(sig)] = batch[bk]
+    # Corrupt layer 1's prediction at the same (h, w) as layer 0's source -- should be
+    # irrelevant to a source whose source_layer says it belongs to layer 0.
+    s_idx = host._signal_index("s")
+    z_hat[:, s_idx, 1, :, 2, 2] += 100.0
+    source_position = torch.tensor([[[2, 2]]], dtype=torch.long)
+    source_layer = torch.tensor([[0]])
+    num_sources = torch.ones(B, dtype=torch.long)
+
+    from mich.models.collocation import CollocationBatch
+
+    fixed_idx = CollocationBatch(
+        t=torch.zeros(1, 1, 1, 1, dtype=torch.long),
+        h=torch.full((B, 1, 1, 1), 7, dtype=torch.long),  # away from the corrupted (2, 2)
+        w=torch.full((B, 1, 1, 1), 7, dtype=torch.long),
+    )
+    with patch.object(
+        MICHLossMixin,
+        "_sample_collocation_indices_per_layer",
+        return_value=[fixed_idx, fixed_idx],
+    ):
+        _total, per_sig = host._supervision_loss(
+            z_hat, batch, source_position, source_layer, num_sources
+        )
+    assert torch.isclose(per_sig["s"], torch.tensor(0.0), atol=1e-6)
+
+
+def test_supervision_loss_grid_uses_grid_fn_and_dense_uses_dense_fn():
+    """The grid component's gather is [B, n_times, n_space] with independently
+    scattered (t, h, w) points along dim=1 -- not one location's trajectory -- so it
+    must go through _supervision_grid_loss_fn (Pearson-free), not
+    _supervision_loss_fn (used correctly for the dense component, which really does
+    gather one fixed location's full T_min)."""
+    host = _mk_host()
+    B, L, T, H, W = 2, 1, 10, 5, 5
+    batch = _mk_supervision_batch(B, L, T, H, W)
+    z_hat = torch.randn(B, 7, L, T, H, W)
+    source_position = torch.randint(0, 5, (B, 1, 2))
+    source_layer = torch.zeros(B, 1, dtype=torch.long)
+    num_sources = torch.ones(B, dtype=torch.long)
+
+    grid_calls, dense_calls = [], []
+    real_grid_fn, real_dense_fn = host._supervision_grid_loss_fn, host._supervision_loss_fn
+
+    def spy_grid(pred, true):
+        grid_calls.append(pred.shape)
+        return real_grid_fn(pred, true)
+
+    def spy_dense(pred, true):
+        dense_calls.append(pred.shape)
+        return real_dense_fn(pred, true)
+
+    host._supervision_grid_loss_fn, host._supervision_loss_fn = spy_grid, spy_dense
+    try:
+        host._supervision_loss(z_hat, batch, source_position, source_layer, num_sources)
+    finally:
+        host._supervision_grid_loss_fn = real_grid_fn
+        host._supervision_loss_fn = real_dense_fn
+
+    n_sig = len(MICHLossMixin._SUPERVISION_KEYS_FULL)
+    assert len(grid_calls) == n_sig * L  # one collocation call per layer, per signal
+    assert all(len(shape) == 3 for shape in grid_calls)  # [B, n_times, n_space]
+    assert len(dense_calls) == n_sig  # one dense call per signal
+    assert all(len(shape) == 2 for shape in dense_calls)  # [M, T_min]
 
 
 def test_derivative_supervision_loss_matches_analytic_target_when_consistent():
@@ -747,6 +898,45 @@ def test_derivative_supervision_loss_matches_analytic_target_when_consistent():
     )
     assert torch.isclose(total, torch.tensor(0.0), atol=1e-4)
     assert set(per_sig.keys()) == {"s"}  # default dzdt_supervision_signals=("s",)
+
+
+def test_derivative_supervision_loss_is_layer_scoped():
+    """When source_layer is given, a source's term only compares its own layer -- a
+    mismatch confined to a different layer at the same (h, w) must not affect it."""
+    host = _mk_host(order="linear")
+    B, L, T, H, W = 1, 2, 10, 5, 5
+    kappa, gamma, tau = 0.65, 0.41, 1.0
+    x_true = torch.randn(B, L, T, H, W)
+    s_true = torch.randn(B, L, T, H, W)
+    f_true = torch.rand(B, L, T, H, W) + 0.5
+    v_true = torch.rand(B, L, T, H, W) + 0.5
+    q_true = torch.rand(B, L, T, H, W) + 0.5
+    batch = {"neural": x_true, "s": s_true, "f": f_true, "v": v_true, "q": q_true}
+
+    vdot, qdot = host._balloon_v_q_dot_targets(f_true, v_true, q_true, "linear")
+    analytic = {
+        "s": x_true - kappa * s_true - gamma * (f_true - 1.0),
+        "f": s_true,
+        "v": vdot / tau,
+        "q": qdot / tau,
+    }
+    dz_hat_dt = torch.zeros(B, 7, L, T, H, W)
+    t_norm_to_physical = T - 1
+    for sig in ("s", "f", "v", "q"):
+        dz_hat_dt[:, host._signal_index(sig)] = analytic[sig] * t_norm_to_physical
+
+    # Corrupt layer 1's dz_hat_dt at the same (h, w) as the (layer-0) source -- should
+    # be irrelevant to a source whose source_layer says it belongs to layer 0.
+    s_idx = host._signal_index("s")
+    dz_hat_dt[:, s_idx, 1, :, 2, 2] += 100.0
+
+    source_position = torch.tensor([[[2, 2]]])
+    source_layer = torch.tensor([[0]])
+    num_sources = torch.ones(B, dtype=torch.long)
+    total, _ = host._derivative_supervision_loss(
+        dz_hat_dt, batch, source_position, num_sources, source_layer
+    )
+    assert torch.isclose(total, torch.tensor(0.0), atol=1e-4)
 
 
 def test_derivative_supervision_loss_respects_custom_signal_list():

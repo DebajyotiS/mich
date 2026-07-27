@@ -1,3 +1,20 @@
+"""Layered 2-D reaction-diffusion simulator for synthetic neural activity.
+
+Governing PDE, per layer l (see `LayeredDiffusionSimulator.simulate`'s main loop):
+
+    dX_l/dt = diff_intra * Laplacian(X_l) - decay_rate * X_l
+              + diff_inter * (X_{l-1} - X_l) + diff_inter * (X_{l+1} - X_l)
+              + injected source signal(s) at their (layer, h, w)
+              + spatial and/or temporal noise
+
+(the two inter-layer flux terms are omitted at the top/bottom layer, which has
+no layer below/above). Integrated with forward Euler, subdividing each `dt`
+into `n_sub` substeps when the explicit-diffusion CFL bound requires it (see
+`simulate`'s stability check) -- this is a different numerical scheme from
+`mich.data.balloon`'s RK4 Balloon-Windkessel integration, used here because the
+diffusion PDE, not an ODE per voxel, is what's being solved.
+"""
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -8,6 +25,9 @@ from .signals import Noise, Pulse
 
 @dataclass(frozen=True, slots=True)
 class NeuralSimulatorParams:
+    """Grid, timestep, and diffusion/decay constants for the PDE in the module
+    docstring, plus the explicit-integration stability controls below."""
+
     num_layers: int
     grid_size: tuple[int, int]
     dt: float = 0.01
@@ -28,11 +48,9 @@ class LayeredDiffusionSimulator:
     """
 
     def __init__(self, params: NeuralSimulatorParams):
-        """
-
-        Args:
-            params (NeuralSimulatorParams): Simulation parameters.
-        """
+        """Allocate a zeroed `(num_layers, *grid_size)` grid; `simulate` re-zeroes
+        it again itself, so this initial grid is only ever read if `simulate` is
+        never called."""
         self.params = params
         self.n_layers = params.num_layers
         self.grid_size = params.grid_size
@@ -46,6 +64,7 @@ class LayeredDiffusionSimulator:
         self.decay_rate = params.decay_rate
 
     def generate_pulse(self, pulses: list[Pulse]) -> list[tuple[np.ndarray, np.ndarray]]:
+        """`pulse.generate()` for each `pulses` entry; see `Pulse.generate`."""
         signals = []
         for pulse in pulses:
             t, signal = pulse.generate()
@@ -59,6 +78,57 @@ class LayeredDiffusionSimulator:
         snr_db: float,
         noise: Noise,
     ):
+        """Integrate the reaction-diffusion PDE (see module docstring) for `steps`
+        timesteps, injecting each `sources` entry's signal at its (layer, h, w)
+        every step, and return the full per-step history.
+
+        Explicit forward Euler is only conditionally stable; before integrating,
+        this computes the CFL bound `dt_max` for the combined intra-layer
+        diffusion + inter-layer coupling + decay, and if `self.dt` exceeds
+        `safety * dt_max`, subdivides each step into enough substeps
+        (`n_sub`, capped at `max_substeps`) to satisfy it -- raising instead of
+        silently integrating an unstable step if `max_substeps` isn't enough.
+
+        Noise amplitude is derived from `snr_db` against the loudest source's
+        own signal power (`snr_db=inf` -> zero noise), then split between
+        spatial (`noise.generate`, added once per step to the whole grid) and
+        temporal (`noise.generate_temporal`, added once per source into that
+        source's injected value) according to `noise.domain` ("spatial" ->
+        all-spatial, "temporal" -> all-temporal, "both" -> `noise.temporal_fraction`,
+        default 0.5, split between the two). Source voxels are re-injected (signal
+        + temporal noise) after every diffusion substep, not just once per
+        outer step, so multi-substep decay/diffusion can't erode the injected
+        value between outer steps.
+
+        Args:
+            sources: One dict (or list of dicts), each with "layer" (int,
+                `0 <= layer < num_layers`), "position" ((i, j) in bounds), and
+                "signal" (1-D, finite; padded with 0 past its own length if
+                shorter than `steps`).
+            steps: Number of timesteps to integrate; must be positive.
+            snr_db: Target SNR in dB against the loudest source, or `inf` for
+                no noise.
+            noise: Noise generator; `noise.domain` controls the spatial/temporal
+                split above, and must have `generate_temporal` if temporal
+                noise is requested.
+
+        Returns:
+            `(steps, num_layers, *grid_size)` float64 array, the grid state
+            recorded at the end of every outer step (after its diffusion
+            substeps and re-injection, but the same value that's used as the
+            starting point for the next step's noise/injection).
+
+        Raises:
+            ValueError: On invalid `steps`/`dt`/`dx`/diffusion coefficients, a
+                malformed or out-of-bounds source, a non-finite source signal,
+                an unstable step that `max_substeps` can't absorb, or a
+                generated noise array of the wrong shape.
+            AttributeError: If `noise.domain` requests temporal noise but
+                `noise` has no `generate_temporal`.
+            FloatingPointError: If the grid becomes non-finite mid-simulation
+                (before or after a diffusion substep) -- this is treated as a
+                hard failure, not sanitised away.
+        """
         if steps is None or steps <= 0:
             raise ValueError(f"`steps` must be a positive int, got {steps}")
 

@@ -124,7 +124,7 @@ def _make_mich(*, L: int = _L, signals: list[str] | None = None, **loss_override
         lambda_data=1.0,
         lambda_physics=0.1,
         lambda_smooth=0.01,
-        lambda_supervision=0.0,
+        lambda_grid_supervision=0.0,
         warmup_steps_physics=0,
         warmup_steps_smooth=0,
         delay_steps_physics=0,
@@ -301,6 +301,109 @@ class TestMICHLosses:
         assert loss.ndim == 0
         assert torch.isfinite(loss)
 
+    def test_data_loss_with_source_layer_uses_per_layer_collocation(self):
+        """Passing source_layer takes the per-layer collocation path for the
+        collocation term and still produces a finite scalar."""
+        model = _make_mich(L=_L3)
+        model.eval()
+        bold = torch.randn(_B, _L3, _T, _H, _W)
+        time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
+        z_hat = model(bold, time).z_hat
+        src_pos = torch.randint(0, min(_H, _W), (_B, 1, 2))
+        src_layer = torch.randint(0, _L3, (_B, 1))
+        num_sources = torch.ones(_B, dtype=torch.long)
+        loss, colloc_loss, src_loss = model._data_loss(
+            z_hat,
+            bold,
+            source_position=src_pos,
+            source_layer=src_layer,
+            num_sources=num_sources,
+        )
+        assert loss.ndim == 0
+        assert torch.isfinite(loss)
+        assert torch.isfinite(colloc_loss)
+        assert torch.isfinite(src_loss)
+
+    def test_data_loss_src_loss_is_layer_scoped(self):
+        """src_loss's dense source-voxel term only compares a source's own layer --
+        corrupting a different layer's prediction at the same (h, w) must not affect
+        it. Checked on src_loss alone (not total/colloc_loss), so no need to control
+        for colloc_loss's independent random collocation draws."""
+        model = _make_mich(L=_L3)
+        model.eval()
+        bold = torch.randn(_B, _L3, _T, _H, _W)
+        time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
+        z_hat = model(bold, time).z_hat
+
+        src_pos = torch.tensor([[[1, 1]]] * _B, dtype=torch.long)  # [B, S=1, 2]
+        src_layer = torch.zeros(_B, 1, dtype=torch.long)  # source belongs to layer 0
+        num_sources = torch.ones(_B, dtype=torch.long)
+
+        _, _, src_loss_before = model._data_loss(
+            z_hat,
+            bold,
+            source_position=src_pos,
+            source_layer=src_layer,
+            num_sources=num_sources,
+        )
+
+        z_hat_corrupted = z_hat.clone()
+        v_idx = model._signal_index("v")
+        z_hat_corrupted[:, v_idx, 1, :, 1, 1] += 5.0  # corrupt layer 1's v, same (h, w)
+
+        _, _, src_loss_after = model._data_loss(
+            z_hat_corrupted,
+            bold,
+            source_position=src_pos,
+            source_layer=src_layer,
+            num_sources=num_sources,
+        )
+        assert torch.isclose(src_loss_before, src_loss_after, atol=1e-6)
+
+    def test_data_loss_colloc_uses_grid_fn_and_src_uses_dense_fn(self):
+        """colloc_loss's gather is [B, n_times, n_space] with independently-scattered
+        (t, h, w) points along dim=1 -- not one location's trajectory -- so it must go
+        through _bold_grid_loss_fn (Pearson-free), not _bold_loss_fn (used correctly
+        for src_loss, which really does gather one fixed location's full T). Passes
+        source_layer so src_loss takes the single-call, layer-scoped path (the one
+        actually used in training)."""
+        model = _make_mich()
+        model.eval()
+        bold = torch.randn(_B, _L, _T, _H, _W)
+        time = MICH._make_time_grid(_B, _T, device=bold.device, dtype=bold.dtype)
+        z_hat = model(bold, time).z_hat
+        src_pos = torch.randint(0, min(_H, _W), (_B, 1, 2))
+        src_layer = torch.zeros(_B, 1, dtype=torch.long)
+        num_sources = torch.ones(_B, dtype=torch.long)
+
+        grid_calls, dense_calls = [], []
+        real_grid_fn, real_dense_fn = model._bold_grid_loss_fn, model._bold_loss_fn
+
+        def spy_grid(pred, true):
+            grid_calls.append(pred.shape)
+            return real_grid_fn(pred, true)
+
+        def spy_dense(pred, true):
+            dense_calls.append(pred.shape)
+            return real_dense_fn(pred, true)
+
+        model._bold_grid_loss_fn, model._bold_loss_fn = spy_grid, spy_dense
+        try:
+            model._data_loss(
+                z_hat,
+                bold,
+                source_position=src_pos,
+                source_layer=src_layer,
+                num_sources=num_sources,
+            )
+        finally:
+            model._bold_grid_loss_fn, model._bold_loss_fn = real_grid_fn, real_dense_fn
+
+        assert len(grid_calls) == _L  # one collocation call per layer
+        assert all(len(shape) == 3 for shape in grid_calls)  # [B, n_times, n_space]
+        assert len(dense_calls) == 1  # single src_loss call
+        assert len(dense_calls[0]) == 2  # [M, T]
+
     def test_physics_loss_is_finite_scalar(self):
         """_physics_loss returns a 0-D finite tensor."""
         model = _make_mich()
@@ -380,7 +483,7 @@ class TestMICHOptionalLossWiring:
                 ),
                 id="quiescence_consistency",
             ),
-            pytest.param(dict(lambda_supervision=1.0), id="supervision"),
+            pytest.param(dict(lambda_grid_supervision=1.0), id="grid_supervision"),
             pytest.param(
                 dict(
                     supervise_dzdt=True,
@@ -400,7 +503,7 @@ class TestMICHOptionalLossWiring:
                     lambda_quiescence_consistency=1.0,
                     delay_steps_quiescence_consistency=0,
                     warmup_steps_quiescence_consistency=0,
-                    lambda_supervision=1.0,
+                    lambda_grid_supervision=1.0,
                     supervise_dzdt=True,
                     lambda_dzdt_supervision=1.0,
                     supervise_x_phase=True,
@@ -455,15 +558,16 @@ class TestMICHOptionalLossWiring:
 
     @pytest.mark.slow
     def test_supervision_guard_skips_cleanly_when_batch_has_no_latents(self, tmp_path):
-        """lambda_supervision>0 but the batch carries no 's'/'f'/'v'/'q' (as with real,
-        non-simulated fMRI) -- the `batch.get("s") is not None` guard in _shared_step
-        must skip supervision rather than KeyError. validation_step unconditionally
-        reads batch["s"], so this only exercises the train-only path (limit_val_batches=0)."""
+        """lambda_grid_supervision>0 but the batch carries no 's'/'f'/'v'/'q' (as with
+        real, non-simulated fMRI) -- the `batch.get("s") is not None` guard in
+        _shared_step must skip supervision rather than KeyError. validation_step
+        unconditionally reads batch["s"], so this only exercises the train-only path
+        (limit_val_batches=0)."""
         torch.manual_seed(0)
         h5_path = str(tmp_path / "data.h5")
         _make_h5_fixture(h5_path, layers=_LAYERS_3)
         dm = _make_datamodule(h5_path, layers=_LAYERS_3, return_latents=False)
-        model = _make_mich(L=_L3, lambda_supervision=1.0)
+        model = _make_mich(L=_L3, lambda_grid_supervision=1.0)
 
         trainer = Trainer(
             max_epochs=1,
@@ -563,7 +667,7 @@ class TestMICHSharedStepInternals:
             lambda_quiescence_consistency=1.0,
             delay_steps_quiescence_consistency=0,
             warmup_steps_quiescence_consistency=0,
-            lambda_supervision=1.0,
+            lambda_grid_supervision=1.0,
             supervise_dzdt=True,
             lambda_dzdt_supervision=1.0,
             supervise_x_phase=True,
@@ -585,8 +689,8 @@ class TestMICHSharedStepInternals:
             "train/loss_weighted/source_activity",
             "train/loss/quiescence_consistency",
             "train/loss_weighted/quiescence_consistency",
-            "train/loss/supervision",
-            "train/loss_weighted/supervision",
+            "train/loss/grid_supervision",
+            "train/loss_weighted/grid_supervision",
             "train/loss/dzdt_supervision",
             "train/loss_weighted/dzdt_supervision",
             "train/loss/x_phase",

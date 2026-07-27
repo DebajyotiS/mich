@@ -1,4 +1,46 @@
-"""Data/physics/supervision loss computation for MICH, plus the Gaussian-PSF blur."""
+"""Data/physics/supervision loss computation for MICH, plus the Gaussian-PSF blur.
+
+Governing equations (Heinzle/Balloon-Windkessel, `order="exact"`; see
+`_balloon_v_q_dot_targets` for the `order="linear"`/`"quadratic"` Taylor expansions
+about the resting state s=0, f=v=q=1):
+
+    ds/dt = x - kappa*s - gamma*(f - 1)
+    df/dt = s
+    dv/dt = (f - v**(1/alpha)) / tau
+    dq/dt = (f*(1 - (1-E0)**(1/f))/E0 - q*v**(1/alpha - 1)) / tau
+
+with the drain-mode addition for layer > 0: `dv/dt += lambda_d * v_star_below /
+tau`, `dq/dt += lambda_d * q_star_below / tau`, and the delay filter
+`dv_star/dt = (-v_star + (v-1)) / tau_d` (same for q_star). This is the same math
+`mich.data.balloon.balloon_derivatives`/`delay_filter_derivatives` implement for
+generating simulated ground truth -- the two are independent implementations (one
+numpy/scipy, one torch/autograd) and must be kept in sync by hand; there is no
+shared source of truth between them.
+
+The s-equation above (`ds/dt = x - kappa*s - gamma*(f-1)`) recurs across this
+module -- as the physics-loss residual target in `_compute_physics_layer_loss`, as
+the analytic target in `_derivative_supervision_loss`, as the reconstruction
+`_x_phase_loss` pulls x_hat toward, and as the rationale for
+`_quiescence_consistency_loss`'s gate. All four must agree with the equation above.
+
+Time-derivative units convention ("t_norm" vs "physical"): `dz_hat_dt` (produced by
+`blocks.SpatioTemporalDecoder`) is d(z_hat)/d(t_norm), the derivative with respect
+to the model's [0, 1]-normalised time grid -- not with respect to the stored
+per-sample index. Every ODE target above is a plain physical-value combination
+with no t_norm involved, so any `dz_hat_dt` slice compared against one of those
+targets must first be divided by `T - 1` (the grid's index-to-t_norm scale) to
+convert it to the same per-index convention. `_compute_physics_layer_loss`,
+`_derivative_supervision_loss`, and `_x_phase_loss` each do this via a local
+`t_norm_to_physical = T - 1` divisor.
+
+Source metadata convention, shared by every loss below that needs to locate the
+known source(s) within a sample: `source_position` is `[B, S, 2]` (h, w) per
+source slot, `source_layer` is `[B, S]` (that source's layer index), and
+`num_sources` is `[B]` (how many of the S slots are real). S is padded to the
+batch's max source count, so slots at index >= `num_sources[b]` hold undefined
+values for sample b and must be excluded via a `torch.arange(S) < num_sources[:,
+None]` mask before use, not read directly.
+"""
 
 from __future__ import annotations
 
@@ -72,8 +114,27 @@ class MICHLossMixin(CollocationMixin):
     def _make_loss_fn(loss_cfg) -> callable:
         """Build a loss callable `(pred, true) -> scalar` from a loss config mapping.
 
-        Supported types: mse, huber, pearson, mse+pearson, huber+pearson.
-        Pearson correlation is computed over dim=1 (the time/sequence dimension).
+        Args:
+            loss_cfg: A mapping-like config object (attribute access via
+                `getattr`) with `type` ("mse"|"huber"|"pearson"|"mse+pearson"|
+                "huber+pearson", default "mse"), `huber_delta` (default 1.0),
+                `lambda_pearson` (default 1.0), and -- for the two combined
+                types -- `lambda_npearson` (default 1.0). None is treated as
+                `type="mse"` with all other defaults. Pearson correlation is
+                computed over dim=1 (the time/sequence dimension).
+
+        Warning:
+            For the "mse+pearson"/"huber+pearson" types, `lambda_pearson` is
+            read from `loss_cfg` once here, at build time, and closed over as a
+            plain float; `lambda_npearson` is instead re-read from `loss_cfg`
+            every call. A caller that mutates `loss_cfg.lambda_pearson` after
+            calling this (e.g. to anneal it, as `mich.MICH._shared_step` does
+            for `x_phase_loss`) will silently have no effect on the returned
+            callable -- only mutating `lambda_npearson` actually changes its
+            behaviour.
+
+        Raises:
+            ValueError: If `loss_cfg.type` doesn't match a supported name.
         """
         if loss_cfg is None:
             return F.mse_loss
@@ -119,10 +180,53 @@ class MICHLossMixin(CollocationMixin):
                 "Must be one of: mse, huber, pearson, mse+pearson, huber+pearson"
             )
 
+    class _NoPearsonView:
+        """Proxies a loss config but reports `lambda_pearson=0.0`, for building a
+        Pearson-free variant of an otherwise-identical loss fn (see `_make_loss_fn`'s
+        `lambda_pearson`/`lambda_npearson` handling). All other attributes (`type`,
+        `huber_delta`, `lambda_npearson`) pass through to `inner` unchanged."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            if name == "lambda_pearson":
+                return 0.0
+            return getattr(self._inner, name)
+
+    @classmethod
+    def _make_grid_loss_fn(cls, loss_cfg) -> callable:
+        """Like `_make_loss_fn`, but with any Pearson term forced to zero weight.
+
+        Collocation-gathered tensors (`_gather_bold_at_layer`/`_gather_z_hat_at_layer`
+        applied to a per-layer collocation batch) have shape [B, n_times, n_space]
+        where `dim=1` is *not* one location's trajectory over time -- both the time
+        index and the (h, w) location vary independently across it (see
+        `_sample_collocation_indices_one_layer`). `_make_loss_fn`'s Pearson term
+        assumes `dim=1` is a coherent sequence to correlate pred against true; applied
+        here it centers/correlates values from unrelated (t, h, w) points, which is
+        not a meaningful signal (unlike the dense/source components, which really do
+        gather one fixed location's full trajectory). Use this for any loss fn applied
+        to a collocation-batch gather; use `_make_loss_fn` (full Pearson if
+        configured) for dense/source-voxel gathers.
+        """
+        if loss_cfg is None:
+            return F.mse_loss
+        return cls._make_loss_fn(cls._NoPearsonView(loss_cfg))
+
     @staticmethod
     def _compute_bold(
         v: torch.Tensor, q: torch.Tensor, acquisition: AcquisitionConstants, V0: float
     ) -> torch.Tensor:
+        """BOLD readout from blood volume/deoxyhemoglobin: `V0 * (k1*(1-q) +
+        k2*(1-q/v) + k3*(1-v))` (same formula as `mich.data.balloon.get_bold_from_state`,
+        with `k1`/`k2`/`k3` from `acquisition` rather than looked up there).
+
+        Warning:
+            Divides by `v` elementwise; callers must keep `v` away from 0
+            (`_sanitise_states` enforces a 0.1 floor upstream of this in the
+            physics-loss path).
+        """
         k1, k2, k3 = acquisition.k1, acquisition.k2, acquisition.k3
         return V0 * (k1 * (1 - q) + k2 * (1 - q / v) + k3 * (1 - v))
 
@@ -130,6 +234,8 @@ class MICHLossMixin(CollocationMixin):
     def _compute_bold_at(
         z_hat: torch.Tensor, idx, acquisition: AcquisitionConstants, V0: float
     ) -> torch.Tensor:
+        """`_compute_bold`, gathering v/q from `z_hat` at `idx`'s collocation points
+        first. `z_hat`: [B, 7, L, T, H, W]; returns [B, L, n_times, n_space]."""
         v = CollocationMixin._gather_z_hat_at(z_hat, idx, signal="v")
         q = CollocationMixin._gather_z_hat_at(z_hat, idx, signal="q")
         return MICHLossMixin._compute_bold(v, q, acquisition, V0)
@@ -169,38 +275,18 @@ class MICHLossMixin(CollocationMixin):
         tau_f: float,
         eps_x: float,
     ) -> torch.Tensor:
-        """Self-consistency off-source guard. It uses the model's own predicted s and f
-        values as the quiescent signal.
+        """Self-consistency off-source guard: wherever the model's own s and f sit at
+        their resting baseline (|s| < tau_s and |f-1| < tau_f), its own x should also
+        be near 0, and penalises it if not.
 
-        The s-equation ODE residual is ds/dt = x - kappa*s - gamma*(f-1). This residual
-        is already enforced elsewhere by the physics loss. If s sits at its steady
-        baseline of approximately 0 for a stretch of time, then ds/dt is also
-        approximately 0 there. This forces x to equal kappa*s + gamma*(f-1), which is
-        approximately 0 whenever f is also at its baseline of 1. Wherever the model's
-        own s and f jointly indicate that nothing is happening, x should be
-        approximately 0. If x is not near 0, then an internal inconsistency exists in
-        the model's own output.
-        Note: This check does not require comparison against any
-        known source position.
-
-        This gate does not require physics constants. The tolerances tau_s and
-        tau_f are generic numerical parameters. They are not tied to scenario-specific
-        diffusion parameters. The gate is evaluated directly from z_hat at each voxel
-        and timestep. It maintains grid coverage regardless of active source density.
-        The gate is also time-resolved. A voxel that is quiescent early but active
-        later is correctly excluded the moment its own s and f move off baseline.
-
-        This gate naturally handles multi-layer scenarios. It checks the model's own s
-        and f values at every individual voxel. A genuinely active neighbor layer is
-        exempt because it will have non-baseline s and f values. This avoids the need
-        for manual coordinate exclusions.
-
-        This gate densely re-applies the constraint that the s-equation residual of
-        the physics loss implies. This dense application happens over the entire grid
-        at every step. It is needed because the physics loss is only evaluated at
-        sparse collocation points. Those points are heavily biased toward the known
-        source due to dense_spatial_frac. The constraint is otherwise barely enforced
-        away from the source.
+        Follows directly from the s-equation (see module docstring): if s and ds/dt
+        are both ~0 (baseline and unchanging), then x ~= kappa*s + gamma*(f-1), which
+        is also ~0 once f is at its baseline of 1. No comparison against a known
+        source position or physics constant is needed -- tau_s/tau_f/eps_x are
+        generic numerical tolerances, and the gate is evaluated pointwise from z_hat
+        at every voxel, layer, and timestep, so it re-applies (densely, over the full
+        grid) the same constraint the physics loss only enforces at sparse,
+        source-biased collocation points (see `dense_spatial_frac`).
         """
         x_idx, s_idx, f_idx = (
             self._signal_index("x"),
@@ -221,23 +307,69 @@ class MICHLossMixin(CollocationMixin):
         bold_norm: torch.Tensor,
         source_position: torch.Tensor | None = None,
         num_sources: torch.Tensor | None = None,
+        source_layer: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        collocation = self._sample_collocation_indices(
+        """BOLD data loss: sparse grid collocation, plus a heavier-weighted dense
+        term at every known source voxel across all of T.
+
+        Predicted BOLD is reconstructed from z_hat's v/q channels via
+        `_compute_bold` and PSF-blurred before either component is computed, so
+        both are compared against the (already-blurred) `bold_norm`/`true_bold`
+        the network is trained against. The collocation term uses
+        `_bold_grid_loss_fn` (Pearson-free -- see `_make_grid_loss_fn`) since its
+        gather's `dim=1` mixes independently-scattered (t, h, w) points rather than
+        one location's trajectory; the dense source term uses the full
+        `_bold_loss_fn` (Pearson included if configured), since that gather really is
+        one fixed location's trajectory over all of T.
+
+        Args:
+            z_hat: [B, 7, L, T, H, W].
+            bold_norm: [B, L, T, H, W], the normalised BOLD the model was
+                conditioned on; de-normalised via `self.normaliser` (if set)
+                to get `true_bold` for comparison.
+            source_position, num_sources: See *Source metadata convention* in
+                the module docstring -- [B, S, 2] / [B].
+            source_layer: [B, S]. If given, each source's dense term compares
+                only against its own layer. If None, falls back to comparing
+                every layer at that source's (h, w) -- the pre-per-layer
+                behaviour, kept for callers without per-layer source info.
+
+        Returns:
+            (total, colloc_loss, src_loss): `total = colloc_loss +
+            lambda_src * src_loss`; `colloc_loss` and `src_loss` are also
+            returned unweighted, for logging.
+        """
+        L = z_hat.shape[2]
+        lc = self.hparams.loss_config
+        common_kwargs = dict(
             T=bold_norm.shape[2],
             H=bold_norm.shape[3],
             W=bold_norm.shape[4],
-            n_times=self.hparams.loss_config.n_time,
-            n_space=self.hparams.loss_config.n_space,
+            n_times=lc.n_time,
+            n_space=lc.n_space,
             device=z_hat.device,
-            source_position=source_position,
-            num_sources=num_sources,
-            dense_spatial_frac=self.hparams.loss_config.dense_spatial_frac,
-            dense_spatial_radius=self.hparams.loss_config.dense_spatial_radius,
-            dense_time_frac=self.hparams.loss_config.dense_time_frac,
-            dense_time_lo=self.hparams.loss_config.dense_time_lo,
-            dense_time_hi=self.hparams.loss_config.dense_time_hi,
-            uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
+            dense_spatial_frac=lc.dense_spatial_frac,
+            dense_spatial_radius=lc.dense_spatial_radius,
+            dense_time_frac=lc.dense_time_frac,
+            dense_time_lo=lc.dense_time_lo,
+            dense_time_hi=lc.dense_time_hi,
+            uniform_time_lo=lc.uniform_time_lo,
         )
+        if source_position is not None and source_layer is not None:
+            idx_per_layer = self._sample_collocation_indices_per_layer(
+                L=L,
+                source_position=source_position,
+                source_layer=source_layer,
+                num_sources=num_sources,
+                **common_kwargs,
+            )
+        else:
+            # No per-layer source info -- fall back to one shared draw reused for every
+            # layer, matching the old (pre-per-layer) behaviour exactly.
+            shared_idx = self._sample_collocation_indices(
+                source_position=source_position, num_sources=num_sources, **common_kwargs
+            )
+            idx_per_layer = [shared_idx] * L
 
         v_idx, q_idx = self._signal_index("v"), self._signal_index("q")
         pred_v = z_hat[:, v_idx]
@@ -251,42 +383,76 @@ class MICHLossMixin(CollocationMixin):
             self.normaliser.denormalize(bold_norm) if self.normaliser is not None else bold_norm
         )
 
-        # Collocation loss -- per layer shape: [B, n_times, n_space]; Pearson over n_times (dim=1)
-        pred_bold_at = self._gather_bold_at(pred_bold, collocation)
-        true_bold_at = self._gather_bold_at(true_bold, collocation)
-        L = pred_bold_at.shape[1]
+        # Collocation loss -- one independent draw per layer; per-layer shape
+        # [B, n_times, n_space], where dim=1 is *not* a coherent time series (each
+        # entry is an independently-scattered (t, h, w) point -- see
+        # `_make_grid_loss_fn`), so this uses the Pearson-free variant.
         colloc_loss = torch.stack(
             [
-                self._bold_loss_fn(pred_bold_at[:, layer], true_bold_at[:, layer])
+                self._bold_grid_loss_fn(
+                    self._gather_bold_at_layer(pred_bold, idx_per_layer[layer], layer),
+                    self._gather_bold_at_layer(true_bold, idx_per_layer[layer], layer),
+                )
                 for layer in range(L)
             ]
         ).mean()
 
-        # Source voxel loss -- full T, all layers, per valid source; shape per layer:
-        # [M, T] where M = total valid sources across the batch; Pearson over T (dim=1)
+        # Source voxel loss -- full T, per valid source; Pearson over T (dim=1)
         B = pred_bold.shape[0]
         S = source_position.shape[1]
         b_idx = torch.arange(B, device=pred_bold.device)[:, None].expand(B, S)
         src_h = source_position[..., 0].long()  # [B, S]
         src_w = source_position[..., 1].long()
-        pred_bold_src = pred_bold[b_idx, :, :, src_h, src_w]  # [B, S, L, T]
-        true_bold_src = true_bold[b_idx, :, :, src_h, src_w]  # [B, S, L, T]
-        T_src = pred_bold_src.shape[-1]
-
         mask = torch.arange(S, device=pred_bold.device)[None, :] < num_sources[:, None]  # [B, S]
-        pred_bold_src = pred_bold_src.reshape(B * S, L, T_src)[mask.reshape(-1)]  # [M, L, T]
-        true_bold_src = true_bold_src.reshape(B * S, L, T_src)[mask.reshape(-1)]
-        src_loss = torch.stack(
-            [
-                self._bold_loss_fn(pred_bold_src[:, layer], true_bold_src[:, layer])
-                for layer in range(L)
-            ]
-        ).mean()
+
+        if source_layer is not None:
+            # Each source's own layer only -- shape [B, S, T].
+            src_l = source_layer.clamp(min=0, max=L - 1).long()
+            pred_bold_src = pred_bold[b_idx, src_l, :, src_h, src_w]
+            true_bold_src = true_bold[b_idx, src_l, :, src_h, src_w]
+            T_src = pred_bold_src.shape[-1]
+            pred_bold_src = pred_bold_src.reshape(B * S, T_src)[mask.reshape(-1)]  # [M, T]
+            true_bold_src = true_bold_src.reshape(B * S, T_src)[mask.reshape(-1)]
+            src_loss = self._bold_loss_fn(pred_bold_src, true_bold_src)
+        else:
+            # No per-layer source info -- fall back to comparing every layer at each
+            # source's (h, w), matching the old (pre-per-layer) behaviour exactly.
+            pred_bold_src = pred_bold[b_idx, :, :, src_h, src_w]  # [B, S, L, T]
+            true_bold_src = true_bold[b_idx, :, :, src_h, src_w]  # [B, S, L, T]
+            T_src = pred_bold_src.shape[-1]
+            pred_bold_src = pred_bold_src.reshape(B * S, L, T_src)[mask.reshape(-1)]  # [M, L, T]
+            true_bold_src = true_bold_src.reshape(B * S, L, T_src)[mask.reshape(-1)]
+            src_loss = torch.stack(
+                [
+                    self._bold_loss_fn(pred_bold_src[:, layer], true_bold_src[:, layer])
+                    for layer in range(L)
+                ]
+            ).mean()
 
         total = colloc_loss + self.hparams.loss_config.lambda_src * src_loss
         return total, colloc_loss, src_loss
 
     def _sanitise_states(self, states: dict[str, Any]) -> dict[str, Any]:
+        """Clamp gathered Heinzle states in place to keep the physics-loss ODE
+        residuals (which divide by v and raise v/f to negative/fractional powers)
+        finite, before they're used as targets.
+
+        Args:
+            states: Signal name -> tensor, values as gathered by
+                `_gather_z_hat_at_layer` (any shape). Only keys "f", "v", "q"
+                get the positive floor; every other key (e.g. "x", "s",
+                "vstar", "qstar") gets the signed clamp.
+
+        Returns:
+            The same dict, mutated in place (also returned for chaining).
+
+        Warning:
+            NaN/+-inf values are silently replaced (NaN -> 0, +-inf -> +-1e3)
+            before clamping. A genuine upstream divergence (e.g. the network
+            predicting NaN) will therefore not crash here -- it will instead
+            surface downstream as an anomalously large-but-finite physics loss,
+            not as an exception.
+        """
         for key, value in states.items():
             value = torch.nan_to_num(value, nan=0.0, posinf=1e3, neginf=-1e3)
             if key in ("f", "v", "q"):
@@ -314,10 +480,16 @@ class MICHLossMixin(CollocationMixin):
         need_v/need_q let a caller that only supervises one of the two skip computing
         the other; both default to True to preserve the original always-compute-both
         behaviour for _compute_physics_layer_loss.
+
+        Returns:
+            (target_vdot, target_qdot); each None if its `need_*` flag is False.
+
+        Raises:
+            ValueError: If `order` is not one of "exact", "linear", "quadratic".
         """
         if order not in ("exact", "linear", "quadratic"):
             raise ValueError(
-                f"Expected order to be one of `linear`, `quadractic` or `exact`. But recieved {order}"
+                f"Expected order to be one of `linear`, `quadratic` or `exact`. But received {order}"
             )
         alpha = self._physio("alpha")
         E0 = self._physio("E0")
@@ -367,18 +539,42 @@ class MICHLossMixin(CollocationMixin):
         burn_in: int,
         order: str,
     ) -> Mapping[str, torch.Tensor]:
+        """ODE-residual loss for one layer: `self._ode_loss_fn(analytic d/dt, target)`
+        per equation, for s/f/v/q (and vstar/qstar in drain mode), at `idx`'s
+        collocation points.
+
+        States are gathered and passed through `_sanitise_states` before use (see
+        its docstring for the silent NaN/clamp behaviour that implies). `dz_hat_dt`
+        slices are converted from t_norm to physical units per the module
+        docstring's *Time-derivative units convention* before comparison.
+
+        Args:
+            z_hat, dz_hat_dt: [B, 7, L, T, H, W] (dz_hat_dt: 5 channels if not
+                `has_drain`).
+            idx: This layer's `CollocationBatch` (see `_sample_collocation_indices_per_layer`).
+            layer: Fixed layer channel index.
+            burn_in: Number of leading timesteps (along the collocation "time"
+                axis, i.e. `idx.t`, not the raw T axis) excluded from every loss
+                -- early temporal-encoder predictions are unreliable (little
+                past context yet); see *Physics loss* in `notebooks/training.md`.
+            order: Balloon ODE order, forwarded to `_balloon_v_q_dot_targets`.
+
+        Returns:
+            Dict of per-equation scalar losses, keyed "s", "f", "v", "q" (plus
+            "vstar", "qstar" if `has_drain`).
+        """
         has_drain = z_hat.shape[1] > 5  # vstar/qstar only present in multi-layer mode
 
-        x = self._gather_z_hat_at(z_hat, idx, signal="x")[:, layer]
-        s = self._gather_z_hat_at(z_hat, idx, signal="s")[:, layer]
-        f = self._gather_z_hat_at(z_hat, idx, signal="f")[:, layer]
-        v = self._gather_z_hat_at(z_hat, idx, signal="v")[:, layer]
-        q = self._gather_z_hat_at(z_hat, idx, signal="q")[:, layer]
+        x = self._gather_z_hat_at_layer(z_hat, idx, layer, signal="x")
+        s = self._gather_z_hat_at_layer(z_hat, idx, layer, signal="s")
+        f = self._gather_z_hat_at_layer(z_hat, idx, layer, signal="f")
+        v = self._gather_z_hat_at_layer(z_hat, idx, layer, signal="v")
+        q = self._gather_z_hat_at_layer(z_hat, idx, layer, signal="q")
 
         state_dict = {"x": x, "s": s, "f": f, "v": v, "q": q}
         if has_drain:
-            v_star = self._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer]
-            q_star = self._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer]
+            v_star = self._gather_z_hat_at_layer(z_hat, idx, layer, signal="vstar")
+            q_star = self._gather_z_hat_at_layer(z_hat, idx, layer, signal="qstar")
             state_dict.update({"vstar": v_star, "qstar": q_star})
 
         states = self._sanitise_states(state_dict)
@@ -414,7 +610,7 @@ class MICHLossMixin(CollocationMixin):
         dv_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="v") / t_norm_to_physical
         target_vdot, target_qdot = self._balloon_v_q_dot_targets(f, v, q, order)
         if has_drain and layer > 0:
-            vstar_deeper = self._gather_z_hat_at(z_hat, idx, signal="vstar")[:, layer - 1]
+            vstar_deeper = self._gather_z_hat_at_layer(z_hat, idx, layer - 1, signal="vstar")
             target_vdot = target_vdot + lambda_d * vstar_deeper
         v_loss = self._ode_loss_fn(
             dv_dt[:, burn_in:],
@@ -423,7 +619,7 @@ class MICHLossMixin(CollocationMixin):
 
         dq_dt = self._gather_grad_at(dz_hat_dt, layer, idx, signal="q") / t_norm_to_physical
         if has_drain and layer > 0:
-            qstar_deeper = self._gather_z_hat_at(z_hat, idx, signal="qstar")[:, layer - 1]
+            qstar_deeper = self._gather_z_hat_at_layer(z_hat, idx, layer - 1, signal="qstar")
             target_qdot = target_qdot + lambda_d * qstar_deeper
         q_loss = self._ode_loss_fn(
             dq_dt[:, burn_in:],
@@ -450,7 +646,19 @@ class MICHLossMixin(CollocationMixin):
         self, start_val: float, end_val: float, anneal_start_step: int, anneal_end_step: int
     ) -> float:
         """Linearly interpolate start_val -> end_val over [anneal_start_step,
-        anneal_end_step], clamped to start_val before and end_val after."""
+        anneal_end_step], clamped to start_val before and end_val after.
+
+        Note:
+            Reads `self.global_step` (set by `LightningModule`/the trainer) --
+            not a pure function of its arguments alone; two calls with
+            identical arguments return different results as training
+            progresses.
+
+        Returns:
+            `end_val` if `anneal_end_step <= anneal_start_step` (a
+            zero-or-negative-length window is treated as "already annealed",
+            not as an error).
+        """
         if anneal_end_step <= anneal_start_step:
             return end_val
         frac = (self.global_step - anneal_start_step) / (anneal_end_step - anneal_start_step)
@@ -460,6 +668,15 @@ class MICHLossMixin(CollocationMixin):
     def _get_scheduled_lambda(
         self, lambda_target: float, warmup_steps: int, delay_steps: int = 0
     ) -> float:
+        """Scale a target loss weight for the current step: 0 before
+        `delay_steps`, then linearly ramping to `lambda_target` over the next
+        `warmup_steps`, then held at `lambda_target`. With both <= 0, returns
+        `lambda_target` unscheduled (always on, from step 0).
+
+        Note:
+            Reads `self.global_step`, like `_anneal_between` -- not a pure
+            function of its arguments alone.
+        """
         if warmup_steps <= 0 and delay_steps <= 0:
             return lambda_target
         if self.global_step < delay_steps:
@@ -469,42 +686,83 @@ class MICHLossMixin(CollocationMixin):
             return lambda_target
         return min(1.0, ramp_step / warmup_steps) * lambda_target
 
-    def _physics_loss(  # add a parameter that says whether the loss is linear or nonlinear
+    def _physics_loss(
         self,
         z_hat: torch.Tensor,
         dz_hat_dt: torch.Tensor,
         order: str,
         lambda_smooth: float = 0.0,
         source_position: torch.Tensor | None = None,
+        source_layer: torch.Tensor | None = None,
         num_sources: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        idx = self._sample_collocation_indices(
+        """Total ODE-residual loss: `_compute_physics_layer_loss` averaged over
+        every equation and every layer, plus an optional temporal-smoothness term.
+
+        Args:
+            z_hat, dz_hat_dt: [B, 7, L, T, H, W] (5 channels if not drain mode).
+            order: Balloon ODE order ("exact"|"linear"|"quadratic").
+            lambda_smooth: Weight for the smoothness term below; <= 0 disables
+                it entirely (the term is not computed at all, not computed
+                and zero-weighted).
+            source_position, source_layer, num_sources: See *Source metadata
+                convention* in the module docstring. If `source_position`/
+                `source_layer` are None, falls back to one collocation draw
+                shared across every layer (pre-per-layer behaviour).
+
+        Returns:
+            (total_physics_loss, per_eq): `per_eq` maps each equation name
+            ("s","f","v","q"[,"vstar","qstar"]) to its own averaged-over-layers
+            scalar, for logging; `total_physics_loss` is their combination
+            (equations and layers both averaged, i.e. divided by `n_eq` and by
+            `n_layers`) plus `lambda_smooth * smoothness_loss` if enabled.
+
+        Note:
+            The smoothness term is a finite difference of `z_hat` over the
+            full T axis (`z_hat[..., 1:] - z_hat[..., :-1]`), not restricted to
+            collocation points -- unlike every other term here.
+        """
+        n_layers = z_hat.shape[2]
+        lc = self.hparams.loss_config
+        common_kwargs = dict(
             T=z_hat.shape[3],
             H=z_hat.shape[4],
             W=z_hat.shape[5],
-            n_times=self.hparams.loss_config.n_time,
-            n_space=self.hparams.loss_config.n_space,
+            n_times=lc.n_time,
+            n_space=lc.n_space,
             device=z_hat.device,
-            source_position=source_position,
-            num_sources=num_sources,
-            dense_spatial_frac=self.hparams.loss_config.dense_spatial_frac,
-            dense_spatial_radius=self.hparams.loss_config.dense_spatial_radius,
-            dense_time_frac=self.hparams.loss_config.dense_time_frac,
-            dense_time_lo=self.hparams.loss_config.dense_time_lo,
-            dense_time_hi=self.hparams.loss_config.dense_time_hi,
-            uniform_time_lo=self.hparams.loss_config.uniform_time_lo,
+            dense_spatial_frac=lc.dense_spatial_frac,
+            dense_spatial_radius=lc.dense_spatial_radius,
+            dense_time_frac=lc.dense_time_frac,
+            dense_time_lo=lc.dense_time_lo,
+            dense_time_hi=lc.dense_time_hi,
+            uniform_time_lo=lc.uniform_time_lo,
         )
+        if source_position is not None and source_layer is not None:
+            idx_per_layer = self._sample_collocation_indices_per_layer(
+                L=n_layers,
+                source_position=source_position,
+                source_layer=source_layer,
+                num_sources=num_sources,
+                **common_kwargs,
+            )
+        else:
+            # No per-layer source info -- fall back to one shared draw reused for every
+            # layer, matching the old (pre-per-layer) behaviour exactly.
+            shared_idx = self._sample_collocation_indices(
+                source_position=source_position, num_sources=num_sources, **common_kwargs
+            )
+            idx_per_layer = [shared_idx] * n_layers
         has_drain = z_hat.shape[1] > 5
         _eq_keys = ("s", "f", "v", "q", "vstar", "qstar") if has_drain else ("s", "f", "v", "q")
         n_eq = len(_eq_keys)
         tot_physics_loss = torch.tensor(0.0, device=z_hat.device, dtype=torch.float32)
         per_eq = {k: torch.tensor(0.0, device=z_hat.device, dtype=torch.float32) for k in _eq_keys}
-        n_layers = z_hat.shape[2]
         for layer in range(n_layers):
             layer_losses = self._compute_physics_layer_loss(
                 z_hat,
                 dz_hat_dt,
-                idx,
+                idx_per_layer[layer],
                 layer=layer,
                 burn_in=self.hparams.loss_config.burn_in,
                 order=order,
@@ -523,6 +781,9 @@ class MICHLossMixin(CollocationMixin):
             return tot_physics_loss + lambda_smooth * smoothness_loss, per_eq
 
     def _supervision_keys(self, z_hat: torch.Tensor):
+        """(z_hat signal name, batch dict key) pairs `_supervision_loss` should
+        supervise: `_SUPERVISION_KEYS_SINGLE`/`_FULL` depending on whether `z_hat`
+        has drain channels, plus `("x", "neural")` if `supervise_x` is set."""
         keys = self._SUPERVISION_KEYS_SINGLE if z_hat.shape[1] <= 5 else self._SUPERVISION_KEYS_FULL
         # TEMPORARY ablation switch: direct supervision on x (batch["neural"]) is not
         # part of the normal MICH objective (x is meant to be recovered purely via the
@@ -538,22 +799,48 @@ class MICHLossMixin(CollocationMixin):
         self,
         z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
         batch: dict,
-        source_position: torch.Tensor | None = None,
-        num_sources: torch.Tensor | None = None,
+        source_position: torch.Tensor,  # [B, S, 2]
+        source_layer: torch.Tensor,  # [B, S]
+        num_sources: torch.Tensor,  # [B]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """MSE between predicted and ground-truth latent states at collocation points."""
-        # Use T_min so collocation indices are valid for both z_hat and true latents.
+        """MSE(+Pearson) between predicted and ground-truth latent states (s, f, v, q,
+        vstar, qstar), combining two coverage regimes under one term instead of having
+        this supervision computed twice by two separate loss functions:
+
+          - a dense component: every valid source, at its own (layer, h, w), across
+            every timestep -- guarantees the known source voxel is always fully
+            supervised, and (unlike the old _source_supervision_loss this replaces)
+            compares it against ground truth only in *its own* layer via
+            source_layer, not every layer at that (h, w). Uses the full
+            `supervision_loss` config (Pearson included if configured) since this is a
+            real, fixed-location trajectory.
+          - a grid component: one independent collocation draw per layer, sampled
+            across the whole grid, with each layer's dense-near-source share
+            restricted to that layer's own sources (see
+            _sample_collocation_indices_per_layer) -- this is what reaches
+            off-source/weak-spillover voxels, which the dense component never does.
+            Uses `_make_grid_loss_fn`'s Pearson-free variant, since each collocation
+            gather's `dim=1` mixes independently-scattered (t, h, w) points rather
+            than one location's trajectory.
+
+        Combined the same way _data_loss combines its src_loss and colloc_loss:
+        weighted by lambda_src so the known source voxel counts more than an
+        arbitrary collocation point, without a second, separately-tuned lambda.
+        """
         T_latent = batch["s"].shape[2]
         T_min = min(z_hat.shape[3], T_latent)
+        L = z_hat.shape[2]
         lc = self.hparams.loss_config
-        idx = self._sample_collocation_indices(
+        idx_per_layer = self._sample_collocation_indices_per_layer(
             T=T_min,
             H=z_hat.shape[4],
             W=z_hat.shape[5],
+            L=L,
             n_times=lc.n_time,
             n_space=lc.n_space,
             device=z_hat.device,
             source_position=source_position,
+            source_layer=source_layer,
             num_sources=num_sources,
             dense_spatial_frac=lc.dense_spatial_frac,
             dense_spatial_radius=lc.dense_spatial_radius,
@@ -562,56 +849,45 @@ class MICHLossMixin(CollocationMixin):
             dense_time_hi=lc.dense_time_hi,
             uniform_time_lo=lc.uniform_time_lo,
         )
-        per_sig: dict[str, torch.Tensor] = {}
-        for sig, bk in self._supervision_keys(z_hat):
-            true = batch[bk].float()  # [B, L, T_latent, H, W]
-            pred_at = self._gather_z_hat_at(z_hat, idx, signal=sig).float()  # [B, L, n_t, n_s]
-            true_at = self._gather_bold_at(true, idx).float()  # [B, L, n_t, n_s]
-            L = pred_at.shape[1]
-            per_sig[sig] = torch.stack(
-                [
-                    self._supervision_loss_fn(pred_at[:, layer], true_at[:, layer])
-                    for layer in range(L)
-                ]
-            ).mean()
-        total = sum(per_sig.values()) / len(per_sig)
-        return total, per_sig
 
-    def _source_supervision_loss(
-        self,
-        z_hat: torch.Tensor,  # [B, 7, L, T, H, W]
-        batch: dict,
-        source_position: torch.Tensor,  # [B, S, 2]
-        num_sources: torch.Tensor,  # [B]
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """MSE between predicted and ground-truth latent states at each valid source voxel, across all T."""
         B = z_hat.shape[0]
         S = source_position.shape[1]
         device = z_hat.device
         b_idx = torch.arange(B, device=device)[:, None].expand(B, S)
         src_h = source_position[..., 0].long()  # [B, S]
         src_w = source_position[..., 1].long()
+        src_l = source_layer.clamp(min=0, max=L - 1).long()  # [B, S]
         mask = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
-        T_latent = batch["s"].shape[2]
-        T_pred = z_hat.shape[3]
-        T_min = min(T_pred, T_latent)
 
         per_sig: dict[str, torch.Tensor] = {}
         for sig, bk in self._supervision_keys(z_hat):
             true = batch[bk].float()  # [B, L, T_latent, H, W]
             pred = z_hat[:, self._signal_index(sig)].float()  # [B, L, T, H, W]
-            pred_src = pred[b_idx, :, :T_min, src_h, src_w]  # [B, S, L, T_min]
-            true_src = true[b_idx, :, :T_min, src_h, src_w]  # [B, S, L, T_min]
-            L = pred_src.shape[2]
-            pred_src = pred_src.reshape(B * S, L, T_min)[mask.reshape(-1)]  # [M, L, T_min]
-            true_src = true_src.reshape(B * S, L, T_min)[mask.reshape(-1)]
-            per_sig[sig] = torch.stack(
+
+            # Dense: every valid source, its own layer only, every timestep.
+            pred_src = pred[b_idx, src_l, :T_min, src_h, src_w]  # [B, S, T_min]
+            true_src = true[b_idx, src_l, :T_min, src_h, src_w]  # [B, S, T_min]
+            pred_src = pred_src.reshape(B * S, T_min)[mask.reshape(-1)]  # [M, T_min]
+            true_src = true_src.reshape(B * S, T_min)[mask.reshape(-1)]
+            dense_loss = self._supervision_loss_fn(pred_src, true_src)
+
+            # Grid: sparse collocation, one independent draw per layer. dim=1 here is
+            # not a coherent time series (each entry is an independently-scattered
+            # (t, h, w) point -- see `_make_grid_loss_fn`), so this uses the
+            # Pearson-free variant.
+            grid_loss = torch.stack(
                 [
-                    self._supervision_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
-                    for layer_idx in range(L)
+                    self._supervision_grid_loss_fn(
+                        self._gather_z_hat_at_layer(
+                            z_hat, idx_per_layer[layer], layer, signal=sig
+                        ).float(),
+                        self._gather_bold_at_layer(true, idx_per_layer[layer], layer).float(),
+                    )
+                    for layer in range(L)
                 ]
             ).mean()
 
+            per_sig[sig] = grid_loss + lc.lambda_src * dense_loss
         total = sum(per_sig.values()) / len(per_sig)
         return total, per_sig
 
@@ -621,10 +897,13 @@ class MICHLossMixin(CollocationMixin):
         batch: dict,
         source_position: torch.Tensor,  # [B, S, 2]
         num_sources: torch.Tensor,  # [B]
+        source_layer: torch.Tensor | None = None,  # [B, S]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """MSE between the network's analytic dz_hat/dt and the exact Balloon-Windkessel
         ODE derivative evaluated on ground-truth latents, at each valid source voxel
-        across all T.
+        across all T. When source_layer is given, each source is compared only against
+        its own layer, not every layer at that (h, w) (falls back to the old
+        every-layer behaviour if source_layer is omitted).
 
         Compared in per-index units (i.e. per stored sample, not per unit of the model's
         normalised [0, 1] time grid): dz_hat_dt is d(z_hat)/d(t_norm), so it's divided by
@@ -642,11 +921,13 @@ class MICHLossMixin(CollocationMixin):
         signals = tuple(getattr(lc, "dzdt_supervision_signals", ("s",)))
         has_drain = dz_hat_dt.shape[1] > 5
         B = dz_hat_dt.shape[0]
+        L = dz_hat_dt.shape[2]
         S = source_position.shape[1]
         device = dz_hat_dt.device
         b_idx = torch.arange(B, device=device)[:, None].expand(B, S)
         src_h = source_position[..., 0].long()  # [B, S]
         src_w = source_position[..., 1].long()
+        src_l = source_layer.clamp(min=0, max=L - 1).long() if source_layer is not None else None
         mask = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
 
         s_true = batch["s"].float()
@@ -707,17 +988,26 @@ class MICHLossMixin(CollocationMixin):
             true_dt = analytic_target[sig]  # [B, L, T_min, H, W]
             pred = dz_hat_dt[:, self._signal_index(sig)].float()  # [B, L, T, H, W]
 
-            pred_src = pred[b_idx, :, :T_min, src_h, src_w] / (T_min - 1)  # [B, S, L, T_min]
-            true_src = true_dt[b_idx, :, :T_min, src_h, src_w]  # [B, S, L, T_min]
-            L = pred_src.shape[2]
-            pred_src = pred_src.reshape(B * S, L, T_min)[mask.reshape(-1)]  # [M, L, T_min]
-            true_src = true_src.reshape(B * S, L, T_min)[mask.reshape(-1)]
-            per_sig[sig] = torch.stack(
-                [
-                    self._dzdt_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
-                    for layer_idx in range(L)
-                ]
-            ).mean()
+            if src_l is not None:
+                # Each source's own layer only -- shape [B, S, T_min].
+                pred_src = pred[b_idx, src_l, :T_min, src_h, src_w] / (T_min - 1)
+                true_src = true_dt[b_idx, src_l, :T_min, src_h, src_w]
+                pred_src = pred_src.reshape(B * S, T_min)[mask.reshape(-1)]  # [M, T_min]
+                true_src = true_src.reshape(B * S, T_min)[mask.reshape(-1)]
+                per_sig[sig] = self._dzdt_loss_fn(pred_src, true_src)
+            else:
+                # No per-layer source info -- fall back to comparing every layer at
+                # each source's (h, w), matching the old (pre-per-layer) behaviour.
+                pred_src = pred[b_idx, :, :T_min, src_h, src_w] / (T_min - 1)  # [B, S, L, T_min]
+                true_src = true_dt[b_idx, :, :T_min, src_h, src_w]  # [B, S, L, T_min]
+                pred_src = pred_src.reshape(B * S, L, T_min)[mask.reshape(-1)]  # [M, L, T_min]
+                true_src = true_src.reshape(B * S, L, T_min)[mask.reshape(-1)]
+                per_sig[sig] = torch.stack(
+                    [
+                        self._dzdt_loss_fn(pred_src[:, layer_idx], true_src[:, layer_idx])
+                        for layer_idx in range(L)
+                    ]
+                ).mean()
 
         total = sum(per_sig.values()) / len(per_sig)
         return total, per_sig
@@ -736,9 +1026,9 @@ class MICHLossMixin(CollocationMixin):
         touching x_hat's value at all, but it's evaluated at scattered collocation points
         -- a fresh random draw of times (and, separately, spatial locations) every step
         (see _sample_collocation_indices), never a coherent, ordered whole trajectory.
-        s/f/v/q, by contrast, are judged by _source_supervision_loss on their full,
-        ordered T-length trajectory at the fixed source voxel every step -- a whole-shape
-        comparison, not a cloud of independent point constraints. This loss gives x_hat
+        s/f/v/q, by contrast, are judged by _supervision_loss's dense component on their
+        full, ordered T-length trajectory at the fixed source voxel every step -- a
+        whole-shape comparison, not a cloud of independent point constraints. This loss gives x_hat
         that same kind of coherent, per-step, whole-trajectory signal, against a
         reconstruction built entirely from data-derived quantities (Dp_s, s_hat, f_hat)
         rather than ground-truth x, so it stays usable with real fMRI (no x label needed).

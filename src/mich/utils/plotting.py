@@ -1,3 +1,17 @@
+"""Validation-time plotting helpers for BOLD/neural predictions and latent states.
+
+`LAYER_NAMES` is top-to-bottom (superficial first), the opposite order from the
+channel-index convention (`mich.models.collocation.CollocationMixin._layer_index`:
+0=deep, 1=middle, 2=superficial). Both functions below index `LAYER_NAMES` with
+`n_layers - 1 - <channel index>` to display rows superficial-to-deep while still
+reading data at the correct channel index -- `LAYER_NAMES` itself is never
+reordered to match the channel convention.
+
+`COLOR_HEX` is a fixed palette indexed by `SIGNALS_LIST.index(<signal name>)`,
+shared by both plot functions so a given signal (e.g. "bold", "s") keeps the same
+colour across every figure this module produces.
+"""
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch

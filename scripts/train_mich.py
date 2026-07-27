@@ -135,8 +135,14 @@ def main(cfg: DictConfig) -> None:
                 cfg.model.scheduler.T_max = None
             _inject_scheduler_steps(cfg)
 
-    if cfg.model.loss_config.lambda_supervision == 0.0:
-        log.info("lambda_supervision=0, disabling return_latents in datamodule")
+    _needs_latents = getattr(
+        cfg.model.loss_config, "lambda_grid_supervision", 0.0
+    ) > 0.0 or getattr(cfg.model.loss_config, "supervise_dzdt", False)
+    if not _needs_latents:
+        log.info(
+            "No latent-consuming loss term active (lambda_grid_supervision=0, "
+            "supervise_dzdt=False), disabling return_latents in datamodule"
+        )
         cfg.datamodule.data.return_latents = False
 
     log.info("Instantiating datamodule")
@@ -159,8 +165,7 @@ def main(cfg: DictConfig) -> None:
         log.info(f"Setting matrix precision to {cfg.precision}")
         torch.set_float32_matmul_precision(cfg.precision)
 
-    if getattr(cfg.model.loss_config, "lambda_supervision", 0.0) == 0.0:
-        log.info("lambda_supervision=0, disabling return_latents in datamodule")
+    if not _needs_latents:
         cfg.datamodule.data.return_latents = False
 
     log.info("Instantiating datamodule")

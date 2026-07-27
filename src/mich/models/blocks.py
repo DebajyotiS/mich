@@ -1,3 +1,28 @@
+"""HeinzleNet: the MICH encoder/decoder network, from raw BOLD to Heinzle latent states.
+
+Pipeline (see `HeinzleNet.forward`): `MaskedLayerMixing` (mixes BOLD across adjacent
+cortical layers, expands to C channels) -> `SpatialEncoder` (per-timestep 2D conv
+stack) -> `TemporalMixingEncoder` (per-voxel temporal TCN) -> `SpatioTemporalDecoder`
+(time-and-signal-conditioned FiLM decoder to the 7 Heinzle channels).
+
+Axis-order convention: the encoder/temporal-mixing stack (`MaskedLayerMixing`,
+`SpatialEncoder`, `TemporalMixingEncoder`) uses `[B, T, L, C, H, W]` (time before
+layer). `SpatioTemporalDecoder`'s output, and everything downstream of it
+(`SpatialDecoderManifest`, `mich.models.collocation`, `mich.models.mich_losses`),
+uses `[B, C, L, T, H, W]` (channel-first, layer before time) instead. The decoder's
+`forward` is where that flip happens; there is no shared symbolic name for both
+orders because they never coexist in the same tensor.
+
+Heinzle signal vocabulary: `HEINZLE_SIGNALS` (0=x, 1=s, 2=f, 3=v, 4=q, 5=vstar,
+6=qstar) is the canonical channel ordering for every `[..., 7, ...]` tensor in this
+module and in `mich.models.collocation`/`mich.models.mich_losses`. `x` is the neural
+drive (forcing input, not itself governed by an ODE here); `s, f, v, q` are the
+Heinzle/Balloon-Windkessel state variables; `vstar, qstar` are the delayed
+inter-layer vascular-drainage terms, present only when a model is built with
+`out_channels=7` (multi-layer/drain mode) -- `HEINZLE_SIGNALS_SINGLE` (5 channels,
+no vstar/qstar) is used for single-layer/no-drain configs.
+"""
+
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping
 
@@ -86,6 +111,23 @@ HEINZLE_ACTIVATIONS_ORDERED: list[ChannelActivation] = [
 
 
 def _init_heinzle_output_bias(out_conv: nn.Conv2d, L: int) -> None:
+    """In-place: set `out_conv`'s per-channel bias so the network starts near the
+    Balloon model's resting state before any training.
+
+    `softplus_inv_1` (0.5413) is the pre-activation value whose softplus equals
+    exactly 1.0 -- the physiological resting baseline for f, v, q. `softplus_inv_0`
+    (-3.0) gives softplus ≈ 0.05 as x's bias; x uses an identity activation
+    elsewhere (see `HEINZLE_ACTIVATIONS`), so this only matters as a small,
+    near-zero starting point for the resting neural drive.
+
+    Args:
+        out_conv: 7-channel output conv layer to mutate in place (weights are
+            untouched; only `.bias` is written).
+        L: Present only for interface symmetry with other init helpers; unused.
+
+    Raises:
+        ValueError: If `out_conv.bias` is None, or `out_conv.out_channels != 7`.
+    """
     if out_conv.bias is None:
         raise ValueError("Expected out_conv to have a bias for Heinzle output initialization.")
     if out_conv.out_channels != 7:
@@ -110,6 +152,22 @@ def _init_heinzle_output_bias(out_conv: nn.Conv2d, L: int) -> None:
 
 
 class MaskedLayerMixing(nn.Module):
+    """Mix each cortical layer with the layer immediately below it, then expand
+    1 -> C channels independently per layer.
+
+    The 1x1 "conv2d" over the layer axis is restricted by `mask` (see
+    `_generate_mask`) to only ever mix a layer with itself and the layer below,
+    modelling one-directional vascular drainage/point-spread bleed-through
+    between adjacent layers rather than an unrestricted L x L mixing matrix.
+
+    Args:
+        L: Number of cortical layers.
+        C: Output channel count per layer after `expand_net`.
+        init_identity: If True, initialise the per-layer mixing weight `W` to
+            the identity (each layer starts as an unmixed copy of itself; the
+            below-layer coupling is learned away from zero during training).
+    """
+
     def __init__(self, L: int = 3, C: int = 16, init_identity: bool = True):
         super().__init__()
         self.C = int(C)
@@ -128,6 +186,10 @@ class MaskedLayerMixing(nn.Module):
                     self.W[i, i, 0, 0] = 1.0
 
     def _generate_mask(self) -> None:
+        """Register the `[L, L, 1, 1]` conv-weight mask: `mask[i, i] = 1` (self) and
+        `mask[i, i-1] = 1` (the layer below), zero elsewhere -- multiplied elementwise
+        against the learnable `W` in `forward` so gradient descent can never populate
+        a masked-out (self, above, or non-adjacent) coupling."""
         mask = torch.zeros((self.L, self.L), dtype=torch.float32)
         idx = torch.arange(self.L)
         mask[idx, idx] = 1.0
@@ -136,6 +198,16 @@ class MaskedLayerMixing(nn.Module):
         self.register_buffer("mask", mask.view(self.L, self.L, 1, 1), persistent=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, L, T, H, W] BOLD (or any single-channel per-layer input).
+
+        Returns:
+            [B, T, L, C, H, W] -- masked layer mix, then per-layer 1 -> C expansion.
+
+        Raises:
+            AssertionError: If `x`'s layer count doesn't match `self.L`.
+        """
         B, L, T, H, W = x.shape
         if L != self.L:
             raise AssertionError(f"Expected input with {self.L} layers, got {L}")
@@ -154,6 +226,8 @@ class MaskedLayerMixing(nn.Module):
 
 
 class DepthWiseSeparableConvLayer(nn.Module):
+    """Depthwise spatial conv -> pointwise channel mix -> GroupNorm -> activation."""
+
     def __init__(
         self,
         cin: int,
@@ -193,6 +267,13 @@ class DepthWiseSeparableConvLayer(nn.Module):
 
 
 class SpatialEncoder(nn.Module):
+    """Stack of `DepthWiseSeparableConvLayer`s applied independently at every
+    (batch, timestep, layer) -- i.e. purely spatial, no temporal or cross-layer
+    mixing here (that happens in `TemporalMixingEncoder` and `MaskedLayerMixing`
+    respectively). Each layer runs under `torch.utils.checkpoint` to trade
+    recompute for activation memory.
+    """
+
     def __init__(self, module_config: list[Mapping[str, Any]]):
         super().__init__()
         self.module = nn.ModuleList()
@@ -200,6 +281,14 @@ class SpatialEncoder(nn.Module):
             self.module.append(DepthWiseSeparableConvLayer(**config))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, T, L, C, H, W].
+
+        Returns:
+            [B, T, L, C', H, W] -- C' is the last layer's `cout`; H, W unchanged
+            (every conv here is stride/padding-preserving).
+        """
         B, T, L, C, H, W = x.shape
         x = x.reshape(B * T * L, C, H, W)  # [B*T*L, C, H, W]
         for layer in self.module:
@@ -210,6 +299,15 @@ class SpatialEncoder(nn.Module):
 
 
 class TemporalDepthWiseTCNLayer(nn.Module):
+    """Depthwise-separable 1D temporal conv with a residual connection.
+
+    Warning:
+        Padding is symmetric (`forward` pads both sides of the kernel equally),
+        so this layer is non-causal: its output at timestep t can depend on
+        input at t' > t. `dilation` (set by `TemporalMixingEncoder`) controls
+        how far in both directions.
+    """
+
     def __init__(
         self,
         cin: int,
@@ -250,6 +348,16 @@ class TemporalDepthWiseTCNLayer(nn.Module):
 
 
 class TemporalMixingEncoder(nn.Module):
+    """Stack of `TemporalDepthWiseTCNLayer`s applied independently per voxel
+    (every (batch, layer, h, w) is its own length-T sequence).
+
+    Args:
+        module_config: Per-layer kwargs for `TemporalDepthWiseTCNLayer`.
+        auto_dilation: If True, layer i's dilation is overridden to `2**i`
+            (exponentially growing receptive field with depth), overwriting
+            any `dilation` given in `module_config[i]`.
+    """
+
     def __init__(self, module_config: list[Mapping[str, Any]], auto_dilation: bool = True):
         super().__init__()
         self.num_layers = len(module_config)
@@ -263,6 +371,14 @@ class TemporalMixingEncoder(nn.Module):
             self.module.append(TemporalDepthWiseTCNLayer(**layer_config))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, T, L, C, H, W].
+
+        Returns:
+            [B, T, L, C, H, W] -- same shape; channel count is preserved by
+            every `TemporalDepthWiseTCNLayer` (cin==cout, residual add).
+        """
         B, T, L, C, H, W = x.shape
 
         # Flatten spatial and latent dimensions into batch dimension
@@ -279,6 +395,15 @@ class TemporalMixingEncoder(nn.Module):
 
 
 class FourierTimeEmbedding(nn.Module):
+    """Sinusoidal (NeRF-style) time embedding: log-spaced frequencies, each
+    contributing a sin and a cos feature, for conditioning `TimeFiLM`.
+
+    Args:
+        num_freqs: Number of log-spaced frequencies between `min_freq` and
+            `max_freq`; output width is `2 * num_freqs` (sin + cos per freq).
+        min_freq, max_freq: Endpoints of the log-spaced frequency range.
+    """
+
     def __init__(self, num_freqs: int = 16, min_freq: float = 0.1, max_freq: float = 10.0):
         super().__init__()
         self.num_freqs = int(num_freqs)
@@ -296,8 +421,17 @@ class FourierTimeEmbedding(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
-        t: [B, T] (or [T], or [B,T,1])
-        returns: [B, T, 2F] (or [T, 2F] if input was [T])
+        Args:
+            t: [B, T] (or [T], or [B, T, 1]).
+
+        Returns:
+            [B, T, 2F] (or [T, 2F] if input was [T]); F = `self.num_freqs`.
+
+        Note:
+            The trig computation runs in float32 with autocast disabled
+            regardless of `t`'s input dtype/device autocast state, to avoid
+            dtype-promotion surprises in the sin/cos ops; the output is
+            float32 even under a bf16/fp16 autocast context.
         """
         # Squeeze trailing singleton dim if present
         if t.dim() >= 1 and t.shape[-1] == 1:
@@ -321,6 +455,17 @@ class FourierTimeEmbedding(nn.Module):
 
 
 class TimeFiLM(nn.Module):
+    """Feature-wise Linear Modulation (FiLM): maps a conditioning embedding to a
+    per-channel (gamma, beta) pair, applied elsewhere as `gamma * features + beta`.
+
+    Args:
+        embed_dim: Width of the input conditioning embedding `e_t`.
+        hidden_dim: Width of the single hidden layer between `embed_dim` and
+            the `2 * c_dec`-wide (gamma, beta) output.
+        activation: Name passed to `get_activation` for the hidden layer.
+        c_dec: Width of the modulated feature space gamma/beta apply to.
+    """
+
     def __init__(self, embed_dim: int, hidden_dim: int, activation: str, c_dec: int):
         super().__init__()
         self.c_dec = int(c_dec)
@@ -330,8 +475,14 @@ class TimeFiLM(nn.Module):
 
     def forward(self, e_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        e_t: [..., E]
-        returns gamma, beta: [..., c_dec]
+        Args:
+            e_t: [..., E] conditioning embedding, E = `embed_dim`.
+
+        Returns:
+            (gamma, beta), each [..., c_dec].
+
+        Raises:
+            ValueError: If `e_t` has no dimensions (0-d).
         """
         if e_t.dim() < 1:
             raise ValueError(f"Expected e_t with at least 1 dim (E). Got shape {tuple(e_t.shape)}")
@@ -388,6 +539,30 @@ class SpatioTemporalDecoder(nn.Module):
         upsample: bool = False,
         signals: list[HeinzleSignal] = HEINZLE_SIGNALS,
     ):
+        """
+        Args:
+            cin: Input channel count (from `TemporalMixingEncoder`).
+            c_dec: Shared spatial-decoder width (`self.conv`'s output).
+            out_channels: Must equal `len(signals)` (7, or 5 for
+                `HEINZLE_SIGNALS_SINGLE`).
+            activation: Name passed to `get_activation` for `self.conv`.
+            L: Number of cortical layers; one output head per (signal, layer).
+            temporal_film_config: Kwargs for `TimeFiLM`, minus `embed_dim`/
+                `c_dec`, which this class computes and injects itself.
+            temporal_embedding_config: Kwargs for `FourierTimeEmbedding`.
+            c_film: Width of the FiLM bottleneck (`self.signal_proj`'s output),
+                shared across signals before each signal's own output head.
+            layer_embed_dim, signal_embed_dim: Widths of the learned layer- and
+                signal-identity embeddings concatenated into the FiLM input.
+            upsample: If True, 2x bilinear-upsample spatial features before
+                `self.conv` (and update H, W accordingly).
+            signals: Which Heinzle signals this decoder predicts, and in what
+                channel order; must all be valid `HEINZLE_ACTIVATIONS` keys.
+
+        Raises:
+            AssertionError: If any `signals` entry isn't a valid Heinzle
+                signal, or if `out_channels != len(signals)`.
+        """
         super().__init__()
 
         assert all(
@@ -448,6 +623,25 @@ class SpatioTemporalDecoder(nn.Module):
         *,
         return_gradients: bool = False,
     ) -> SpatialDecoderManifest:
+        """
+        Args:
+            x: [B, T, L, C_in, H, W].
+            t: [B, T], the [0, 1]-normalised time grid (see
+                `CollocationMixin._make_time_grid`).
+            return_gradients: If True, also compute `dz_hat_dt` (analytic d/dt
+                of the post-activation states); otherwise `SpatialDecoderManifest.grads`
+                is None and the whole derivative branch below is skipped.
+
+        Returns:
+            `SpatialDecoderManifest` with `z_hat`: [B, 7, L, T, H, W], and
+            `grads` of the same shape if `return_gradients`, else None.
+
+        Note:
+            The derivative branch runs under `torch.autocast(..., enabled=False)`
+            in float32 -- see the inline comment below for why a single
+            precision boundary is used for the whole branch rather than only
+            around the vmap/jacrev call.
+        """
         u, (B, T, L, H, W) = self._pre_film_features(x)
         gamma, beta = self._gamma_beta(t)
 
@@ -731,6 +925,21 @@ class FullySupervisedNet(nn.Module):
 
 
 class HeinzleNet(nn.Module):
+    """Full BOLD -> Heinzle-states network: see the module docstring's pipeline
+    summary. `mich.models.mich.MICH` wraps one instance of this as `heinzle_net`.
+
+    Args:
+        layer_mixing_config: Kwargs for `MaskedLayerMixing`.
+        spatial_encoder_config: Per-layer kwargs list for `SpatialEncoder`.
+        temporal_mixing_config: Per-layer kwargs list for `TemporalMixingEncoder`.
+        time_embedding_config: Kwargs for `FourierTimeEmbedding`, forwarded
+            into `SpatioTemporalDecoder` as `temporal_embedding_config`.
+        time_film_config: Kwargs for `TimeFiLM`, forwarded into
+            `SpatioTemporalDecoder` as `temporal_film_config`.
+        spatial_decoder_config: Remaining `SpatioTemporalDecoder` kwargs.
+        auto_dilation: Forwarded to `TemporalMixingEncoder`.
+    """
+
     def __init__(
         self,
         layer_mixing_config: Mapping[str, Any],
@@ -756,6 +965,16 @@ class HeinzleNet(nn.Module):
     def forward(
         self, x: torch.Tensor, t: torch.Tensor, return_gradients: bool = False
     ) -> SpatialDecoderManifest:
+        """
+        Args:
+            x: [B, L, T, H, W] BOLD input.
+            t: [B, T], the [0, 1]-normalised time grid.
+            return_gradients: Forwarded to `SpatioTemporalDecoder.forward`.
+
+        Returns:
+            `SpatialDecoderManifest` with `z_hat`: [B, 7, L, T, H, W] (and
+            `grads` of the same shape if `return_gradients`).
+        """
         xmix = self.layer_mixing(x)  # [B, T, L, C, H, W]
         xenc = self.spatial_encoder(xmix)  # [B, T, L, C', H, W]
         xmix = self.temporal_mixing(xenc)  # [B, T, L, C', H, W]

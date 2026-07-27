@@ -144,6 +144,39 @@ def test_gather_grad_at_matches_manual_indexing_for_fixed_layer():
     assert torch.equal(gathered[0, 0, 0], expected)
 
 
+def test_gather_z_hat_at_layer_matches_manual_indexing():
+    B, S, L, T, H, W = 2, 7, 3, 6, 4, 4
+    z_hat = torch.randn(B, S, L, T, H, W)
+    n_t, n_s = 4, 2
+    idx = CollocationBatch(
+        t=torch.randint(0, T, (1, 1, n_t, n_s)),
+        h=torch.randint(0, H, (B, 1, n_t, n_s)),
+        w=torch.randint(0, W, (B, 1, n_t, n_s)),
+    )
+    layer = 2
+    gathered = CollocationMixin._gather_z_hat_at_layer(z_hat, idx, layer, signal="f")
+    assert gathered.shape == (B, n_t, n_s)
+    f_idx = CollocationMixin._signal_index("f")
+    expected = z_hat[1, f_idx, layer, idx.t[0, 0, -1, -1], idx.h[1, 0, -1, -1], idx.w[1, 0, -1, -1]]
+    assert torch.equal(gathered[1, -1, -1], expected)
+
+
+def test_gather_bold_at_layer_matches_manual_indexing():
+    B, L, T, H, W = 2, 3, 6, 4, 4
+    bold = torch.randn(B, L, T, H, W)
+    n_t, n_s = 4, 2
+    idx = CollocationBatch(
+        t=torch.randint(0, T, (1, 1, n_t, n_s)),
+        h=torch.randint(0, H, (B, 1, n_t, n_s)),
+        w=torch.randint(0, W, (B, 1, n_t, n_s)),
+    )
+    layer = 1
+    gathered = CollocationMixin._gather_bold_at_layer(bold, idx, layer)
+    assert gathered.shape == (B, n_t, n_s)
+    expected = bold[0, layer, idx.t[0, 0, 0, 0], idx.h[0, 0, 0, 0], idx.w[0, 0, 0, 0]]
+    assert torch.equal(gathered[0, 0, 0], expected)
+
+
 # -----------------------------
 # _sample_collocation_indices
 # -----------------------------
@@ -315,3 +348,103 @@ def test_sample_collocation_indices_partial_dense_frac_produces_uniform_tail():
     near_source = (h_vals - 50).abs() <= 2
     # Not all points should be forced near the source when dense_spatial_frac < 1.
     assert not torch.all(near_source)
+
+
+# -----------------------------
+# _sample_collocation_indices_per_layer
+# -----------------------------
+
+
+def test_sample_collocation_indices_per_layer_returns_one_batch_per_layer_with_right_shapes():
+    B, S, L = 2, 2, 3
+    H, W = 20, 20
+    source_position = torch.randint(0, H, (B, S, 2))
+    source_layer = torch.randint(0, L, (B, S))
+    num_sources = torch.full((B,), S, dtype=torch.long)
+
+    idx_list = CollocationMixin._sample_collocation_indices_per_layer(
+        T=10,
+        H=H,
+        W=W,
+        L=L,
+        n_times=5,
+        n_space=6,
+        device=torch.device("cpu"),
+        source_position=source_position,
+        source_layer=source_layer,
+        num_sources=num_sources,
+        dense_spatial_frac=0.5,
+        dense_spatial_radius=2,
+    )
+    assert len(idx_list) == L
+    for idx in idx_list:
+        assert idx.h.shape == (B, 1, 5, 6)
+        assert idx.w.shape == (B, 1, 5, 6)
+        assert idx.h.min() >= 0 and idx.h.max() < H
+        assert idx.w.min() >= 0 and idx.w.max() < W
+
+
+def test_sample_collocation_indices_per_layer_dense_draws_use_only_this_layers_sources():
+    """A layer's dense collocation points must cluster around its own source(s) only --
+    not another layer's source, even though _sample_collocation_indices' pooled
+    round-robin would mix them."""
+    H, W = 100, 100
+    radius = 2
+    # Layer 0's source and layer 1's source sit far apart so we can tell which one any
+    # given dense draw clustered around.
+    source_position = torch.tensor([[[10, 10], [80, 80]]], dtype=torch.long)  # [B, S=2, 2]
+    source_layer = torch.tensor([[0, 1]])  # source 0 -> layer 0, source 1 -> layer 1
+    num_sources = torch.tensor([2])
+
+    idx_list = CollocationMixin._sample_collocation_indices_per_layer(
+        T=10,
+        H=H,
+        W=W,
+        L=2,
+        n_times=6,
+        n_space=6,
+        device=torch.device("cpu"),
+        source_position=source_position,
+        source_layer=source_layer,
+        num_sources=num_sources,
+        dense_spatial_frac=1.0,  # all points dense
+        dense_spatial_radius=radius,
+    )
+    h0, w0 = idx_list[0].h[0, 0].reshape(-1), idx_list[0].w[0, 0].reshape(-1)
+    h1, w1 = idx_list[1].h[0, 0].reshape(-1), idx_list[1].w[0, 0].reshape(-1)
+
+    assert torch.all((h0 - 10).abs() <= radius) and torch.all((w0 - 10).abs() <= radius)
+    assert torch.all((h1 - 80).abs() <= radius) and torch.all((w1 - 80).abs() <= radius)
+
+
+def test_sample_collocation_indices_per_layer_falls_back_to_uniform_without_own_source():
+    """A sample where this layer has zero sources of its own must not cluster around a
+    different layer's source location -- it should fall back to a uniform draw."""
+    H, W = 100, 100
+    radius = 2
+    # Only one source, belonging to layer 0. Layer 1 has none.
+    source_position = torch.tensor([[[10, 10]]], dtype=torch.long)  # [B, S=1, 2]
+    source_layer = torch.tensor([[0]])
+    num_sources = torch.tensor([1])
+
+    idx_list = CollocationMixin._sample_collocation_indices_per_layer(
+        T=10,
+        H=H,
+        W=W,
+        L=2,
+        n_times=6,
+        n_space=20,
+        device=torch.device("cpu"),
+        source_position=source_position,
+        source_layer=source_layer,
+        num_sources=num_sources,
+        dense_spatial_frac=1.0,
+        dense_spatial_radius=radius,
+    )
+    h1 = idx_list[1].h[0, 0].reshape(-1)
+    w1 = idx_list[1].w[0, 0].reshape(-1)
+    near_layer0_source = (h1 - 10).abs() <= radius
+    # With a uniform fallback over a 100x100 grid and 120 draws, landing within a
+    # radius-2 box (25 cells) of (10, 10) on every single draw is not a real fallback.
+    assert not torch.all(near_layer0_source)
+    assert w1.max() > 10 + radius or h1.max() > 10 + radius

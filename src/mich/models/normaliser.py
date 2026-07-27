@@ -37,10 +37,16 @@ class LayerwiseBOLDNormalizer(nn.Module):
 
     @property
     def frozen(self) -> bool:
+        """True once `step` (incremented once per `_welford_update` call, i.e.
+        once per training forward pass, not per optimizer step) reaches
+        `freeze_after_steps` -- from then on, `forward` stops updating the
+        running statistics and always normalises with the frozen values."""
         return self.step.item() >= self.freeze_after_steps
 
     @property
     def running_var(self) -> torch.Tensor:
+        """Unbiased running variance; `1.0` (not `0.0`) if fewer than 2 samples
+        have been seen yet, so `forward`'s `std.sqrt()` never divides by 0 this way."""
         if self.running_count < 2:
             return torch.ones_like(self.running_M2)
         return self.running_M2 / (self.running_count - 1)
@@ -91,6 +97,29 @@ class LayerwiseBOLDNormalizer(nn.Module):
     def _welford_update(
         self, bold: torch.Tensor, source_position: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fold this batch's source-neighbourhood values into the running
+        mean/variance (Welford's parallel-combination formula), in place, and
+        return this batch's own (unpooled-with-history) mean/var.
+
+        Under DDP, this batch's per-rank mean/M2 are combined into one global
+        batch statistic before folding into the running stats, via a single
+        `all_reduce(SUM)` on `[mean*n, M2 + n*mean**2]` packed together --
+        packing avoids a second collective call, at the cost of the
+        `M2_global = packed[1] - n_global*mean_global**2` reconstruction (a
+        difference of two similarly-sized terms, so cancellation error grows
+        with world size and batch variance, unlike a variance computed
+        directly from the pooled global data).
+
+        Args:
+            bold: [B, L, T, H, W]; detached and cast to float32 before use --
+                does not track gradients regardless of `bold`'s own grad state.
+            source_position, mask: See `_gather_neighbourhood`.
+
+        Returns:
+            (batch_mean, batch_var), each broadcastable-shape (`[1,1,1,1,1]`)
+            -- this batch's (or, under DDP, this step's global) statistics
+            only, not blended with the running history.
+        """
         bold = bold.detach().float()
 
         neighbourhood = self._gather_neighbourhood(bold, source_position, mask)  # [M, L, T, N]
@@ -131,6 +160,32 @@ class LayerwiseBOLDNormalizer(nn.Module):
         num_sources: torch.Tensor | None = None,
         pause_update: bool = False,
     ) -> torch.Tensor:
+        """Normalise `bold` to `(bold - mean) / std`, clamped to [-10, 10].
+
+        Note:
+            Impure: behaviour depends on `self.training` and `self.frozen`
+            (hidden module state), not just the arguments. While training and
+            not yet frozen and not `pause_update`, this also updates the
+            running statistics (via `_welford_update`) as a side effect and
+            normalises with this batch's own (not-yet-blended-in) mean/std;
+            otherwise it normalises with the current running statistics and
+            has no side effect.
+
+        Args:
+            bold: [B, L, T, H, W].
+            source_position, num_sources: Required (raises if missing) exactly
+                when this call will update the running statistics; unused
+                otherwise. See *Source metadata convention* in
+                `mich.models.mich_losses`'s module docstring.
+            pause_update: If True, skip the statistics update this call even
+                while training and not frozen (still normalises with the
+                current running statistics, not this batch's own).
+
+        Raises:
+            ValueError: If a statistics update would run (training, not
+                frozen, not paused) but `source_position`/`num_sources` are
+                None.
+        """
         input_dtype = bold.dtype
         bold_f32 = bold.float()
 
@@ -151,10 +206,21 @@ class LayerwiseBOLDNormalizer(nn.Module):
         return ((bold_f32 - mean) / std).clamp(-10.0, 10.0).to(input_dtype)
 
     def normalize(self, bold: torch.Tensor) -> torch.Tensor:
+        """`forward` with the running (not this-batch) statistics and no side
+        effect, regardless of `self.training`/`self.frozen` -- e.g. for
+        inference call sites that never want a statistics update."""
         input_dtype = bold.dtype
         std = self.running_var.sqrt().clamp(min=1e-3)
         return ((bold.float() - self.running_mean) / std).clamp(-10.0, 10.0).to(input_dtype)
 
     def denormalize(self, bold_norm: torch.Tensor) -> torch.Tensor:
+        """Inverse of `normalize`/`forward`'s linear transform: `bold_norm * std
+        + mean`, using the current running statistics.
+
+        Warning:
+            Not an exact inverse if the input was originally clamped to
+            [-10, 10] by `normalize`/`forward` -- values that saturated the
+            clamp cannot be recovered.
+        """
         std = self.running_var.sqrt().clamp(min=1e-3)
         return (bold_norm.float() * std + self.running_mean).to(bold_norm.dtype)

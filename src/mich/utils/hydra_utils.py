@@ -73,9 +73,12 @@ def print_config(
 
     Args:
         cfg: Configuration composed by Hydra.
-        print_order: Determines in what order config components are printed.
+        print_order: Config groups to print, in this order (a group missing
+            from `cfg` is skipped with a warning, not an error). Any group in
+            `cfg` but not listed here is still printed, ahead of all of
+            these, in the *reverse* of its order in `cfg` (each unlisted
+            group found is inserted at the front of the print queue).
         resolve: Whether to resolve reference fields of DictConfig.
-        save_to_file: Whether to export config to the hydra output folder.
     """
 
     style = "dim"
