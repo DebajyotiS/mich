@@ -110,47 +110,6 @@ HEINZLE_ACTIVATIONS_ORDERED: list[ChannelActivation] = [
 ]
 
 
-def _init_heinzle_output_bias(out_conv: nn.Conv2d, L: int) -> None:
-    """In-place: set `out_conv`'s per-channel bias so the network starts near the
-    Balloon model's resting state before any training.
-
-    `softplus_inv_1` (0.5413) is the pre-activation value whose softplus equals
-    exactly 1.0 -- the physiological resting baseline for f, v, q. `softplus_inv_0`
-    (-3.0) gives softplus ≈ 0.05 as x's bias; x uses an identity activation
-    elsewhere (see `HEINZLE_ACTIVATIONS`), so this only matters as a small,
-    near-zero starting point for the resting neural drive.
-
-    Args:
-        out_conv: 7-channel output conv layer to mutate in place (weights are
-            untouched; only `.bias` is written).
-        L: Present only for interface symmetry with other init helpers; unused.
-
-    Raises:
-        ValueError: If `out_conv.bias` is None, or `out_conv.out_channels != 7`.
-    """
-    if out_conv.bias is None:
-        raise ValueError("Expected out_conv to have a bias for Heinzle output initialization.")
-    if out_conv.out_channels != 7:
-        raise ValueError(
-            f"Expected out_conv to have out_channels=7 for Heinzle output initialization, "
-            f"got {out_conv.out_channels}."
-        )
-
-    softplus_inv_1 = 0.5413  # softplus(0.5413)
-    softplus_inv_0 = -3.0  # softplus(-3.0)
-
-    x_idx = HEINZLE_SIGNAL_IDX["x"]
-    f_idx = HEINZLE_SIGNAL_IDX["f"]
-    v_idx = HEINZLE_SIGNAL_IDX["v"]
-    q_idx = HEINZLE_SIGNAL_IDX["q"]
-
-    with torch.no_grad():
-        out_conv.bias.zero_()
-        out_conv.bias[x_idx] = softplus_inv_0
-        for sidx in (f_idx, v_idx, q_idx):
-            out_conv.bias[sidx] = softplus_inv_1
-
-
 class MaskedLayerMixing(nn.Module):
     """Mix each cortical layer with the layer immediately below it, then expand
     1 -> C channels independently per layer.
@@ -252,9 +211,9 @@ class DepthWiseSeparableConvLayer(nn.Module):
         )
         self.pointwise = nn.Conv2d(cin, cout, kernel_size=pw_kernel, bias=False)
 
-        assert (
-            num_groups > 0 and cout % num_groups == 0
-        ), "num_groups must be a positive divisor of cout"
+        assert num_groups > 0 and cout % num_groups == 0, (
+            "num_groups must be a positive divisor of cout"
+        )
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=cout)
         self.activation = get_activation(activation)
 
@@ -317,7 +276,6 @@ class TemporalDepthWiseTCNLayer(nn.Module):
         activation: str = "silu",
     ):
         super().__init__()
-        _pad = (kernel_size - 1) * dilation // 2  # unused, kept for reference
 
         self.depthwise = nn.Conv1d(
             cin,
@@ -330,9 +288,9 @@ class TemporalDepthWiseTCNLayer(nn.Module):
         )
         self.pointwise = nn.Conv1d(cin, cin, kernel_size=1, bias=False)
 
-        assert (
-            num_groups > 0 and cin % num_groups == 0
-        ), "num_groups must be a positive divisor of cin"
+        assert num_groups > 0 and cin % num_groups == 0, (
+            "num_groups must be a positive divisor of cin"
+        )
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=cin)
         self.activation = get_activation(activation)
 
@@ -565,15 +523,15 @@ class SpatioTemporalDecoder(nn.Module):
         """
         super().__init__()
 
-        assert all(
-            s in HEINZLE_ACTIVATIONS for s in signals
-        ), f"All signals must be valid Heinzle signals. Got: {signals}"
+        assert all(s in HEINZLE_ACTIVATIONS for s in signals), (
+            f"All signals must be valid Heinzle signals. Got: {signals}"
+        )
         self.signals = signals
         self.signal_idx: dict[HeinzleSignal, int] = {s: i for i, s in enumerate(signals)}
         N_SIG = len(signals)
-        assert (
-            out_channels == N_SIG
-        ), f"out_channels must match len(signals): out_channels={out_channels}, len(signals)={N_SIG}"
+        assert out_channels == N_SIG, (
+            f"out_channels must match len(signals): out_channels={out_channels}, len(signals)={N_SIG}"
+        )
         channel_activations = [HEINZLE_ACTIVATIONS[s] for s in signals]
         self.L = L
         self.layer_embed_dim = layer_embed_dim

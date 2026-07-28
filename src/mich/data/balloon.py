@@ -283,9 +283,14 @@ def _apply_psf_torch(
 def _generate_bold_noise(shape: tuple[int, ...], noise: Noise, amplitude: float) -> np.ndarray:
     """Additive BOLD-readout noise: white/uniform/pink, seeded from `noise.seed`.
 
-    Pink noise is generated per spatial location independently (1/f-shaped via
-    `1/sqrt(freq)` in the FFT domain along `shape[0]`, the time axis), each then
-    rescaled to zero-mean/unit-std before applying `amplitude`.
+    Delegates to `Noise.generate_temporal`, treating every spatial location as
+    an independent "source" series over the time axis `shape[0]` -- this is
+    the same per-voxel-independent generation `Noise.generate_temporal` itself
+    implements, just reshaped to `(T, *spatial_shape)` instead of `(n_spatial,
+    T)`. A fresh `Noise(type=noise.type, seed=noise.seed)` is built here rather
+    than requiring the caller's `noise` argument to itself be a full `Noise`
+    (only `.type`/`.seed` are needed, e.g. tests can pass any object with just
+    those two attributes).
 
     Args:
         shape: `(T, *spatial_shape)`; must match the BOLD signal it's added to.
@@ -295,42 +300,15 @@ def _generate_bold_noise(shape: tuple[int, ...], noise: Noise, amplitude: float)
 
     Raises:
         ValueError: If `noise.type` isn't "white", "uniform", or "pink".
-
-    Note:
-        This re-implements the same white/uniform/pink generation as
-        `mich.data.signals.Noise.generate`/`generate_temporal`, independently
-        (this one is unconditionally per-voxel spatial; `Noise.generate*`
-        dispatches on `noise.domain`) -- the two are not shared code.
     """
-    rng = np.random.default_rng(noise.seed)
+    T = shape[0]
+    spatial_shape = shape[1:]
+    n_spatial = int(np.prod(spatial_shape)) if spatial_shape else 1
 
-    if noise.type == "white":
-        return rng.normal(0.0, amplitude, size=shape).astype(np.float64)
-
-    if noise.type == "uniform":
-        return rng.uniform(-amplitude, amplitude, size=shape).astype(np.float64)
-
-    if noise.type == "pink":
-        T = shape[0]
-        spatial_shape = shape[1:]
-        n_spatial = int(np.prod(spatial_shape)) if spatial_shape else 1
-
-        freqs = np.fft.rfftfreq(T)
-        freqs[0] = freqs[1] if len(freqs) > 1 else 1.0
-        shaping = 1.0 / np.sqrt(freqs)
-
-        out = np.empty(shape, dtype=np.float64)
-        flat = out.reshape(T, n_spatial)
-        for k in range(n_spatial):
-            x = rng.standard_normal(T)
-            X = np.fft.rfft(x)
-            X *= shaping
-            y = np.fft.irfft(X, n=T)
-            y = (y - y.mean()) / (y.std() + 1e-12)
-            flat[:, k] = amplitude * y
-        return out
-
-    raise ValueError(f"Unknown noise type: {noise.type}")
+    flat = Noise(type=noise.type, seed=noise.seed).generate_temporal(
+        amplitude, n_spatial, T, dt=1.0
+    )  # [n_spatial, T]
+    return flat.T.reshape(shape)
 
 
 def _is_torch(x: object) -> bool:

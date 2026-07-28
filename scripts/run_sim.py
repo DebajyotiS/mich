@@ -8,6 +8,8 @@ from pathlib import Path
 import h5py
 import hydra
 import numpy as np
+from omegaconf import DictConfig, OmegaConf
+
 from mich import CONFIG_DIR
 from mich.data.balloon import (
     AcquisitionConstants,
@@ -22,7 +24,6 @@ from mich.data.balloon import (
 )
 from mich.data.neuronal import LayeredDiffusionSimulator, NeuralSimulatorParams
 from mich.data.signals import Noise, Pulse, Sources
-from omegaconf import DictConfig, OmegaConf
 
 # Maps pulse_type -> ordered extra parameter names (following amplitude and onset).
 _PULSE_EXTRA_PARAMS: dict[str, list[str]] = {

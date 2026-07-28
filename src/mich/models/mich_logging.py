@@ -90,81 +90,6 @@ class MICHLoggingMixin:
             "val/neural/lag_samples": peak_lag,
         }
 
-    def _plot_and_log_x_recon(
-        self, pred_neural, pred_x_recon, true_x_recon, true_neural, source_layer, num_sources
-    ):
-        """Per-sample, per-layer plot of x (head prediction) against its ODE-residual
-        reconstruction from s/f (`_x_phase_loss`'s `x_rhs`), both against ground
-        truth, logged as `media/x_recon`.
-
-        Args:
-            pred_neural, true_neural: [B, L, T] -- head's x prediction / ground truth.
-            pred_x_recon, true_x_recon: [B, L, T-1] -- reconstruction from
-                predicted/true s,f (one shorter than T; presumably a
-                finite-difference reconstruction, though nothing here computes
-                it, so the T-1 convention is only enforced by the caller).
-            source_layer, num_sources: See *Source metadata convention* in
-                `mich.models.mich_losses`'s module docstring; used only to
-                annotate each subplot's title with its source count.
-
-        Note:
-            Not called from `mich.MICH`'s validation path -- exercised only by
-            `tests/test_mich_logging.py`.
-        """
-        adapter = getattr(self, "_adapter", None)
-        layer_names = ["Deep", "Middle", "Superficial"]
-        images = []
-        for i in range(pred_neural.shape[0]):
-            n_layers = pred_neural.shape[1]
-            valid_layers = source_layer[i, : int(num_sources[i])]
-            fig, axes = plt.subplots(1, n_layers, figsize=(8 * n_layers, 8))
-            if n_layers == 1:
-                axes = [axes]
-            for layer_index, ax in enumerate(axes):
-                T = pred_neural.shape[2]
-                t_full = torch.arange(T).float()
-                t_short = torch.arange(T - 1).float()
-                ax.plot(
-                    t_full, true_neural[i, layer_index].cpu().float(), label="True x", color="green"
-                )
-                ax.plot(
-                    t_full,
-                    pred_neural[i, layer_index].cpu().float(),
-                    label="Pred x (head)",
-                    color="purple",
-                    linestyle="--",
-                )
-                ax.plot(
-                    t_short,
-                    pred_x_recon[i, layer_index].cpu().float(),
-                    label="Pred x (recon from s/f)",
-                    color="orange",
-                    linestyle=":",
-                )
-                ax.plot(
-                    t_short,
-                    true_x_recon[i, layer_index].cpu().float(),
-                    label="True x (recon from s/f)",
-                    color="blue",
-                    linestyle=":",
-                )
-                n_src_here = int((valid_layers == layer_index).sum())
-                ax.set_title(
-                    f"{layer_names[layer_index]}"
-                    + (f" [{n_src_here} src]" if n_src_here > 0 else "")
-                )
-                ax.legend(fontsize=6)
-            fig.suptitle("x: head vs ODE reconstruction")
-            fig.tight_layout()
-            images.append(fig)
-        if adapter is not None and images:
-            adapter.log(
-                {"global_step": self.global_step, "media/x_recon": images},
-                commit=False,
-            )
-        for fig in images:
-            plt.close(fig)
-
     def _plot_and_log_predictions(
         self,
         pred_bold,
@@ -339,7 +264,6 @@ class MICHLoggingMixin:
             if head_norms:
                 pending["gradients/out_heads_norm"] = torch.stack(head_norms).norm().item()
 
-        # pending.update(gpu_stats())
         adapter.log(pending)
 
     def on_fit_start(self) -> None:

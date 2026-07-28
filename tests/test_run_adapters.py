@@ -14,6 +14,8 @@ from unittest.mock import MagicMock
 
 import matplotlib.pyplot as plt
 import pytest
+from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
+
 from mich.utils import run_adapters
 from mich.utils.run_adapters import (
     _MlflowRunAdapter,
@@ -23,7 +25,6 @@ from mich.utils.run_adapters import (
     make_run_adapter,
     make_standalone_mlflow_adapter,
 )
-from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
 
 
 def _mk_trainer(*, logger=None, world_size=1, is_global_zero=True):

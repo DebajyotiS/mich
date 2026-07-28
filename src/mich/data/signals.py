@@ -76,7 +76,7 @@ class TriangularPulse:
         return signal
 
 
-@deprecated(reason="TriangularPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
+@deprecated(reason="SincPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
 @dataclass(frozen=True, slots=True)
 class SincPulse:
     """Hamming-windowed sinc pulse of `width` centred at `t_center`, oscillating
@@ -105,7 +105,7 @@ class SincPulse:
         return signal
 
 
-@deprecated(reason="TriangularPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
+@deprecated(reason="AlphaPulse is deprecated. Use RectPulse or ExpDecayPulse instead.")
 @dataclass(frozen=True, slots=True)
 class AlphaPulse:
     """Alpha-function pulse starting at `t_onset`: `amplitude * alpha * t' *
@@ -179,8 +179,7 @@ def _make_pulse(pulse_type: str, peak: Sequence[Any]) -> Any:
     """Build the pulse dataclass named by `pulse_type`, from positional args `peak`.
 
     Args:
-        pulse_type: One of "exp_decay", "rect", "gaussian" (maps to
-            `TriangularPulse`, not a Gaussian pulse), "sinc", "alpha".
+        pulse_type: One of "exp_decay", "rect", "triangular", "sinc", "alpha".
         peak: Positional constructor args for that pulse dataclass.
 
     Raises:
@@ -191,7 +190,7 @@ def _make_pulse(pulse_type: str, peak: Sequence[Any]) -> Any:
         return ExpDecayPulse(*peak)
     if pulse_type == "rect":
         return RectPulse(*peak)
-    if pulse_type == "gaussian":
+    if pulse_type == "triangular":
         return TriangularPulse(*peak)
     if pulse_type == "sinc":
         return SincPulse(*peak)

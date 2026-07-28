@@ -29,7 +29,6 @@ COLOR_HEX = [
     "#bca73a",
 ]
 SIGNALS_LIST = ["bold", "x", "s", "f", "v", "q", "vstar", "qstar"]
-LATENT_NAMES = ["s", "f", "v", "q", "vstar", "qstar"]
 
 
 def plot_neural_bold_layers(

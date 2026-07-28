@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+
 from mich.models.mich_losses import MICHLossMixin
 from mich.models.physio import LearnablePhysioMixin
 
@@ -137,6 +138,42 @@ def test_make_loss_fn_huber_plus_pearson_combines_both_terms():
     assert torch.isclose(fn(pred, true), expected, atol=1e-5)
 
 
+def test_make_loss_fn_mse_plus_pearson_reads_lambda_pearson_at_call_time():
+    """Regression test: lambda_pearson must be re-read on every call, like
+    lambda_npearson already is, so annealing it after _make_loss_fn was built
+    (e.g. MICH._shared_step's x_phase_loss annealing) actually takes effect."""
+    cfg = types.SimpleNamespace(type="mse+pearson", lambda_npearson=1.0, lambda_pearson=0.5)
+    fn = MICHLossMixin._make_loss_fn(cfg)
+    pred, true = torch.randn(3, 5), torch.randn(3, 5)
+    pearson_fn = MICHLossMixin._make_loss_fn(types.SimpleNamespace(type="pearson"))
+
+    before = fn(pred, true)
+    expected_before = 1.0 * torch.nn.functional.mse_loss(pred, true) + 0.5 * pearson_fn(pred, true)
+    assert torch.isclose(before, expected_before, atol=1e-5)
+
+    cfg.lambda_pearson = 5.0
+    after = fn(pred, true)
+    expected_after = 1.0 * torch.nn.functional.mse_loss(pred, true) + 5.0 * pearson_fn(pred, true)
+    assert torch.isclose(after, expected_after, atol=1e-5)
+    assert not torch.isclose(after, before, atol=1e-5)
+
+
+def test_make_loss_fn_huber_plus_pearson_reads_lambda_pearson_at_call_time():
+    cfg = types.SimpleNamespace(
+        type="huber+pearson", huber_delta=0.2, lambda_npearson=1.0, lambda_pearson=0.5
+    )
+    fn = MICHLossMixin._make_loss_fn(cfg)
+    pred, true = torch.randn(3, 5), torch.randn(3, 5)
+    pearson_fn = MICHLossMixin._make_loss_fn(types.SimpleNamespace(type="pearson"))
+
+    cfg.lambda_pearson = 3.0
+    result = fn(pred, true)
+    expected = 1.0 * torch.nn.functional.huber_loss(pred, true, delta=0.2) + 3.0 * pearson_fn(
+        pred, true
+    )
+    assert torch.isclose(result, expected, atol=1e-5)
+
+
 def test_make_loss_fn_unknown_type_raises():
     with pytest.raises(ValueError, match="Unrecognised loss type"):
         MICHLossMixin._make_loss_fn(types.SimpleNamespace(type="bogus"))
@@ -173,34 +210,6 @@ def test_make_grid_loss_fn_huber_plus_pearson_drops_pearson_term():
 def test_make_grid_loss_fn_plain_mse_unaffected():
     fn = MICHLossMixin._make_grid_loss_fn(types.SimpleNamespace(type="mse"))
     assert fn is torch.nn.functional.mse_loss
-
-
-# -----------------------------
-# _compute_bold / _compute_bold_at
-# -----------------------------
-
-
-def test_compute_bold_at_matches_manual_gather_and_formula():
-    from mich.models.collocation import CollocationBatch
-
-    B, L, T, H, W = 2, 2, 6, 5, 5
-    z_hat = torch.rand(B, 7, L, T, H, W) + 0.5  # keep v away from 0
-    idx = CollocationBatch(
-        t=torch.randint(0, T, (1, 1, 3, 2)),
-        h=torch.randint(0, H, (B, 1, 3, 2)),
-        w=torch.randint(0, W, (B, 1, 3, 2)),
-    )
-    acq = _mk_acquisition()
-    from mich.data.balloon import AcquisitionConstants
-
-    ac = AcquisitionConstants(k1=acq.k1, k2=acq.k2, k3=acq.k3)
-    bold_at = MICHLossMixin._compute_bold_at(z_hat, idx, ac, V0=0.02)
-
-    v_idx, q_idx = MICHLossMixin._signal_index("v"), MICHLossMixin._signal_index("q")
-    v = z_hat[0, v_idx, 0, idx.t[0, 0, 0, 0], idx.h[0, 0, 0, 0], idx.w[0, 0, 0, 0]]
-    q = z_hat[0, q_idx, 0, idx.t[0, 0, 0, 0], idx.h[0, 0, 0, 0], idx.w[0, 0, 0, 0]]
-    expected = 0.02 * (ac.k1 * (1 - q) + ac.k2 * (1 - q / v) + ac.k3 * (1 - v))
-    assert torch.isclose(bold_at[0, 0, 0, 0], expected, atol=1e-6)
 
 
 # -----------------------------
@@ -682,6 +691,63 @@ def test_physics_loss_with_source_layer_uses_per_layer_collocation():
     assert set(per_eq.keys()) == {"s", "f", "v", "q", "vstar", "qstar"}
 
 
+def test_physics_loss_full_grid_collocation_routes_flag_to_sampler():
+    """loss_config.full_grid_collocation must reach the collocation sampler as
+    full_grid=True, not be silently dropped."""
+    host = _mk_host(full_grid_collocation=True)
+    B, L, T, H, W = 2, 1, 4, 3, 3
+    z_hat, dz_hat_dt = _mk_zhat_dzdt(B, 5, L, T, H, W)
+    source_position = torch.randint(0, 3, (B, 1, 2))
+    num_sources = torch.ones(B, dtype=torch.long)
+
+    calls = []
+    real_fn = MICHLossMixin._sample_collocation_indices
+
+    def spy(**kwargs):
+        calls.append(kwargs.get("full_grid"))
+        return real_fn(**kwargs)
+
+    host._sample_collocation_indices = spy
+    try:
+        host._physics_loss(
+            z_hat,
+            dz_hat_dt,
+            order="linear",
+            lambda_smooth=0.0,
+            source_position=source_position,
+            num_sources=num_sources,
+        )
+    finally:
+        del host._sample_collocation_indices
+
+    assert calls == [True]
+
+
+def test_data_loss_full_grid_collocation_routes_flag_to_sampler():
+    host = _mk_host(full_grid_collocation=True)
+    host.normaliser = None
+    B, L, T, H, W = 2, 1, 4, 3, 3
+    z_hat, _ = _mk_zhat_dzdt(B, 5, L, T, H, W)
+    bold_norm = torch.randn(B, L, T, H, W)
+    source_position = torch.randint(0, 3, (B, 1, 2))
+    num_sources = torch.ones(B, dtype=torch.long)
+
+    calls = []
+    real_fn = MICHLossMixin._sample_collocation_indices
+
+    def spy(**kwargs):
+        calls.append(kwargs.get("full_grid"))
+        return real_fn(**kwargs)
+
+    host._sample_collocation_indices = spy
+    try:
+        host._data_loss(z_hat, bold_norm, source_position=source_position, num_sources=num_sources)
+    finally:
+        del host._sample_collocation_indices
+
+    assert calls == [True]
+
+
 # -----------------------------
 # _supervision_keys
 # -----------------------------
@@ -866,6 +932,33 @@ def test_supervision_loss_grid_uses_grid_fn_and_dense_uses_dense_fn():
     assert all(len(shape) == 3 for shape in grid_calls)  # [B, n_times, n_space]
     assert len(dense_calls) == n_sig  # one dense call per signal
     assert all(len(shape) == 2 for shape in dense_calls)  # [M, T_min]
+
+
+def test_supervision_loss_full_grid_collocation_routes_flag_to_sampler():
+    """loss_config.full_grid_collocation must reach the (always per-layer)
+    collocation sampler _supervision_loss uses, as full_grid=True."""
+    host = _mk_host(full_grid_collocation=True)
+    B, L, T, H, W = 2, 1, 6, 3, 3
+    batch = _mk_supervision_batch(B, L, T, H, W)
+    z_hat = torch.randn(B, 7, L, T, H, W)
+    source_position = torch.randint(0, 3, (B, 1, 2))
+    source_layer = torch.zeros(B, 1, dtype=torch.long)
+    num_sources = torch.ones(B, dtype=torch.long)
+
+    calls = []
+    real_fn = MICHLossMixin._sample_collocation_indices_per_layer
+
+    def spy(**kwargs):
+        calls.append(kwargs.get("full_grid"))
+        return real_fn(**kwargs)
+
+    host._sample_collocation_indices_per_layer = spy
+    try:
+        host._supervision_loss(z_hat, batch, source_position, source_layer, num_sources)
+    finally:
+        del host._sample_collocation_indices_per_layer
+
+    assert calls == [True]
 
 
 def test_derivative_supervision_loss_matches_analytic_target_when_consistent():

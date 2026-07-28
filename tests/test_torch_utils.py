@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 import torch
-from mich.utils.torch_utils import get_activation, get_normalisation
 from torch import nn
+
+from mich.utils.torch_utils import get_activation, get_normalisation
 
 # -------------------------
 # get_activation

@@ -411,7 +411,6 @@ class SyntheticDataModule(pl.LightningDataModule):
         self.loader_config = dict(loader)
         self.h5_cache_config = dict(h5_cache)
 
-        self.dataset_full: Optional[SyntheticH5Dataset] = None
         self.ds_train: Optional[Subset] = None
         self.ds_val: Optional[Subset] = None
         self.ds_test: Optional[Subset] = None
@@ -469,11 +468,6 @@ class SyntheticDataModule(pl.LightningDataModule):
         after an optional `torch.Generator`-seeded shuffle: `[0:n_train)` ->
         train, `[n_train:n_train+n_val)` -> val, the rest (up to `n_test`) ->
         test -- so train/val/test are always disjoint regardless of shuffling.
-
-        Note:
-            `self.dataset_full` (declared in `__init__`) is never assigned
-            here or anywhere else in this class; the throwaway dataset above
-            is a local variable, not stored on `self`.
         """
         # Use a temporary dataset to get N and compute split indices
         base_cfg = self._resolve_split_cfg("__none__")

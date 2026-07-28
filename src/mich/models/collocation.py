@@ -15,6 +15,11 @@ a "uniform" share drawn independently and uniformly over the whole grid/timeline
 `dense_time_frac` set each share's size. This concentrates collocation coverage
 where the physics loss matters most (near the source, where sudden transients
 happen) while still sampling the full domain.
+
+`full_grid=True` (see `_full_grid_collocation_batch`) bypasses all of the above:
+every `(t, h, w)` in the volume is used instead of a sample, and every other
+sampling knob (`n_times`, `n_space`, `dense_*`, `uniform_time_lo`,
+`source_position`/`num_sources`) is ignored rather than validated.
 """
 
 from __future__ import annotations
@@ -195,6 +200,26 @@ class CollocationMixin:
         return bold[b_idx, l_idx, t, h, w]
 
     @staticmethod
+    def _full_grid_collocation_batch(
+        T: int, H: int, W: int, device: torch.device
+    ) -> CollocationBatch:
+        """Every `(t, h, w)` in the volume, exactly once -- the `full_grid=True`
+        path for both samplers below.
+
+        Slots into the same `[1, 1, n_times, n_space]`-shaped convention as a
+        sampled `CollocationBatch`, with `n_times=T`, `n_space=H*W`, so every
+        existing `_gather_*` method works unchanged. `t` enumerates true
+        chronological order 0..T-1 (broadcast across the H*W axis), so
+        `burn_in` slicing downstream still means "skip the first `burn_in`
+        real timesteps."
+        """
+        t = torch.arange(T, device=device).view(1, 1, T, 1).expand(1, 1, T, H * W)
+        hw = torch.arange(H * W, device=device)
+        h = (hw // W).view(1, 1, 1, H * W).expand(1, 1, T, H * W)
+        w = (hw % W).view(1, 1, 1, H * W).expand(1, 1, T, H * W)
+        return CollocationBatch(t=t, h=h, w=w)
+
+    @staticmethod
     def _sample_collocation_indices(
         *,
         T: int,
@@ -211,6 +236,7 @@ class CollocationMixin:
         dense_time_lo: float = 0.05,
         dense_time_hi: float = 0.55,
         uniform_time_lo: float = 0.05,
+        full_grid: bool = False,
     ) -> CollocationBatch:
         """Draw one shared (t, h, w) collocation set, reused across every layer.
 
@@ -223,22 +249,29 @@ class CollocationMixin:
             T, H, W: Full grid extent to sample within.
             n_times, n_space: Number of collocation timesteps / spatial points
                 to draw (independently; the returned batch has n_times x
-                n_space (t, h, w) points).
+                n_space (t, h, w) points). Ignored if `full_grid`.
             source_position: [B, S, 2] (h, w) per source, or None for
-                source-agnostic (uniform-only) sampling.
+                source-agnostic (uniform-only) sampling. Ignored if `full_grid`.
             num_sources: [B] valid-source count per sample. Required
                 whenever `source_position` is given and the dense share is
-                non-empty.
+                non-empty. Ignored if `full_grid`.
+            full_grid: If True, return `_full_grid_collocation_batch(T, H, W,
+                device)` directly -- every other argument above is ignored.
 
         Raises:
             ValueError: If `source_position` is given, the dense spatial share
-                is non-empty, and `num_sources` is None.
+                is non-empty, and `num_sources` is None. Never raised if
+                `full_grid`.
 
         Returns:
             CollocationBatch with `t`: [1, 1, n_times, n_space], `h`/`w`:
             [1, 1, n_times, n_space] if source-agnostic or [B, 1, n_times,
-            n_space] once source-biased (per-sample source positions differ).
+            n_space] once source-biased (per-sample source positions differ);
+            `n_times=T`, `n_space=H*W` if `full_grid`.
         """
+        if full_grid:
+            return CollocationMixin._full_grid_collocation_batch(T, H, W, device)
+
         n_dense_t = int(n_times * dense_time_frac)
         n_uniform_t = n_times - n_dense_t
 
@@ -316,6 +349,7 @@ class CollocationMixin:
         dense_time_lo: float = 0.05,
         dense_time_hi: float = 0.55,
         uniform_time_lo: float = 0.05,
+        full_grid: bool = False,
     ) -> list[CollocationBatch]:
         """Like _sample_collocation_indices, but draws one independent (t, h, w) set
         per layer instead of sharing a single set across every layer.
@@ -328,7 +362,15 @@ class CollocationMixin:
         source_layer). A sample where this layer has zero sources falls back to a
         uniform draw for its whole dense share, instead of clustering around some
         other layer's source location.
+
+        If `full_grid`, every other argument except `L`/`T`/`H`/`W`/`device` is
+        ignored and every layer gets the same `_full_grid_collocation_batch`
+        (there is no "this layer's own sources" concept once every point is used).
         """
+        if full_grid:
+            batch = CollocationMixin._full_grid_collocation_batch(T, H, W, device)
+            return [batch] * L
+
         B, S = source_layer.shape
         valid = torch.arange(S, device=device)[None, :] < num_sources[:, None]  # [B, S]
 

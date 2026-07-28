@@ -123,15 +123,13 @@ class MICHLossMixin(CollocationMixin):
                 `type="mse"` with all other defaults. Pearson correlation is
                 computed over dim=1 (the time/sequence dimension).
 
-        Warning:
-            For the "mse+pearson"/"huber+pearson" types, `lambda_pearson` is
-            read from `loss_cfg` once here, at build time, and closed over as a
-            plain float; `lambda_npearson` is instead re-read from `loss_cfg`
-            every call. A caller that mutates `loss_cfg.lambda_pearson` after
-            calling this (e.g. to anneal it, as `mich.MICH._shared_step` does
-            for `x_phase_loss`) will silently have no effect on the returned
-            callable -- only mutating `lambda_npearson` actually changes its
-            behaviour.
+        Note:
+            For the "mse+pearson"/"huber+pearson" types, both `lambda_pearson`
+            and `lambda_npearson` are re-read from `loss_cfg` on every call
+            (not captured once at build time), so a caller that mutates either
+            one on `loss_cfg` after calling this (e.g. to anneal it, as
+            `mich.MICH._shared_step` does for `x_phase_loss`) sees the new
+            value take effect on the next call.
 
         Raises:
             ValueError: If `loss_cfg.type` doesn't match a supported name.
@@ -141,7 +139,6 @@ class MICHLossMixin(CollocationMixin):
 
         loss_type = getattr(loss_cfg, "type", "mse")
         huber_delta = getattr(loss_cfg, "huber_delta", 1.0)
-        lambda_pearson = getattr(loss_cfg, "lambda_pearson", 1.0)
 
         def _pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
             pred_c = pred - pred.mean(dim=1, keepdim=True)
@@ -160,6 +157,7 @@ class MICHLossMixin(CollocationMixin):
 
             def _mse_pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
                 lambda_npearson = getattr(loss_cfg, "lambda_npearson", 1.0)
+                lambda_pearson = getattr(loss_cfg, "lambda_pearson", 1.0)
                 return lambda_npearson * F.mse_loss(pred, true) + lambda_pearson * _pearson(
                     pred, true
                 )
@@ -169,6 +167,7 @@ class MICHLossMixin(CollocationMixin):
 
             def _huber_pearson(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
                 lambda_npearson = getattr(loss_cfg, "lambda_npearson", 1.0)
+                lambda_pearson = getattr(loss_cfg, "lambda_pearson", 1.0)
                 return lambda_npearson * F.huber_loss(
                     pred, true, delta=huber_delta
                 ) + lambda_pearson * _pearson(pred, true)
@@ -229,16 +228,6 @@ class MICHLossMixin(CollocationMixin):
         """
         k1, k2, k3 = acquisition.k1, acquisition.k2, acquisition.k3
         return V0 * (k1 * (1 - q) + k2 * (1 - q / v) + k3 * (1 - v))
-
-    @staticmethod
-    def _compute_bold_at(
-        z_hat: torch.Tensor, idx, acquisition: AcquisitionConstants, V0: float
-    ) -> torch.Tensor:
-        """`_compute_bold`, gathering v/q from `z_hat` at `idx`'s collocation points
-        first. `z_hat`: [B, 7, L, T, H, W]; returns [B, L, n_times, n_space]."""
-        v = CollocationMixin._gather_z_hat_at(z_hat, idx, signal="v")
-        q = CollocationMixin._gather_z_hat_at(z_hat, idx, signal="q")
-        return MICHLossMixin._compute_bold(v, q, acquisition, V0)
 
     def _source_activity_loss(
         self,
@@ -322,6 +311,10 @@ class MICHLossMixin(CollocationMixin):
         `_bold_loss_fn` (Pearson included if configured), since that gather really is
         one fixed location's trajectory over all of T.
 
+        If `loss_config.full_grid_collocation` is set, the "collocation" term above
+        is evaluated over every `(t, h, w)` in the volume instead of a sample (see
+        `CollocationMixin._sample_collocation_indices`'s `full_grid` parameter).
+
         Args:
             z_hat: [B, 7, L, T, H, W].
             bold_norm: [B, L, T, H, W], the normalised BOLD the model was
@@ -354,6 +347,7 @@ class MICHLossMixin(CollocationMixin):
             dense_time_lo=lc.dense_time_lo,
             dense_time_hi=lc.dense_time_hi,
             uniform_time_lo=lc.uniform_time_lo,
+            full_grid=bool(getattr(lc, "full_grid_collocation", False)),
         )
         if source_position is not None and source_layer is not None:
             idx_per_layer = self._sample_collocation_indices_per_layer(
@@ -710,6 +704,11 @@ class MICHLossMixin(CollocationMixin):
                 `source_layer` are None, falls back to one collocation draw
                 shared across every layer (pre-per-layer behaviour).
 
+        If `loss_config.full_grid_collocation` is set, every ODE residual below
+        is evaluated over the full `(t, h, w)` volume instead of a collocation
+        sample (see `CollocationMixin._sample_collocation_indices`'s `full_grid`
+        parameter); the smoothness term is unaffected either way (see its Note).
+
         Returns:
             (total_physics_loss, per_eq): `per_eq` maps each equation name
             ("s","f","v","q"[,"vstar","qstar"]) to its own averaged-over-layers
@@ -737,6 +736,7 @@ class MICHLossMixin(CollocationMixin):
             dense_time_lo=lc.dense_time_lo,
             dense_time_hi=lc.dense_time_hi,
             uniform_time_lo=lc.uniform_time_lo,
+            full_grid=bool(getattr(lc, "full_grid_collocation", False)),
         )
         if source_position is not None and source_layer is not None:
             idx_per_layer = self._sample_collocation_indices_per_layer(
@@ -826,6 +826,12 @@ class MICHLossMixin(CollocationMixin):
         Combined the same way _data_loss combines its src_loss and colloc_loss:
         weighted by lambda_src so the known source voxel counts more than an
         arbitrary collocation point, without a second, separately-tuned lambda.
+
+        If `loss_config.full_grid_collocation` is set, the grid component above
+        is evaluated over every `(t, h, w)` in the volume instead of a sample
+        (see `CollocationMixin._sample_collocation_indices`'s `full_grid`
+        parameter) -- the dense component is unaffected either way, since it
+        already always covers every valid source across all of T.
         """
         T_latent = batch["s"].shape[2]
         T_min = min(z_hat.shape[3], T_latent)
@@ -848,6 +854,7 @@ class MICHLossMixin(CollocationMixin):
             dense_time_lo=lc.dense_time_lo,
             dense_time_hi=lc.dense_time_hi,
             uniform_time_lo=lc.uniform_time_lo,
+            full_grid=bool(getattr(lc, "full_grid_collocation", False)),
         )
 
         B = z_hat.shape[0]

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import types
+
 import torch
-import torch.nn.functional as F
 from pytorch_lightning import LightningModule
 
 from mich.models.blocks import FullySupervisedNet
+from mich.models.mich_logging import MICHLoggingMixin
+from mich.models.mich_losses import MICHLossMixin
 from mich.utils.plotting import plot_neural_bold_layers
 from mich.utils.run_adapters import make_rank_zero_adapter
 
@@ -17,6 +20,12 @@ class SupervisedMICH(LightningModule):
     Takes BOLD as input, predicts neural activity with a direct regression head.
     Loss: MSE + Pearson between predicted and true neural at the source voxel.
     No physics loss, no ODE constraints.
+
+    Reuses `MICHLossMixin._make_loss_fn` (for the loss) and
+    `MICHLoggingMixin._neural_recovery_metrics` (for validation metrics) as plain
+    unbound static calls rather than duplicating their logic -- this class does
+    not mix in either class, since it needs none of their other (collocation/
+    physics-loss/per-rank-adapter) machinery.
     """
 
     def __init__(
@@ -33,74 +42,18 @@ class SupervisedMICH(LightningModule):
         self.save_hyperparameters(logger=False, ignore=["net", "normaliser"])
         self.net = net
         self.normaliser = normaliser
+        # Always MSE + Pearson (unlike MICHLossMixin's other callers, this model's
+        # loss_config has no `type` field of its own to select a different combination).
+        self._loss_fn = MICHLossMixin._make_loss_fn(
+            types.SimpleNamespace(
+                type="mse+pearson",
+                lambda_pearson=getattr(loss_config, "lambda_pearson", 1.0),
+            )
+        )
         self._pred_buffer: list[torch.Tensor] = []
         self._neural_buffer: list[torch.Tensor] = []
         self._bold_buffer: list[torch.Tensor] = []
         self._src_pos_buffer: list[torch.Tensor] = []
-
-    # ------------------------------------------------------------------
-    # Loss helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _pearson_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-        """`1 - Pearson correlation` over the last dim, averaged over every
-        other dim -- equivalent to `mich.models.mich_losses.MICHLossMixin
-        ._make_loss_fn`'s `_pearson` helper (dim=1 there vs dim=-1 here;
-        independent implementations of the same formula)."""
-        pred_c = pred - pred.mean(dim=-1, keepdim=True)
-        true_c = true - true.mean(dim=-1, keepdim=True)
-        num = (pred_c * true_c).sum(dim=-1)
-        denom = (pred_c.norm(dim=-1) * true_c.norm(dim=-1)).clamp(min=1e-8)
-        return (1.0 - num / denom).mean()
-
-    def _loss(self, pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
-        """`mse(pred, true) + lambda_pearson * _pearson_loss(pred, true)`;
-        `lambda_pearson` from `self.hparams.loss_config` (default 1.0 if unset
-        or `loss_config` is None)."""
-        lc = self.hparams.loss_config
-        lambda_pearson = getattr(lc, "lambda_pearson", 1.0)
-        return F.mse_loss(pred, true) + lambda_pearson * self._pearson_loss(pred, true)
-
-    # ------------------------------------------------------------------
-    # Metrics (same as MICH)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _neural_recovery_metrics(pred: torch.Tensor, true: torch.Tensor) -> dict[str, float]:
-        """R2, Pearson r, and peak cross-correlation lag; verbatim duplicate of
-        `mich.models.mich_logging.MICHLoggingMixin._neural_recovery_metrics`
-        (see its docstring for the lag computation and the near-constant-row
-        Warning) -- not shared code between the two models."""
-        pred, true = pred.float(), true.float()
-        T = pred.shape[-1]
-        flat_pred = pred.reshape(-1, T)
-        flat_true = true.reshape(-1, T)
-
-        ss_res = ((flat_true - flat_pred) ** 2).sum(dim=-1)
-        ss_tot = ((flat_true - flat_true.mean(dim=-1, keepdim=True)) ** 2).sum(dim=-1)
-        r2 = (1 - ss_res / ss_tot.clamp(min=1e-8)).mean().item()
-
-        p_c = flat_pred - flat_pred.mean(dim=-1, keepdim=True)
-        t_c = flat_true - flat_true.mean(dim=-1, keepdim=True)
-        pearson = (
-            ((p_c * t_c).sum(dim=-1) / (p_c.norm(dim=-1) * t_c.norm(dim=-1)).clamp(min=1e-8))
-            .mean()
-            .item()
-        )
-
-        xcorr = torch.fft.irfft(
-            torch.fft.rfft(flat_true, n=2 * T) * torch.fft.rfft(flat_pred, n=2 * T).conj(),
-            n=2 * T,
-        )
-        lags = torch.fft.fftfreq(2 * T, d=1.0 / (2 * T)).long().to(xcorr.device)
-        peak_lag = lags[xcorr.argmax(dim=-1)].float().mean().item()
-
-        return {
-            "val/neural/r2": r2,
-            "val/neural/pearson": pearson,
-            "val/neural/lag_samples": peak_lag,
-        }
 
     # ------------------------------------------------------------------
     # Forward / shared step
@@ -141,7 +94,7 @@ class SupervisedMICH(LightningModule):
         pred_src = pred_neural[b_idx, :, :, src_h, src_w]  # [B, L, T]
         true_src = true_neural[b_idx, :, :, src_h, src_w]  # [B, L, T]
 
-        loss = self._loss(pred_src, true_src)
+        loss = self._loss_fn(pred_src, true_src)
 
         self.log(
             f"{stage}/loss/total",
@@ -205,7 +158,7 @@ class SupervisedMICH(LightningModule):
         pred_src = pred[b_idx, :, :, src_h, src_w]  # [N, L, T]
         neural_src = neural[b_idx, :, :, src_h, src_w]  # [N, L, T]
 
-        metrics = self._neural_recovery_metrics(pred_src, neural_src)
+        metrics = MICHLoggingMixin._neural_recovery_metrics(pred_src, neural_src)
         adapter = make_rank_zero_adapter(self.trainer)
         if adapter is not None:
             adapter.log({"global_step": self.global_step, **metrics})

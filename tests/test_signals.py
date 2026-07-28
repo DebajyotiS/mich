@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+
 from mich.data.signals import (
     AlphaPulse,
     ExpDecayPulse,
@@ -119,7 +120,7 @@ def test_alpha_pulse_generate_basic():
     [
         ("exp_decay", [1.0, 0.2, 2.0], ExpDecayPulse),
         ("rect", [1.0, 0.2, 0.3], RectPulse),
-        ("gaussian", [1.0, 0.5, 0.4], TriangularPulse),
+        ("triangular", [1.0, 0.5, 0.4], TriangularPulse),
         ("sinc", [1.0, 0.5, 0.4, 3.0], SincPulse),
         ("alpha", [1.0, 0.2, 2.0, 3.0], AlphaPulse),
     ],

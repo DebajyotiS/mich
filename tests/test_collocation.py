@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+
 from mich.models.collocation import CollocationBatch, CollocationMixin
 
 
@@ -351,6 +352,55 @@ def test_sample_collocation_indices_partial_dense_frac_produces_uniform_tail():
 
 
 # -----------------------------
+# _sample_collocation_indices: full_grid
+# -----------------------------
+
+
+def test_sample_collocation_indices_full_grid_covers_every_point_exactly_once():
+    T, H, W = 4, 3, 2
+    idx = CollocationMixin._sample_collocation_indices(
+        T=T,
+        H=H,
+        W=W,
+        n_times=999,  # ignored
+        n_space=999,  # ignored
+        device=torch.device("cpu"),
+        source_position=None,
+        dense_spatial_frac=0.5,  # ignored
+        full_grid=True,
+    )
+    assert idx.t.shape == (1, 1, T, H * W)
+    assert idx.h.shape == (1, 1, T, H * W)
+    assert idx.w.shape == (1, 1, T, H * W)
+
+    triples = {
+        (int(idx.t[0, 0, i, j]), int(idx.h[0, 0, i, j]), int(idx.w[0, 0, i, j]))
+        for i in range(T)
+        for j in range(H * W)
+    }
+    expected = {(t, h, w) for t in range(T) for h in range(H) for w in range(W)}
+    assert triples == expected
+
+
+def test_sample_collocation_indices_full_grid_ignores_source_requirements():
+    """full_grid=True bypasses source_position/num_sources validation entirely --
+    this would normally raise (see test_..._requires_num_sources_with_source_position)."""
+    source_position = torch.zeros(2, 1, 2, dtype=torch.long)
+    idx = CollocationMixin._sample_collocation_indices(
+        T=3,
+        H=2,
+        W=2,
+        n_times=1,
+        n_space=1,
+        device=torch.device("cpu"),
+        source_position=source_position,
+        num_sources=None,
+        full_grid=True,
+    )
+    assert idx.t.shape == (1, 1, 3, 4)
+
+
+# -----------------------------
 # _sample_collocation_indices_per_layer
 # -----------------------------
 
@@ -448,3 +498,40 @@ def test_sample_collocation_indices_per_layer_falls_back_to_uniform_without_own_
     # radius-2 box (25 cells) of (10, 10) on every single draw is not a real fallback.
     assert not torch.all(near_layer0_source)
     assert w1.max() > 10 + radius or h1.max() > 10 + radius
+
+
+# -----------------------------
+# _sample_collocation_indices_per_layer: full_grid
+# -----------------------------
+
+
+def test_sample_collocation_indices_per_layer_full_grid_returns_same_batch_for_every_layer():
+    T, H, W, L = 3, 2, 2, 4
+    source_position = torch.zeros(2, 1, 2, dtype=torch.long)
+    source_layer = torch.zeros(2, 1, dtype=torch.long)
+    num_sources = torch.ones(2, dtype=torch.long)
+
+    idx_list = CollocationMixin._sample_collocation_indices_per_layer(
+        T=T,
+        H=H,
+        W=W,
+        L=L,
+        n_times=1,  # ignored
+        n_space=1,  # ignored
+        device=torch.device("cpu"),
+        source_position=source_position,
+        source_layer=source_layer,
+        num_sources=num_sources,
+        full_grid=True,
+    )
+    assert len(idx_list) == L
+    assert all(batch is idx_list[0] for batch in idx_list)  # one shared batch, reused
+
+    idx = idx_list[0]
+    triples = {
+        (int(idx.t[0, 0, i, j]), int(idx.h[0, 0, i, j]), int(idx.w[0, 0, i, j]))
+        for i in range(T)
+        for j in range(H * W)
+    }
+    expected = {(t, h, w) for t in range(T) for h in range(H) for w in range(W)}
+    assert triples == expected

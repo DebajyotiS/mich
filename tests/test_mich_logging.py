@@ -7,9 +7,10 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
+
 from mich.models import mich_logging
 from mich.models.mich_logging import MICHLoggingMixin
-from pytorch_lightning.loggers import MLFlowLogger, WandbLogger
 
 
 class _LoggingHost(MICHLoggingMixin):
@@ -80,7 +81,7 @@ def test_neural_recovery_metrics_returns_expected_keys_and_finite():
 
 
 # -----------------------------
-# _plot_and_log_predictions / _plot_and_log_latents / _plot_and_log_x_recon
+# _plot_and_log_predictions / _plot_and_log_latents
 # -----------------------------
 
 
@@ -198,24 +199,6 @@ def test_plot_and_log_latents_with_drain_branch_runs():
     kwargs = {k: torch.randn(B, L, T) for k in names}
     host._plot_and_log_latents(**kwargs)
     host._adapter.log.assert_called_once()
-
-
-def test_plot_and_log_x_recon_logs_without_commit():
-    host = _LoggingHost(global_step=30)
-    host._adapter = MagicMock()
-    B, L, T = 2, 1, 6
-    host._plot_and_log_x_recon(
-        pred_neural=torch.randn(B, L, T),
-        pred_x_recon=torch.randn(B, L, T - 1),
-        true_x_recon=torch.randn(B, L, T - 1),
-        true_neural=torch.randn(B, L, T),
-        source_layer=torch.zeros(B, 1, dtype=torch.long),
-        num_sources=torch.ones(B, dtype=torch.long),
-    )
-    host._adapter.log.assert_called_once()
-    (payload,), call_kwargs = host._adapter.log.call_args
-    assert "media/x_recon" in payload
-    assert call_kwargs.get("commit") is False
 
 
 # -----------------------------

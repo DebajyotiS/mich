@@ -1,8 +1,10 @@
 """Unit/integration tests for SupervisedMICH (src/mich/models/supervised.py).
 
 Coverage:
-  - _pearson_loss: correlated / anti-correlated / uncorrelated signals
-  - _neural_recovery_metrics: identical signals, delayed signals, shape/keys
+  - the loss fn built in __init__ (mse+pearson via the shared
+    MICHLossMixin._make_loss_fn) and MICHLoggingMixin._neural_recovery_metrics,
+    which SupervisedMICH calls directly rather than reimplementing: correlated /
+    anti-correlated / uncorrelated signals, identical/delayed signals, shape/keys
   - forward(): normaliser=None passthrough vs. normaliser invoked and its
     output routed into net
   - _shared_step: finite loss; val-stage buffer growth vs. train-stage
@@ -27,12 +29,23 @@ import pytest
 import torch
 import torch.optim
 import torch.optim.lr_scheduler
-from mich.models import supervised
-from mich.models.blocks import FullySupervisedNet
-from mich.models.supervised import SupervisedMICH
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import Callback
 from torch.utils.data import DataLoader, Dataset
+
+from mich.models import supervised
+from mich.models.blocks import FullySupervisedNet
+from mich.models.mich_logging import MICHLoggingMixin
+from mich.models.mich_losses import MICHLossMixin
+from mich.models.supervised import SupervisedMICH
+
+
+def _pearson_loss(pred: torch.Tensor, true: torch.Tensor) -> torch.Tensor:
+    """SupervisedMICH's loss uses 2-D [N, T] tensors, where MICHLossMixin's
+    dim=1 and dim=-1 coincide, so the shared pearson-only loss fn is a drop-in
+    equivalent for these tests."""
+    return MICHLossMixin._make_loss_fn(types.SimpleNamespace(type="pearson"))(pred, true)
+
 
 # -------------------------
 # Module-level constants
@@ -133,20 +146,20 @@ class TestPearsonLoss:
     def test_perfectly_correlated_is_near_zero(self):
         true = torch.randn(4, 16)
         pred = 3.0 * true + 5.0  # affine transform preserves correlation = 1
-        loss = SupervisedMICH._pearson_loss(pred, true)
+        loss = _pearson_loss(pred, true)
         assert loss.item() == pytest.approx(0.0, abs=1e-5)
 
     def test_perfectly_anticorrelated_is_near_two(self):
         true = torch.randn(4, 16)
         pred = -2.0 * true + 1.0
-        loss = SupervisedMICH._pearson_loss(pred, true)
+        loss = _pearson_loss(pred, true)
         assert loss.item() == pytest.approx(2.0, abs=1e-5)
 
     def test_uncorrelated_is_finite_and_between_extremes(self):
         torch.manual_seed(1)
         true = torch.randn(8, 64)
         pred = torch.randn(8, 64)
-        loss = SupervisedMICH._pearson_loss(pred, true)
+        loss = _pearson_loss(pred, true)
         assert torch.isfinite(loss)
         # Independent random signals: correlation should be far from +/-1,
         # i.e. loss should be far from the 0.0 / 2.0 extremes.
@@ -155,7 +168,7 @@ class TestPearsonLoss:
     def test_returns_scalar(self):
         true = torch.randn(4, 16)
         pred = torch.randn(4, 16)
-        loss = SupervisedMICH._pearson_loss(pred, true)
+        loss = _pearson_loss(pred, true)
         assert loss.ndim == 0
 
 
@@ -167,7 +180,7 @@ class TestPearsonLoss:
 class TestNeuralRecoveryMetrics:
     def test_identical_signals_perfect_recovery(self):
         true = torch.randn(3, 2, 32)
-        metrics = SupervisedMICH._neural_recovery_metrics(true.clone(), true)
+        metrics = MICHLoggingMixin._neural_recovery_metrics(true.clone(), true)
         assert metrics["val/neural/r2"] == pytest.approx(1.0, abs=1e-4)
         assert metrics["val/neural/pearson"] == pytest.approx(1.0, abs=1e-4)
         assert metrics["val/neural/lag_samples"] == pytest.approx(0.0, abs=1e-6)
@@ -175,7 +188,7 @@ class TestNeuralRecoveryMetrics:
     def test_keys_present(self):
         true = torch.randn(2, 16)
         pred = torch.randn(2, 16)
-        metrics = SupervisedMICH._neural_recovery_metrics(pred, true)
+        metrics = MICHLoggingMixin._neural_recovery_metrics(pred, true)
         assert set(metrics.keys()) == {
             "val/neural/r2",
             "val/neural/pearson",
@@ -195,7 +208,7 @@ class TestNeuralRecoveryMetrics:
         T = 32
         true = torch.randn(1, T)
         pred = torch.roll(true, shifts=k, dims=-1)
-        metrics = SupervisedMICH._neural_recovery_metrics(pred, true)
+        metrics = MICHLoggingMixin._neural_recovery_metrics(pred, true)
         assert metrics["val/neural/lag_samples"] == pytest.approx(-k, abs=1e-6)
         # A pure relabeling (roll) still gives perfect r2/pearson once the
         # correct lag is discounted -- but r2/pearson here are computed
@@ -208,7 +221,7 @@ class TestNeuralRecoveryMetrics:
         """Leading dims (e.g. [N, L]) are flattened to rows of length T before reduction."""
         pred = torch.randn(5, 3, 20)
         true = torch.randn(5, 3, 20)
-        metrics = SupervisedMICH._neural_recovery_metrics(pred, true)
+        metrics = MICHLoggingMixin._neural_recovery_metrics(pred, true)
         # Just confirm it runs on multi-dim leading shape and returns finite scalars.
         assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
 

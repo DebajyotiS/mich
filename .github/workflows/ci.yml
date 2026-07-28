@@ -37,7 +37,7 @@ jobs:
       - name: Ruff lint
         run: |
           . .venv/bin/activate
-          ruff check src tests --fix
+          ruff check src tests
 
       - name: Ruff format
         run: |

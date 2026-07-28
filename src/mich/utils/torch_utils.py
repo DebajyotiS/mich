@@ -1,18 +1,13 @@
 """Activation/normalisation factories and elementwise activation derivatives.
 
-The `_*_deriv` functions each compute the analytic derivative of one activation,
-for use where a caller needs d/dx of an activation it applies elsewhere (e.g.
-`blocks.HEINZLE_ACTIVATIONS` pairs an activation with its derivative for the
-chain-rule computation in `SpatioTemporalDecoder._apply_activation_derivatives`).
-Only `_softplus_deriv` is currently wired into that pairing; `_sigmoid_deriv`,
-`_one_plus_softplus`, `_neg_softplus_neg`, `_neg_softplus_neg_deriv`, and
-`_tanh_deriv` have no caller in `src/` and are exercised only by
-`tests/test_grads.py`.
+`_softplus_deriv` computes the analytic derivative of softplus, for use where a
+caller needs d/dx of an activation it applies elsewhere: `blocks.HEINZLE_ACTIVATIONS`
+pairs it with `F.softplus` for the chain-rule computation in
+`SpatioTemporalDecoder._apply_activation_derivatives`.
 """
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 
 def get_activation(activation: str) -> nn.Module:
@@ -95,33 +90,6 @@ def get_normalisation(normalisation: str, input_dims: int, **kwargs):
             raise ValueError(f"Unsupported normalisation: {normalisation}")
 
 
-def _sigmoid_deriv(x: torch.Tensor) -> torch.Tensor:
-    """d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))"""
-    s = torch.sigmoid(x)
-    return s * (1.0 - s)
-
-
 def _softplus_deriv(x: torch.Tensor) -> torch.Tensor:
     """d/dx softplus(x) = sigmoid(x)"""
     return torch.sigmoid(x)
-
-
-def _one_plus_softplus(x: torch.Tensor) -> torch.Tensor:
-    """1 + softplus(x) -- smooth, bounded below by 1."""
-    return 1.0 + F.softplus(x)
-
-
-def _neg_softplus_neg(x: torch.Tensor) -> torch.Tensor:
-    """-softplus(-x)  -- non-positive, smooth"""
-    return -F.softplus(-x)
-
-
-def _neg_softplus_neg_deriv(x: torch.Tensor) -> torch.Tensor:
-    """d/dx [-softplus(-x)] = sigmoid(x) - 1"""
-    return torch.sigmoid(x) - 1.0
-
-
-def _tanh_deriv(x: torch.Tensor) -> torch.Tensor:
-    """d/dx tanh(x) = 1 - tanh^2(x)"""
-    t = torch.tanh(x)
-    return 1.0 - t * t

@@ -172,6 +172,10 @@ loss_config:
   dense_time_lo: 0.0
   dense_time_hi: 0.70
   uniform_time_lo: 0.0
+  # If true, overrides n_space/n_time/dense_*/uniform_time_lo above entirely: the
+  # data/physics/grid-supervision losses see every (t, h, w) in the volume instead
+  # of a sampled subset. Off by default -- only affordable on small grids/durations.
+  full_grid_collocation: false
   burn_in: 0
   supervision_loss:
     type: "mse+pearson"
