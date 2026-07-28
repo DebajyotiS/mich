@@ -54,6 +54,12 @@ target-version = "py313"
 select = ["E", "F", "I", "B"]
 ignore = ["E203", "E266", "E501"]
 
+[tool.ruff.lint.isort]
+# wandb writes a `wandb/` run-log directory at the repo root; without this,
+# ruff's first-party auto-detection mistakes it for the wandb package itself,
+# making import sort order depend on whether that local directory exists.
+known-third-party = ["wandb"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

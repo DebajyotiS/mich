@@ -11,12 +11,11 @@ import hydra
 import rich
 import rich.syntax
 import rich.tree
+import wandb
 from lightning import LightningModule, Trainer
 from lightning_fabric.utilities.rank_zero import rank_zero_only
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from pytorch_lightning.loggers import MLFlowLogger
-
-import wandb
 
 log = logging.getLogger(__name__)
 

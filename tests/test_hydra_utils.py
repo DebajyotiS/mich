@@ -11,10 +11,10 @@ import pytest
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import wandb
 from omegaconf import OmegaConf
 from pytorch_lightning.loggers import MLFlowLogger
 
-import wandb
 from mich.utils.hydra_utils import (
     instantiate_collection,
     log_hyperparameters,
