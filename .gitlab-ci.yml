@@ -1,6 +1,7 @@
 stages:
   - lint
   - test
+  - mutation
 
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
@@ -53,3 +54,13 @@ pytest:
       - coverage.xml
       - htmlcov/
     expire_in: 7 days
+
+# Coverage says which lines ran; it cannot say whether a test would notice if
+# those lines were wrong. This job injects a curated set of physics defects and
+# fails if the suite stays green. See tools/mutation_gate.py.
+mutation-gate:
+  stage: mutation
+  <<: *install_deps
+  script:
+    - . .venv/bin/activate
+    - python tools/mutation_gate.py

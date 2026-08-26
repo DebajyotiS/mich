@@ -203,6 +203,25 @@ pytest -m "not slow and not gpu"
 
 Unit tests live in `tests/`, one file per source module. `tests/diagnostics/` holds a separate suite of end-to-end diagnostics (lag decomposition, localisation, units correction, ground-truth integration checks, and similar) used to validate training behaviour rather than individual functions. Slow or GPU-requiring tests are marked and excluded from CI.
 
+### Mutation gate
+
+```bash
+python tools/mutation_gate.py            # whole catalogue, ~2.5 min
+python tools/mutation_gate.py --list     # show it without running
+python tools/mutation_gate.py -k balloon # one module
+```
+
+Coverage reports which lines ran. It cannot report whether a test would notice if those lines were wrong, and for the physics code that is the question that matters: a swapped coefficient or a dropped `1/tau` executes exactly the same lines as the correct version.
+
+`tools/mutation_gate.py` holds a catalogue of 36 defects in the balloon ODE, the reaction-diffusion simulator, the physics loss, the collocation sampler, the normaliser, and the network blocks. It injects each one, runs the tests meant to catch it, and fails if the suite stays green. Every entry was confirmed to survive the suite before the corresponding oracle existed, so the gate protects those oracles against being quietly weakened later.
+
+Two things it depends on, both documented in the script:
+
+- `src/` must have no uncommitted changes. Mutations are reverted with `git checkout --`, so the gate refuses to start rather than risk discarding local work.
+- `__pycache__` is cleared around every run. A `.pyc` stores its source mtime at one-second resolution, so a size-preserving mutation applied and reverted within a second can leave Python running the mutated bytecode, which makes a real gap look covered.
+
+A surviving mutation means an assertion lost its teeth. Restore it, or update the catalogue entry if the behaviour changed on purpose. A `STALE` entry means the source moved and the entry no longer matches; that fails too, so the catalogue cannot rot into silence.
+
 ---
 
 ## License

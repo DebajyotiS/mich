@@ -676,7 +676,7 @@ def test_temporal_noise_is_added_to_the_injected_source_value():
     )
     # signal power = 1.0, ratio = 10 -> amp = sqrt(0.1)
     expected = 1.0 + np.sqrt(0.1)
-    assert hist[:, 0, 2, 2] == pytest.approx(expected, rel=1e-12)
+    assert np.allclose(hist[:, 0, 2, 2], expected, rtol=1e-12)
 
 
 def test_inter_layer_coupling_moves_activity_between_layers():

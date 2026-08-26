@@ -445,9 +445,10 @@ class TestSharedScaleContract:
         bold[:, 2] = 5.0
 
         out = norm(bold)
-        # Ratios between layers must be unchanged by a single shared scale.
-        assert out[:, 1].mean() / out[:, 0].mean() == pytest.approx(3.0, rel=1e-6)
-        assert out[:, 2].mean() / out[:, 0].mean() == pytest.approx(5.0, rel=1e-6)
+        ratio_10 = (out[:, 1].mean() / out[:, 0].mean()).item()
+        ratio_20 = (out[:, 2].mean() / out[:, 0].mean()).item()
+        assert ratio_10 == pytest.approx(3.0, rel=1e-6)
+        assert ratio_20 == pytest.approx(5.0, rel=1e-6)
 
     def test_normalize_denormalize_roundtrip_is_exact_and_unguarded(self):
         """An unconditional round-trip oracle.
