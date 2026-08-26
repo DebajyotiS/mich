@@ -32,7 +32,9 @@ from mich.models.mich import MICH
 # -------------------------
 
 _LAYERS = ("layer_0", "layer_1")  # 2-layer setup for unit/component tests (faster)
-_B, _L, _T, _H, _W = 2, 2, 8, 4, 4
+# H != W deliberately: with a square grid, every accidental h/w transposition in
+# the metric and plotting gathers is shape-compatible and therefore invisible.
+_B, _L, _T, _H, _W = 2, 2, 8, 4, 5
 
 # The Trainer integration tests use 3 layers to match production (plot_latent_layers
 # hardcodes LAYER_NAMES with 3 entries and fails with fewer layers).
@@ -121,8 +123,8 @@ def _make_mich(*, L: int = _L, signals: list[str] | None = None, **loss_override
         dense_time_lo=0.05,
         dense_time_hi=0.55,
         uniform_time_lo=0.05,
-        lambda_src=1.0,
-        lambda_data=1.0,
+        lambda_src=1.6,
+        lambda_data=1.3,
         lambda_physics=0.1,
         lambda_smooth=0.01,
         lambda_grid_supervision=0.0,
@@ -146,14 +148,16 @@ def _make_mich(*, L: int = _L, signals: list[str] | None = None, **loss_override
             kappa=0.65,
             gamma=0.41,
             alpha=0.32,
-            tau=1.0,
+            # Non-unit and distinct from tau_d: tau=tau_d=1.0 makes every
+            # `/ tau` and `/ tau_d` in the physics targets a no-op under test.
+            tau=1.7,
             lambda_d=0.2,
-            tau_d=1.0,
+            tau_d=2.3,
         ),
         acquisition=types.SimpleNamespace(
             k1=0.02,
             k2=0.38,
-            k3=0.38,
+            k3=0.52,  # distinct from k2 so swapping the BOLD terms is detectable
             E0=0.35,
         ),
         V0=0.02,

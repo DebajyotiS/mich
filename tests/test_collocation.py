@@ -442,7 +442,9 @@ def test_sample_collocation_indices_per_layer_dense_draws_use_only_this_layers_s
     radius = 2
     # Layer 0's source and layer 1's source sit far apart so we can tell which one any
     # given dense draw clustered around.
-    source_position = torch.tensor([[[10, 10], [80, 80]]], dtype=torch.long)  # [B, S=2, 2]
+    # h != w within each source: with symmetric positions like (10, 10), swapping the
+    # h and w lookups in the sampler is undetectable.
+    source_position = torch.tensor([[[10, 24], [80, 62]]], dtype=torch.long)  # [B, S=2, 2]
     source_layer = torch.tensor([[0, 1]])  # source 0 -> layer 0, source 1 -> layer 1
     num_sources = torch.tensor([2])
 
@@ -463,8 +465,8 @@ def test_sample_collocation_indices_per_layer_dense_draws_use_only_this_layers_s
     h0, w0 = idx_list[0].h[0, 0].reshape(-1), idx_list[0].w[0, 0].reshape(-1)
     h1, w1 = idx_list[1].h[0, 0].reshape(-1), idx_list[1].w[0, 0].reshape(-1)
 
-    assert torch.all((h0 - 10).abs() <= radius) and torch.all((w0 - 10).abs() <= radius)
-    assert torch.all((h1 - 80).abs() <= radius) and torch.all((w1 - 80).abs() <= radius)
+    assert torch.all((h0 - 10).abs() <= radius) and torch.all((w0 - 24).abs() <= radius)
+    assert torch.all((h1 - 80).abs() <= radius) and torch.all((w1 - 62).abs() <= radius)
 
 
 def test_sample_collocation_indices_per_layer_falls_back_to_uniform_without_own_source():
@@ -473,7 +475,7 @@ def test_sample_collocation_indices_per_layer_falls_back_to_uniform_without_own_
     H, W = 100, 100
     radius = 2
     # Only one source, belonging to layer 0. Layer 1 has none.
-    source_position = torch.tensor([[[10, 10]]], dtype=torch.long)  # [B, S=1, 2]
+    source_position = torch.tensor([[[10, 24]]], dtype=torch.long)  # [B, S=1, 2]
     source_layer = torch.tensor([[0]])
     num_sources = torch.tensor([1])
 
@@ -493,11 +495,11 @@ def test_sample_collocation_indices_per_layer_falls_back_to_uniform_without_own_
     )
     h1 = idx_list[1].h[0, 0].reshape(-1)
     w1 = idx_list[1].w[0, 0].reshape(-1)
-    near_layer0_source = (h1 - 10).abs() <= radius
+    near_layer0_source = ((h1 - 10).abs() <= radius) & ((w1 - 24).abs() <= radius)
     # With a uniform fallback over a 100x100 grid and 120 draws, landing within a
-    # radius-2 box (25 cells) of (10, 10) on every single draw is not a real fallback.
+    # radius-2 box (25 cells) of (10, 24) on every single draw is not a real fallback.
     assert not torch.all(near_layer0_source)
-    assert w1.max() > 10 + radius or h1.max() > 10 + radius
+    assert w1.max() > 24 + radius or h1.max() > 10 + radius
 
 
 # -----------------------------
@@ -535,3 +537,48 @@ def test_sample_collocation_indices_per_layer_full_grid_returns_same_batch_for_e
     }
     expected = {(t, h, w) for t in range(T) for h in range(H) for w in range(W)}
     assert triples == expected
+
+
+# -----------------------------
+# Phase 2 oracle: full-grid axis semantics
+#
+# The full-grid tests above compare the (t, h, w) triples as a *set*, which
+# proves coverage but says nothing about how they are laid out along each axis.
+# The docstring's guarantee is stronger: the time axis is in true chronological
+# order, which is what makes downstream `burn_in` slicing mean "skip the first
+# burn_in real timesteps". A reversed or shuffled time axis satisfies every
+# set-based assertion while silently making burn_in drop the wrong end.
+# -----------------------------
+
+
+def test_full_grid_collocation_batch_time_axis_is_chronological():
+    """`t` must increase along the time axis and be constant across the space axis."""
+    T, H, W = 6, 3, 4
+    idx = CollocationMixin._full_grid_collocation_batch(T=T, H=H, W=W, device=torch.device("cpu"))
+
+    t = idx.t[0, 0]  # [T, H*W]
+    # Every spatial column sees the same, strictly increasing timeline.
+    expected = torch.arange(T).view(T, 1).expand(T, H * W)
+    assert torch.equal(t, expected), "time axis must enumerate 0..T-1 in order"
+
+    # Stated as a property too, so the intent survives a refactor of the above.
+    assert torch.all(t[1:] > t[:-1]), "t must be strictly increasing along the time axis"
+    assert torch.all(t[:, 1:] == t[:, :1]), "t must not vary along the space axis"
+
+
+def test_full_grid_collocation_batch_space_axis_is_row_major():
+    """`h`/`w` must decompose the flat spatial index as (index // W, index % W) and
+    stay constant along the time axis, so an h/w transposition is visible."""
+    T, H, W = 3, 3, 4
+    idx = CollocationMixin._full_grid_collocation_batch(T=T, H=H, W=W, device=torch.device("cpu"))
+    h, w = idx.h[0, 0], idx.w[0, 0]  # [T, H*W]
+
+    flat = torch.arange(H * W)
+    assert torch.equal(h[0], flat // W), "h must be the row index"
+    assert torch.equal(w[0], flat % W), "w must be the column index"
+    # H != W here, so a transposition would put h out of range as well.
+    assert int(h.max()) == H - 1
+    assert int(w.max()) == W - 1
+    # Constant along time.
+    assert torch.all(h[1:] == h[:1])
+    assert torch.all(w[1:] == w[:1])

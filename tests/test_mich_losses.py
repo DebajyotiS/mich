@@ -42,13 +42,16 @@ class _LossHost(MICHLossMixin, LearnablePhysioMixin, torch.nn.Module):
 
 
 def _mk_haemo(**overrides):
-    base = dict(kappa=0.65, gamma=0.41, alpha=0.32, tau=1.0, lambda_d=0.2, tau_d=1.0)
+    # Every constant here is deliberately distinct and non-unit. tau/tau_d of 1.0
+    # make every `/ tau` and `/ tau_d` in the ODE targets a no-op, and equal
+    # kappa/gamma or k2/k3 make swapping them undetectable.
+    base = dict(kappa=0.65, gamma=0.41, alpha=0.32, tau=1.7, lambda_d=0.2, tau_d=2.3)
     base.update(overrides)
     return types.SimpleNamespace(**base)
 
 
 def _mk_acquisition(**overrides):
-    base = dict(k1=0.02, k2=0.38, k3=0.38, E0=0.35)
+    base = dict(k1=0.02, k2=0.38, k3=0.52, E0=0.35)
     base.update(overrides)
     return types.SimpleNamespace(**base)
 
@@ -64,8 +67,8 @@ def _mk_loss_config(**overrides):
         dense_time_lo=0.05,
         dense_time_hi=0.55,
         uniform_time_lo=0.05,
-        lambda_src=1.0,
-        lambda_data=1.0,
+        lambda_src=1.6,
+        lambda_data=1.3,
         burn_in=1,
     )
     base.update(overrides)
@@ -1055,7 +1058,13 @@ def test_derivative_supervision_loss_drain_coupling_matches_analytic_target():
     adds, and vstar/qstar get their own ground-truth-only analytic targets."""
     host = _mk_host(order="linear", dzdt_supervision_signals=("v", "q", "vstar", "qstar"))
     B, L, T, H, W = 2, 2, 10, 5, 5
-    lambda_d, tau_d, tau = 0.2, 1.0, 1.0  # matches _mk_haemo() defaults
+    # Read the constants off the host rather than restating them, so this oracle
+    # keeps testing the *structure* of the ODE targets even when the fixture
+    # values change. Hardcoding them here previously made the test pass only
+    # because tau and tau_d happened to be 1.0, which hid every `/ tau` bug.
+    lambda_d = host.hparams.haemo.lambda_d
+    tau_d = host.hparams.haemo.tau_d
+    tau = host._physio("tau")
 
     f_true = torch.rand(B, L, T, H, W) + 0.5
     v_true = torch.rand(B, L, T, H, W) + 0.5
@@ -1148,3 +1157,249 @@ def test_x_phase_loss_positive_when_mismatched():
     num_sources = torch.ones(B, dtype=torch.long)
     loss = host._x_phase_loss(z_hat, dz_hat_dt, source_position, num_sources)
     assert loss > 0.0
+
+
+# -----------------------------
+# Phase 2 oracles: ODE-residual, BOLD value, and loss-composition contracts
+#
+# The tests above this block establish that the physics losses run, return the
+# right keys, and stay finite. They do not pin a single numeric value, so a
+# swapped coefficient or a dropped `/ tau` passes them all. The tests below
+# supply the missing oracles: a state that exactly satisfies the balloon ODE
+# system must drive every residual to zero, a hand-computed BOLD value must be
+# reproduced exactly, and the documented `total = colloc + lambda_src * src`
+# contract must actually hold.
+# -----------------------------
+
+
+def _consistent_physics_state(host, B, L, T, H, W, *, order, n_channels=7, seed=0):
+    """Build a (z_hat, dz_hat_dt) pair that exactly satisfies the balloon ODE system.
+
+    Every residual `_compute_physics_layer_loss` forms is
+    `analytic_derivative - ODE_right_hand_side`, so feeding it a state whose
+    derivatives *are* the right-hand sides must yield exactly zero for every
+    equation. That makes this an independent oracle: it constrains each
+    coefficient, each `/ tau`, and each drain coupling term individually,
+    without restating the implementation's own expression for them.
+
+    States are kept in a benign range (f/v/q near 1, x/s small) so that
+    `_sanitise_states`' NaN replacement and 0.1 floor are no-ops and cannot mask
+    a mismatch.
+    """
+    gen = torch.Generator().manual_seed(seed)
+
+    def _rand(scale, offset=0.0):
+        return torch.rand(B, L, T, H, W, generator=gen) * scale + offset
+
+    x = _rand(0.6, -0.3)
+    s = _rand(0.6, -0.3)
+    f = _rand(0.6, 0.7)  # [0.7, 1.3]
+    v = _rand(0.6, 0.7)
+    q = _rand(0.6, 0.7)
+    v_star = _rand(0.4, -0.2)
+    q_star = _rand(0.4, -0.2)
+
+    has_drain = n_channels > 5
+    kappa = host._physio("kappa")
+    gamma = host._physio("gamma")
+    tau = host._physio("tau")
+    tau_d = host.hparams.haemo.tau_d
+    lambda_d = host.hparams.haemo.lambda_d
+
+    vdot, qdot = host._balloon_v_q_dot_targets(f, v, q, order)
+
+    # The flow-inducing signal and flow equations.
+    ds_dt = x - kappa * s - gamma * (f - 1)
+    df_dt = s
+
+    # Volume/deoxyhaemoglobin, including the inter-layer drainage a layer picks
+    # up from the layer below it (layer 0 has nothing below it, so no term).
+    dv_dt = vdot.clone()
+    dq_dt = qdot.clone()
+    if has_drain and L > 1:
+        dv_dt[:, 1:] = dv_dt[:, 1:] + lambda_d * v_star[:, :-1]
+        dq_dt[:, 1:] = dq_dt[:, 1:] + lambda_d * q_star[:, :-1]
+    dv_dt = dv_dt / tau
+    dq_dt = dq_dt / tau
+
+    dv_star_dt = (-v_star + v - 1) / tau_d
+    dq_star_dt = (-q_star + q - 1) / tau_d
+
+    channels = [x, s, f, v, q, v_star, q_star][:n_channels]
+    z_hat = torch.stack(channels, dim=1)
+
+    # `_compute_physics_layer_loss` converts the derivative side from the
+    # decoder's [0, 1]-normalised time grid to per-index units by dividing by
+    # (T - 1), so pre-multiply here to cancel that exactly.
+    t_norm_to_physical = T - 1
+    zero = torch.zeros_like(x)
+    grads = [zero, ds_dt, df_dt, dv_dt, dq_dt, dv_star_dt, dq_star_dt][:n_channels]
+    dz_hat_dt = torch.stack(grads, dim=1) * t_norm_to_physical
+
+    return z_hat, dz_hat_dt
+
+
+def _full_grid_idx(B, T, H, W):
+    """A CollocationBatch covering every (t, h, w) once, so the oracle below is
+    checked at every point rather than a random handful."""
+    from mich.models.collocation import CollocationBatch
+
+    t = torch.arange(T).view(1, 1, T, 1).expand(B, 1, T, H * W)
+    hw = torch.arange(H * W)
+    h = (hw // W).view(1, 1, 1, H * W).expand(B, 1, T, H * W)
+    w = (hw % W).view(1, 1, 1, H * W).expand(B, 1, T, H * W)
+    return CollocationBatch(t=t.contiguous(), h=h.contiguous(), w=w.contiguous())
+
+
+@pytest.mark.parametrize("order", ["exact", "linear", "quadratic"])
+def test_compute_physics_layer_loss_is_zero_for_ode_consistent_state_no_drain(order):
+    """An ODE-consistent state must drive every per-equation residual to zero.
+
+    This is the oracle the key-set-and-finiteness tests above are missing: it
+    pins the s/f/v/q right-hand sides for all three balloon orders, including
+    the quadratic branch, whose coefficients all cancel at the resting state and
+    were therefore never constrained by any previous test.
+    """
+    host = _mk_host(order=order)
+    B, L, T, H, W = 2, 1, 6, 3, 4
+    z_hat, dz_hat_dt = _consistent_physics_state(host, B, L, T, H, W, order=order, n_channels=5)
+    idx = _full_grid_idx(B, T, H, W)
+
+    losses = host._compute_physics_layer_loss(
+        z_hat, dz_hat_dt, idx, layer=0, burn_in=0, order=order
+    )
+
+    assert set(losses.keys()) == {"s", "f", "v", "q"}
+    for eq, value in losses.items():
+        assert value.abs() < 1e-10, f"{order}/{eq} residual should vanish, got {value.item():.3e}"
+
+
+@pytest.mark.parametrize("order", ["exact", "linear", "quadratic"])
+@pytest.mark.parametrize("layer", [0, 1])
+def test_compute_physics_layer_loss_is_zero_for_ode_consistent_state_with_drain(order, layer):
+    """Same oracle in multi-layer (drain) mode, per layer.
+
+    Layer 1 must pick up the `lambda_d * vstar/qstar` term from layer 0 while
+    layer 0 must not, and vstar/qstar get their own `(-v_star + v - 1) / tau_d`
+    targets. That `tau_d` divisor is written twice in the source (here and in
+    `_derivative_supervision_loss`); only the other copy was pinned before.
+    """
+    host = _mk_host(order=order)
+    B, L, T, H, W = 2, 2, 6, 3, 4
+    z_hat, dz_hat_dt = _consistent_physics_state(host, B, L, T, H, W, order=order, n_channels=7)
+    idx = _full_grid_idx(B, T, H, W)
+
+    losses = host._compute_physics_layer_loss(
+        z_hat, dz_hat_dt, idx, layer=layer, burn_in=0, order=order
+    )
+
+    assert set(losses.keys()) == {"s", "f", "v", "q", "vstar", "qstar"}
+    for eq, value in losses.items():
+        assert value.abs() < 1e-10, (
+            f"{order}/layer{layer}/{eq} residual should vanish, got {value.item():.3e}"
+        )
+
+
+def test_compute_physics_layer_loss_v_q_targets_scale_with_tau():
+    """The v/q targets must be divided by tau, not multiplied by it or left raw.
+
+    Built as a differential check against the zero-residual oracle: a state made
+    consistent for one tau must be inconsistent for a different tau, and the
+    residual must grow in the direction `/ tau` predicts.
+    """
+    host = _mk_host(order="linear")
+    B, L, T, H, W = 2, 1, 6, 3, 4
+    tau = host._physio("tau")
+    assert tau != 1.0, "fixture must use a non-unit tau or this test proves nothing"
+
+    z_hat, dz_hat_dt = _consistent_physics_state(host, B, L, T, H, W, order="linear", n_channels=5)
+    idx = _full_grid_idx(B, T, H, W)
+
+    baseline = host._compute_physics_layer_loss(
+        z_hat, dz_hat_dt, idx, layer=0, burn_in=0, order="linear"
+    )
+    assert baseline["v"].abs() < 1e-10
+
+    # Scale only the v/q derivative channels by tau. The targets are `raw / tau`,
+    # so a derivative of `raw` (i.e. tau times too large) must no longer match.
+    v_idx, q_idx = host._signal_index("v"), host._signal_index("q")
+    perturbed = dz_hat_dt.clone()
+    perturbed[:, v_idx] *= tau
+    perturbed[:, q_idx] *= tau
+
+    off = host._compute_physics_layer_loss(
+        z_hat, perturbed, idx, layer=0, burn_in=0, order="linear"
+    )
+    assert off["v"] > 1e-6, "v residual must react to a tau-sized error in dv/dt"
+    assert off["q"] > 1e-6, "q residual must react to a tau-sized error in dq/dt"
+    # s/f do not involve tau and must be untouched.
+    assert off["s"].abs() < 1e-10
+    assert off["f"].abs() < 1e-10
+
+
+def test_compute_bold_matches_hand_computed_value():
+    """Pin `_compute_bold` against arithmetic done by hand, with k1/k2/k3 all
+    distinct so that permuting the three terms changes the result.
+
+    The existing formula test re-derives the expression in the test body, which
+    cannot distinguish a wrong formula from a faithfully-copied wrong formula.
+    Here the inputs are chosen so every term is a clean number:
+        k1 * (1 - q)     = 1.0 * (1 - 0.5)         =  0.5
+        k2 * (1 - q / v) = 2.0 * (1 - 0.5 / 0.25)  = -2.0
+        k3 * (1 - v)     = 4.0 * (1 - 0.25)        =  3.0
+        V0 * sum         = 0.02 * 1.5              =  0.03
+    """
+    acquisition = _mk_acquisition(k1=1.0, k2=2.0, k3=4.0)
+    q = torch.tensor([0.5])
+    v = torch.tensor([0.25])
+
+    out = MICHLossMixin._compute_bold(q=q, v=v, acquisition=acquisition, V0=0.02)
+
+    assert torch.isclose(out, torch.tensor(0.03), atol=1e-7), out
+
+
+def test_compute_bold_increases_as_deoxyhaemoglobin_falls():
+    """Physiological sign convention: with volume held fixed, BOLD signal must
+    rise as deoxyhaemoglobin q falls (washout increases signal)."""
+    acquisition = _mk_acquisition()
+    v = torch.ones(1)
+    high_q = MICHLossMixin._compute_bold(
+        q=torch.tensor([1.2]), v=v, acquisition=acquisition, V0=0.02
+    )
+    low_q = MICHLossMixin._compute_bold(
+        q=torch.tensor([0.8]), v=v, acquisition=acquisition, V0=0.02
+    )
+    assert low_q > high_q
+
+
+def test_data_loss_total_equals_colloc_plus_lambda_src_times_src():
+    """The documented contract `total = colloc_loss + lambda_src * src_loss`.
+
+    Every previous `_data_loss` test asserted only that the total was a finite
+    scalar, which a sign flip or a dropped weight satisfies just as well. This
+    needs a non-unit lambda_src in the fixture to have any teeth.
+    """
+    host = _mk_host()
+    host.normaliser = None
+    lambda_src = host.hparams.loss_config.lambda_src
+    assert lambda_src != 1.0, "fixture must use a non-unit lambda_src"
+
+    B, L, T, H, W = 2, 2, 10, 5, 6
+    torch.manual_seed(0)
+    z_hat = torch.randn(B, 7, L, T, H, W) * 0.1 + 1.0
+    bold_norm = torch.randn(B, L, T, H, W)
+    source_position = torch.tensor([[[1, 3]], [[4, 2]]], dtype=torch.long)
+    source_layer = torch.tensor([[0], [1]])
+    num_sources = torch.ones(B, dtype=torch.long)
+
+    total, colloc_loss, src_loss = host._data_loss(
+        z_hat,
+        bold_norm,
+        source_position=source_position,
+        num_sources=num_sources,
+        source_layer=source_layer,
+    )
+
+    assert torch.isclose(total, colloc_loss + lambda_src * src_loss, atol=1e-6)
+    # Guard against the contract holding only because src_loss vanished.
+    assert src_loss > 0

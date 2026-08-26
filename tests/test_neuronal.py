@@ -451,3 +451,256 @@ def test_simulate_injection_sets_value_without_diffusion_or_noise():
     mask = np.ones((4, 1, 4, 4), dtype=bool)
     mask[:, 0, 1, 1] = False
     assert np.all(hist[mask] == 0.0)
+
+
+# -------------------------
+# Phase 2 oracles: PDE dynamics
+#
+# The dynamics tests above run with diffusion, decay and noise all switched off,
+# so the only thing they constrain is source injection. The tests below turn each
+# mechanism on one at a time and check it against an analytic solution: pure
+# exponential decay, mass conservation under pure diffusion, and the dB-to-power
+# SNR conversion.
+# -------------------------
+
+
+class ConstantNoise:
+    """Noise double that returns a known constant scaled by the requested amplitude.
+
+    Every existing double returns all-zeros, which makes the noise amplitude
+    unobservable: the SNR arithmetic that produced it can be anything at all.
+    Real generators scale their output by the `amplitude` they are handed, so
+    this does too, which turns the injected offset into a direct readout of that
+    amplitude. It also records the amplitude for tests that want to assert on it
+    without going through the grid.
+    """
+
+    def __init__(self, domain="temporal", temporal_fraction=0.5, value=1.0):
+        self.domain = domain
+        self.temporal_fraction = temporal_fraction
+        self.value = value
+        self.last_amplitude = None
+
+    def generate(self, amplitude, layers, grid_size):
+        self.last_amplitude = amplitude
+        return np.full((layers, *grid_size), amplitude * self.value, dtype=np.float64)
+
+    def generate_temporal(self, amplitude, n_sources, steps, dt):
+        self.last_amplitude = amplitude
+        return np.full((n_sources, steps), amplitude * self.value, dtype=np.float64)
+
+
+def test_pure_decay_follows_discrete_exponential_after_injection_stops():
+    """With diffusion off, a voxel left alone after one injection must decay
+    geometrically by exactly (1 - decay_rate * dt_sub) per substep.
+
+    This pins the sign of the decay term (a flipped sign grows without bound),
+    the `* dt_sub` factor (dropping it changes the ratio), and the fact that the
+    decay is applied to the previous grid rather than the updated one. The
+    existing dynamics test sets decay_rate=0, so none of this is constrained.
+    """
+    decay, dt = 0.5, 0.1
+    sim = _make_sim(
+        num_layers=1,
+        grid_size=(5, 5),
+        dt=dt,
+        dx=1.0,
+        diff_intra=0.0,
+        diff_inter=0.0,
+        decay_rate=decay,
+    )
+    # Signal of length 1: injected at step 0 only, then left to decay.
+    sig = np.array([1.0], dtype=np.float64)
+    src = _source(layer=0, position=(2, 2), signal=sig)
+
+    steps = 6
+    hist = sim.simulate([src], steps=steps, snr_db=np.inf, noise=SpyNoise(domain="spatial"))
+    trace = hist[:, 0, 2, 2]
+
+    # With diff=0 the stability bound is dt*decay <= 1, satisfied here, so n_sub=1.
+    per_step = 1.0 - decay * dt
+    assert trace[0] == pytest.approx(1.0), "step 0 is the re-pinned injection"
+    for k in range(1, steps):
+        assert trace[k] == pytest.approx(per_step**k, rel=1e-12), f"step {k}"
+
+    # Sanity: this must actually be a decay, not growth.
+    assert np.all(np.diff(trace) < 0)
+
+
+def test_pure_decay_approximates_continuous_exponential():
+    """Independently of the discrete scheme, refining dt must make the trajectory
+    converge to the continuous solution exp(-decay * t). This is the oracle that
+    ties the implementation to the PDE the module docstring claims to solve."""
+    decay, t_end = 0.5, 1.0
+    errors = []
+    for steps in (20, 40, 80):
+        dt = t_end / steps
+        sim = _make_sim(
+            num_layers=1,
+            grid_size=(5, 5),
+            dt=dt,
+            dx=1.0,
+            diff_intra=0.0,
+            diff_inter=0.0,
+            decay_rate=decay,
+        )
+        src = _source(layer=0, position=(2, 2), signal=np.array([1.0]))
+        hist = sim.simulate([src], steps=steps, snr_db=np.inf, noise=SpyNoise(domain="spatial"))
+        errors.append(abs(hist[steps - 1, 0, 2, 2] - np.exp(-decay * (steps - 1) * dt)))
+
+    # Forward Euler is first order, so halving dt must roughly halve the error.
+    assert errors[0] > errors[1] > errors[2]
+    assert errors[0] / errors[2] > 3.0, f"expected ~4x error drop over 4x refinement, {errors}"
+
+
+def test_pure_diffusion_conserves_total_mass_in_the_interior():
+    """With decay off, the discrete Laplacian sums to zero, so pure diffusion must
+    move mass around without creating or destroying it, as long as the front has
+    not reached the zero-padded boundary.
+
+    This constrains the Laplacian stencil itself: changing the centre weight from
+    -4 makes the kernel sum non-zero and mass drift immediately. The one existing
+    test with diffusion enabled asserts only shape and finiteness.
+    """
+    sim = _make_sim(
+        num_layers=1,
+        grid_size=(21, 21),
+        dt=0.1,
+        dx=1.0,
+        diff_intra=0.1,
+        diff_inter=0.0,
+        decay_rate=0.0,
+    )
+    src = _source(layer=0, position=(10, 10), signal=np.array([1.0]))
+    steps = 5
+    hist = sim.simulate([src], steps=steps, snr_db=np.inf, noise=SpyNoise(domain="spatial"))
+
+    masses = hist[:, 0].sum(axis=(1, 2))
+    # Front cannot reach the boundary in 5 steps from the centre of a 21x21 grid.
+    assert np.all(np.abs(hist[:, 0, 0, :]) < 1e-15)
+    assert np.all(np.abs(hist[:, 0, -1, :]) < 1e-15)
+    for k in range(1, steps):
+        assert masses[k] == pytest.approx(masses[0], rel=1e-12), f"mass drifted at step {k}"
+
+    # Sanity: diffusion must actually have spread the mass, or conservation is vacuous.
+    assert hist[steps - 1, 0, 10, 11] > 0.0
+    assert hist[steps - 1, 0, 10, 10] < hist[0, 0, 10, 10]
+
+
+def test_diffusion_is_isotropic_between_the_two_spatial_axes():
+    """The stencil weights the four neighbours equally, so a point source on a
+    square grid must spread identically along h and w. An asymmetric stencil (or
+    an h/w transposition) breaks this."""
+    sim = _make_sim(
+        num_layers=1,
+        grid_size=(21, 21),
+        dt=0.1,
+        dx=1.0,
+        diff_intra=0.1,
+        diff_inter=0.0,
+        decay_rate=0.0,
+    )
+    src = _source(layer=0, position=(10, 10), signal=np.array([1.0]))
+    hist = sim.simulate([src], steps=4, snr_db=np.inf, noise=SpyNoise(domain="spatial"))
+    final = hist[-1, 0]
+    assert final[9, 10] == pytest.approx(final[11, 10], rel=1e-12)
+    assert final[10, 9] == pytest.approx(final[10, 11], rel=1e-12)
+    assert final[9, 10] == pytest.approx(final[10, 9], rel=1e-12)
+    assert final[9, 10] > 0.0
+
+
+@pytest.mark.parametrize(
+    "snr_db, expected_ratio",
+    [
+        (0.0, 1.0),  # 10**(0/10)  = 1   -> noise power == signal power
+        (10.0, 10.0),  # 10**(10/10) = 10
+        (20.0, 100.0),  # 10**(20/10) = 100 -- distinguishes /10 from /20
+    ],
+)
+def test_snr_db_converts_as_power_not_amplitude(snr_db, expected_ratio):
+    """snr_linear = 10**(snr_db / 10) is the *power* convention.
+
+    Every existing test passes snr_db of exactly inf or 0.0, and 10**0 == 1 under
+    both the /10 and /20 conventions, so the exponent divisor is currently a free
+    variable. Checking snr_db=20 separates them: /10 gives a ratio of 100, /20
+    gives 10.
+
+    With domain="temporal" the whole noise budget goes to the temporal term, so
+    the amplitude handed to the generator is sqrt(signal_power / ratio).
+    """
+    amplitude = 2.0
+    sig = np.full(4, amplitude, dtype=np.float64)
+    signal_power = float(np.mean(sig * sig))  # = amplitude**2
+
+    sim = _make_sim(
+        num_layers=1,
+        grid_size=(5, 5),
+        dt=0.1,
+        dx=1.0,
+        diff_intra=0.0,
+        diff_inter=0.0,
+        decay_rate=0.0,
+    )
+    noise = ConstantNoise(domain="temporal")
+    sim.simulate(
+        [_source(layer=0, position=(2, 2), signal=sig)],
+        steps=4,
+        snr_db=snr_db,
+        noise=noise,
+    )
+
+    expected_amp = np.sqrt(signal_power / expected_ratio)
+    assert noise.last_amplitude == pytest.approx(expected_amp, rel=1e-12)
+
+
+def test_temporal_noise_is_added_to_the_injected_source_value():
+    """The injected value must be signal + temporal noise. With a constant-one
+    noise double the offset is exactly the noise amplitude, so this observes the
+    amplitude rather than merely counting generator calls."""
+    sig = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+    sim = _make_sim(
+        num_layers=1,
+        grid_size=(5, 5),
+        dt=0.1,
+        dx=1.0,
+        diff_intra=0.0,
+        diff_inter=0.0,
+        decay_rate=0.0,
+    )
+    noise = ConstantNoise(domain="temporal")
+    hist = sim.simulate(
+        [_source(layer=0, position=(2, 2), signal=sig)],
+        steps=3,
+        snr_db=10.0,
+        noise=noise,
+    )
+    # signal power = 1.0, ratio = 10 -> amp = sqrt(0.1)
+    expected = 1.0 + np.sqrt(0.1)
+    assert hist[:, 0, 2, 2] == pytest.approx(expected, rel=1e-12)
+
+
+def test_inter_layer_coupling_moves_activity_between_layers():
+    """With intra-layer diffusion off and only inter-layer coupling on, a source
+    in layer 0 must push activity into layer 1 and nowhere else spatially.
+
+    No existing test enables diffusion_coefficient_inter with a value assertion,
+    so the sign and direction of the inter-layer flux are unconstrained.
+    """
+    sim = _make_sim(
+        num_layers=3,
+        grid_size=(9, 9),
+        dt=0.05,
+        dx=1.0,
+        diff_intra=0.0,
+        diff_inter=0.2,
+        decay_rate=0.0,
+    )
+    src = _source(layer=0, position=(4, 4), signal=np.array([1.0]))
+    hist = sim.simulate([src], steps=3, snr_db=np.inf, noise=SpyNoise(domain="spatial"))
+
+    # Activity must flow downward into layer 1 with the same sign as the source.
+    assert hist[-1, 1, 4, 4] > 0.0
+    # And it must stay on the source column, since intra-layer diffusion is off.
+    col = hist[-1, 1].copy()
+    col[4, 4] = 0.0
+    assert np.all(np.abs(col) < 1e-15)

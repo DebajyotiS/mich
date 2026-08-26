@@ -270,7 +270,9 @@ class TestGatherNeighbourhood:
         B, L, T, H, W, r = 3, 4, 5, 10, 10, 2
         norm = _make_norm(H=H, W=W, radius=r)
         bold = torch.randn(B, L, T, H, W)
-        pos = torch.tensor([[[5, 5]], [[3, 3]], [[7, 7]]], dtype=torch.long)  # [B, S=1, 2]
+        # h != w in every position: symmetric positions make an h/w swap in
+        # _gather_neighbourhood's offset arithmetic undetectable.
+        pos = torch.tensor([[[5, 2]], [[3, 6]], [[7, 1]]], dtype=torch.long)  # [B, S=1, 2]
         mask = torch.ones(B, 1, dtype=torch.bool)
         out = norm._gather_neighbourhood(bold, pos, mask)
         N = (2 * r + 1) ** 2
@@ -306,3 +308,210 @@ class TestGatherNeighbourhood:
         mask = torch.ones(B, 1, dtype=torch.bool)
         out = norm._gather_neighbourhood(bold, pos, mask)
         assert (out == 99.0).any()
+
+    def test_neighbourhood_gathers_the_asymmetric_source_position(self):
+        """The gather must read (h, w) in that order, on a non-square grid.
+
+        The test above plants its value at (4, 4) on an 8x8 grid, so swapping the
+        h and w lookups reads the very same voxel and cannot be detected. Here the
+        grid is 6x9 and the position is (1, 7), which is only in range when h and
+        w are used the right way round.
+        """
+        B, L, T, H, W, r = 1, 1, 1, 6, 9, 1
+        norm = _make_norm(H=H, W=W, radius=r)
+        bold = torch.zeros(B, L, T, H, W)
+        src_h, src_w = 1, 7
+        bold[0, 0, 0, src_h, src_w] = 99.0
+        # A decoy at the transposed location would be picked up by a swapped gather.
+        # (7, 1) is out of range for h, so plant the decoy where a swap would clamp to.
+        bold[0, 0, 0, H - 1, 1] = -55.0
+        pos = torch.tensor([[[src_h, src_w]]], dtype=torch.long)
+        mask = torch.ones(B, 1, dtype=torch.bool)
+
+        out = norm._gather_neighbourhood(bold, pos, mask)
+        assert (out == 99.0).any(), "the true source voxel must be gathered"
+        assert not (out == -55.0).any(), "a transposed gather must not reach the decoy"
+
+
+# -------------------------
+# Phase 2 oracles: which statistics are actually used, and the shared-scale contract
+#
+# The tests above verify that the running statistics move and that outputs stay
+# finite. They never check *which* statistics a given call normalises with, which
+# is the module's central documented semantic, nor the single-shared-scale design
+# rationale. Both are pinned below.
+# -------------------------
+
+
+class TestWhichStatisticsAreUsed:
+    def test_training_normalises_with_this_batch_statistics_not_running(self):
+        """While training (and not frozen or paused), `forward` must normalise with
+        this batch's own mean/std, per the docstring, and not the running values.
+
+        Written as a differential check to avoid restating the source's own
+        gather-and-average logic: two normalisers that differ *only* in their
+        running statistics must produce identical output for the same batch, because
+        the running values are not supposed to enter the computation at all. The
+        running counts are large so that blending this batch in cannot quietly drag
+        the two running means together and mask the difference.
+        """
+
+        def _norm_with_running(mean_val):
+            n = _make_norm(H=8, W=8, radius=2)
+            n.train()
+            n.running_mean.fill_(mean_val)
+            n.running_M2.fill_(1e6 - 1.0)  # var = M2/(count-1) = 1.0
+            n.running_count.fill_(1e6)
+            return n
+
+        norm_a = _norm_with_running(0.0)
+        norm_b = _norm_with_running(100.0)
+
+        torch.manual_seed(0)
+        bold = torch.randn(2, 3, 4, 8, 8) + 7.0
+        pos = torch.tensor([[[4, 3]], [[2, 5]]], dtype=torch.long)
+        num_sources = torch.ones(2, dtype=torch.long)
+
+        out_a = norm_a(bold.clone(), pos, num_sources)
+        out_b = norm_b(bold.clone(), pos, num_sources)
+
+        assert torch.allclose(out_a, out_b, atol=1e-6), (
+            "training output must not depend on the running statistics"
+        )
+        # Guard against the comparison being vacuous because both saturated the clamp.
+        assert out_a.abs().max() < 10.0
+
+    def test_eval_normalises_with_running_statistics_and_does_not_update(self):
+        """In eval mode the running statistics must be used verbatim and left
+        untouched, so the result equals `normalize` exactly."""
+        norm = _make_norm(H=8, W=8, radius=2)
+        norm.running_mean.fill_(2.0)
+        norm.running_M2.fill_(4.0)
+        norm.running_count.fill_(5)  # var = 1.0
+        norm.eval()
+
+        bold = torch.linspace(0.0, 4.0, 2 * 3 * 4 * 8 * 8).reshape(2, 3, 4, 8, 8)
+        before = (
+            norm.running_mean.clone(),
+            norm.running_M2.clone(),
+            norm.running_count.clone(),
+            norm.step.clone(),
+        )
+
+        out = norm(bold)
+
+        assert torch.allclose(out, norm.normalize(bold))
+        assert torch.equal(norm.running_mean, before[0])
+        assert torch.equal(norm.running_M2, before[1])
+        assert torch.equal(norm.running_count, before[2])
+        assert torch.equal(norm.step, before[3]), "eval must not advance the step counter"
+
+    def test_pause_update_uses_running_statistics_while_still_training(self):
+        """`pause_update=True` must switch to the running statistics, matching
+        `normalize`, not merely skip the counter increment."""
+        norm = _make_norm(H=8, W=8, radius=2)
+        norm.train()
+        norm.running_mean.fill_(2.0)
+        norm.running_M2.fill_(4.0)
+        norm.running_count.fill_(5)
+
+        bold = torch.linspace(0.0, 4.0, 2 * 3 * 4 * 8 * 8).reshape(2, 3, 4, 8, 8)
+        pos = torch.tensor([[[4, 3]], [[2, 5]]], dtype=torch.long)
+        num_sources = torch.ones(2, dtype=torch.long)
+
+        out = norm(bold, pos, num_sources, pause_update=True)
+        assert torch.allclose(out, norm.normalize(bold))
+        assert norm.step.item() == 0
+
+
+class TestSharedScaleContract:
+    def test_all_layers_share_one_scalar_scale(self):
+        """The module docstring's central design claim: a single shared scalar is
+        applied across sources, layers, time and voxels, so that inter-layer
+        amplitude ratios survive normalisation.
+
+        Give two layers deliberately different amplitudes and check the ratio
+        between them is preserved exactly. A per-layer scale would equalise them.
+        """
+        norm = _make_norm(H=8, W=8, radius=2)
+        norm.running_mean.fill_(0.0)
+        norm.running_M2.fill_(16.0)
+        norm.running_count.fill_(5)  # var = 4, std = 2 (non-unit on purpose)
+        norm.eval()
+
+        bold = torch.zeros(1, 3, 2, 8, 8)
+        bold[:, 0] = 1.0
+        bold[:, 1] = 3.0
+        bold[:, 2] = 5.0
+
+        out = norm(bold)
+        # Ratios between layers must be unchanged by a single shared scale.
+        assert out[:, 1].mean() / out[:, 0].mean() == pytest.approx(3.0, rel=1e-6)
+        assert out[:, 2].mean() / out[:, 0].mean() == pytest.approx(5.0, rel=1e-6)
+
+    def test_normalize_denormalize_roundtrip_is_exact_and_unguarded(self):
+        """An unconditional round-trip oracle.
+
+        The existing round-trip test wraps its assertion in `if in_range.all():`,
+        so it silently becomes a no-op if the values ever saturate the [-10, 10]
+        clamp. Here the inputs are chosen to sit well inside the clamp and the
+        assertion always runs.
+        """
+        norm = _make_norm()
+        norm.running_mean.fill_(2.0)
+        # var = M2 / (count - 1) = 16 / 4 = 4, so std = 2. A non-unit std is what
+        # makes a `/ std` vs `* std` mix-up observable at all.
+        norm.running_M2.fill_(16.0)
+        norm.running_count.fill_(5)
+
+        bold = torch.linspace(-1.0, 5.0, 32).reshape(1, 1, 2, 4, 4)
+        normalized = norm.normalize(bold)
+        # Guard the guard: prove we are inside the clamp rather than assuming it.
+        assert normalized.abs().max() < 9.0
+        assert torch.allclose(norm.denormalize(normalized), bold, atol=1e-5)
+
+    def test_denormalize_inverts_the_exact_affine_transform(self):
+        """denormalize(x) = x * std + mean with the running statistics, pinned
+        against hand-computed values so a swapped mean/std or a dropped term is
+        visible. With mean=3, M2=16, count=5: var = 16/4 = 4, std = 2.
+        Hence denormalize(1.5) = 1.5 * 2 + 3 = 6.
+        """
+        norm = _make_norm()
+        norm.running_mean.fill_(3.0)
+        norm.running_M2.fill_(16.0)
+        norm.running_count.fill_(5)
+
+        out = norm.denormalize(torch.tensor([[[[[1.5]]]]]))
+        assert out.item() == pytest.approx(6.0, rel=1e-6)
+
+    def test_training_normalisation_is_invariant_to_rescaling_the_batch(self):
+        """Normalising by (x - mean) / std is exactly scale-invariant: scaling the
+        input by c scales both the batch mean and the batch std by c, so the
+        output must be unchanged.
+
+        This pins the `sqrt` on the batch variance without restating how the
+        source computes it. Dropping the sqrt makes the divisor scale as c^2
+        instead of c, so the output would shrink by 1/c.
+        """
+
+        def _fresh():
+            n = _make_norm(H=8, W=8, radius=2)
+            n.train()
+            n.running_mean.fill_(0.0)
+            n.running_M2.fill_(1e6 - 1.0)
+            n.running_count.fill_(1e6)
+            return n
+
+        torch.manual_seed(0)
+        bold = torch.randn(2, 3, 4, 8, 8) * 1.5 + 4.0
+        pos = torch.tensor([[[4, 3]], [[2, 5]]], dtype=torch.long)
+        num_sources = torch.ones(2, dtype=torch.long)
+
+        c = 3.0
+        out_plain = _fresh()(bold.clone(), pos, num_sources)
+        out_scaled = _fresh()(bold.clone() * c, pos, num_sources)
+
+        assert out_plain.abs().max() < 10.0, "clamp saturated; comparison would be vacuous"
+        assert torch.allclose(out_plain, out_scaled, atol=1e-5), (
+            "normalisation must be invariant to a global rescaling of the batch"
+        )

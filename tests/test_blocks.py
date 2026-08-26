@@ -511,3 +511,123 @@ def test_heinzle_net_forward_with_gradients_produces_dz_hat_dt():
     assert m.z_hat.shape == (1, 7, 2, 3, 4, 4)
     assert m.dz_hat_dt.shape == (1, 7, 2, 3, 4, 4)
     assert torch.isfinite(m.dz_hat_dt).all()
+
+
+# -----------------------------
+# Phase 2 oracles: value-level contracts in the building blocks
+#
+# The block tests above are largely shape, dtype and finiteness checks. The tests
+# below pin the actual arithmetic: the Fourier embedding's frequency convention,
+# the FiLM gamma/beta split, the layer-mixing mask under a non-identity weight,
+# and the decoder's positivity baseline at initialisation.
+# -----------------------------
+
+
+def test_fourier_time_embedding_at_t_zero_is_sines_zero_cosines_one():
+    """emb(0) = [sin(0)..., cos(0)...] = [0..., 1...].
+
+    This pins the sin/cos concatenation order. The existing test asserts only
+    shape, dtype and finiteness, so swapping the halves is invisible.
+    """
+    emb = FourierTimeEmbedding(num_freqs=4)
+    out = emb(torch.zeros(1, 3))  # [1, 3, 8]
+    F = emb.num_freqs
+    assert torch.allclose(out[..., :F], torch.zeros_like(out[..., :F]), atol=1e-6)
+    assert torch.allclose(out[..., F:], torch.ones_like(out[..., F:]), atol=1e-6)
+
+
+def test_fourier_time_embedding_uses_two_pi_scaling():
+    """The angle is (2*pi) * t * freq, so with the lowest frequency equal to 1,
+    t = 1 must complete exactly one full turn and return to emb(0).
+
+    Dropping the 2*pi factor makes t = 1 land at 1 radian instead, so sin != 0.
+    """
+    emb = FourierTimeEmbedding(num_freqs=3)
+    with torch.no_grad():
+        emb.freqs.copy_(torch.tensor([1.0, 2.0, 3.0]))
+
+    at_zero = emb(torch.zeros(1, 1))
+    at_one = emb(torch.ones(1, 1))
+    assert torch.allclose(at_zero, at_one, atol=1e-5), (
+        "integer t with integer frequencies must be periodic, which requires the 2*pi scaling"
+    )
+
+    # And a quarter turn must put the first frequency's sine at exactly 1.
+    # Note the [1, 2] shape: a trailing singleton dimension would be squeezed
+    # by forward, changing the output rank.
+    quarter = emb(torch.tensor([[0.25, 0.25]]))
+    assert quarter[0, 0, 0].item() == pytest.approx(1.0, abs=1e-5)
+
+
+def test_time_film_gamma_and_beta_come_from_distinct_halves():
+    """gamma is the first half of the projection and beta the second.
+
+    Force the output layer to emit a known constant vector so the two halves are
+    distinguishable, then check which is which. The existing test only asserts
+    both have the right shape, so swapping them is invisible.
+    """
+    film = TimeFiLM(embed_dim=6, hidden_dim=8, activation="silu", c_dec=3)
+    with torch.no_grad():
+        film.out.weight.zero_()
+        # out is [2 * c_dec] and gets viewed as [..., 2, c_dec]: the first c_dec
+        # entries become gamma, the last c_dec become beta.
+        film.out.bias.copy_(torch.tensor([1.0, 2.0, 3.0, -1.0, -2.0, -3.0]))
+
+    gamma, beta = film(torch.randn(4, 6))
+    assert torch.allclose(gamma, torch.tensor([1.0, 2.0, 3.0]).expand_as(gamma))
+    assert torch.allclose(beta, torch.tensor([-1.0, -2.0, -3.0]).expand_as(beta))
+
+
+def test_masked_layer_mixing_blocks_coupling_from_layers_above():
+    """The mask permits self-coupling and the layer below only.
+
+    Set every entry of W to 1 so that, without the mask, each output layer would
+    sum all input layers. The existing mask test leaves W at identity, where
+    `W * mask == W` and dropping the mask entirely changes nothing.
+    """
+    B, L, T, H, W_ = 1, 3, 1, 3, 3
+    C = 2
+    m = MaskedLayerMixing(L=L, C=C, init_identity=False)
+    with torch.no_grad():
+        m.W.fill_(1.0)
+        m.b.zero_()
+        m.expand_net.weight.fill_(1.0)
+        m.expand_net.bias.zero_()
+
+    # Put a distinct signal in the deepest layer only.
+    x = torch.zeros(B, L, T, H, W_)
+    x[:, 2] = 7.0
+
+    y = m(x)  # [B, T, L, C, H, W]
+    # mask[i, i] and mask[i, i-1] are open, so layer 2's signal may reach
+    # output layer 2 (self). It must NOT reach output layers 0 or 1.
+    assert torch.allclose(y[:, :, 0], torch.zeros_like(y[:, :, 0]), atol=1e-6), (
+        "layer 0 must not see layer 2 (coupling from above is masked out)"
+    )
+    assert torch.allclose(y[:, :, 1], torch.zeros_like(y[:, :, 1]), atol=1e-6), (
+        "layer 1 must not see layer 2 (coupling from above is masked out)"
+    )
+    assert not torch.allclose(y[:, :, 2], torch.zeros_like(y[:, :, 2]), atol=1e-6)
+
+
+def test_masked_layer_mixing_allows_coupling_from_the_layer_below():
+    """The complement of the test above: layer i-1 (below) must reach layer i,
+    so the mask is not simply diagonal."""
+    B, L, T, H, W_ = 1, 3, 1, 3, 3
+    m = MaskedLayerMixing(L=L, C=2, init_identity=False)
+    with torch.no_grad():
+        m.W.fill_(1.0)
+        m.b.zero_()
+        m.expand_net.weight.fill_(1.0)
+        m.expand_net.bias.zero_()
+
+    x = torch.zeros(B, L, T, H, W_)
+    x[:, 0] = 5.0  # signal in the shallowest layer
+
+    y = m(x)
+    assert not torch.allclose(y[:, :, 1], torch.zeros_like(y[:, :, 1]), atol=1e-6), (
+        "layer 1 must see layer 0 (the layer below)"
+    )
+    assert torch.allclose(y[:, :, 2], torch.zeros_like(y[:, :, 2]), atol=1e-6), (
+        "layer 2 must not see layer 0 (non-adjacent)"
+    )

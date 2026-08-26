@@ -56,7 +56,8 @@ def _mk_consts() -> HaemodynamicConstants:
 
 
 def _mk_acq() -> AcquisitionConstants:
-    return AcquisitionConstants(k1=7.0, k2=2.0, k3=2.0)
+    # k2 != k3 so that permuting the BOLD readout terms is detectable.
+    return AcquisitionConstants(k1=7.0, k2=2.0, k3=3.0)
 
 
 def _mk_layer(
@@ -856,3 +857,153 @@ def test_simulate_cortex_zero_input_stays_at_resting_state():
     assert np.allclose(d["v"], 1.0, atol=1e-6), "v drifted from resting 1.0 under zero input"
     assert np.allclose(d["q"], 1.0, atol=1e-6), "q drifted from resting 1.0 under zero input"
     assert np.allclose(d["s"], 0.0, atol=1e-6), "s drifted from 0.0 under zero input"
+
+
+# -----------------------------
+# Phase 2 oracles: balloon ODE right-hand side
+#
+# The derivative tests above evaluate the RHS either at the resting state
+# (v = f = q = 1), where every perturbation term multiplies zero and so
+# constrains nothing, or assert only key sets and finiteness. The tests below
+# evaluate it *away* from rest and pin the structure that actually matters:
+# the small-signal agreement between orders, the 1/tau scaling, and the
+# individual coefficients of the s equation.
+# -----------------------------
+
+
+def _perturbed_derivs(order, eps, *, c=None, tau=1.0):
+    """dv/dt and dq/dt at a state perturbed a distance ~eps away from rest."""
+    c = c or _mk_consts()
+    layer = _mk_layer(
+        tau=tau,
+        x=0.0,
+        s=0.0,
+        f=1.0 + eps,
+        v=1.0 + 0.7 * eps,
+        q=1.0 - 0.4 * eps,
+    )
+    d = balloon_derivatives(layer, c, order=order)
+    return float(np.asarray(d["dv_dt"])), float(np.asarray(d["dq_dt"]))
+
+
+@pytest.mark.parametrize("signal", ["dv", "dq"])
+def test_linear_order_is_first_order_accurate_against_exact(signal):
+    """The linear order is the Jacobian of the exact ODE about rest, so their
+    discrepancy must fall off as O(eps^2): halving the perturbation must shrink
+    the error by roughly 4x.
+
+    This is the oracle that constrains the exact order's Grubb exponent and the
+    linear order's 1/alpha coefficients against *each other*. At rest both
+    vanish identically, which is why the existing resting-state test cannot see
+    a difference between v**(1/alpha) and v**alpha.
+    """
+    pick = 0 if signal == "dv" else 1
+
+    def err(eps):
+        return abs(_perturbed_derivs("exact", eps)[pick] - _perturbed_derivs("linear", eps)[pick])
+
+    e1, e2 = err(1e-2), err(5e-3)
+    assert e1 > 0, "orders must not be trivially identical"
+    ratio = e1 / e2
+    assert 3.0 < ratio < 5.0, f"expected ~4x (second-order) error drop, got {ratio:.2f}"
+
+
+@pytest.mark.parametrize("signal", ["dv", "dq"])
+def test_quadratic_order_is_second_order_accurate_against_exact(signal):
+    """The quadratic order is the full second-order Taylor expansion of the exact
+    ODE about rest, so its discrepancy must fall off as O(eps^3): halving the
+    perturbation must shrink the error by roughly 8x.
+
+    This is strictly stronger than asserting the quadratic merely beats the
+    linear order. Every second-order coefficient (the v**2 terms, the f**2
+    coefficient `beta * log(1 - E0) / 2`, and the v*q cross term) has to be
+    exactly right for the cubic rate to hold; getting any of them wrong
+    degrades the rate to O(eps^2), i.e. a ratio of 4, while still comfortably
+    beating the linear order.
+    """
+    pick = 0 if signal == "dv" else 1
+
+    def err(eps):
+        return abs(
+            _perturbed_derivs("exact", eps)[pick] - _perturbed_derivs("quadratic", eps)[pick]
+        )
+
+    e1, e2 = err(1e-2), err(5e-3)
+    assert e1 > 0, "orders must not be trivially identical"
+    ratio = e1 / e2
+    assert 6.5 < ratio < 9.5, f"expected ~8x (third-order) error drop, got {ratio:.2f}"
+
+    # And it must still beat the linear order at the same perturbation.
+    exact = _perturbed_derivs("exact", 1e-2)[pick]
+    lin_err = abs(exact - _perturbed_derivs("linear", 1e-2)[pick])
+    assert err(1e-2) < lin_err
+
+
+@pytest.mark.parametrize("order", ["exact", "linear", "quadratic"])
+def test_v_q_derivatives_scale_inversely_with_tau(order):
+    """dv/dt and dq/dt carry an explicit 1/tau; ds/dt and df/dt do not.
+
+    Doubling tau must therefore halve dv/dt and dq/dt exactly and leave ds/dt
+    and df/dt untouched. No existing test varies tau comparatively, so dropping
+    a `/ layer.tau` currently changes nothing observable.
+    """
+    c = _mk_consts()
+    state = dict(x=0.3, s=0.2, f=1.1, v=1.05, q=0.95)
+    d1 = balloon_derivatives(_mk_layer(tau=1.0, **state), c, order=order)
+    d2 = balloon_derivatives(_mk_layer(tau=2.0, **state), c, order=order)
+
+    for key in ("dv_dt", "dq_dt"):
+        a, b = float(np.asarray(d1[key])), float(np.asarray(d2[key]))
+        assert abs(a) > 1e-6, f"{key} must be non-zero off-rest for this test to bite"
+        assert np.isclose(b, a / 2.0, rtol=1e-12), f"{key}: {b} != {a}/2"
+
+    for key in ("ds_dt", "df_dt"):
+        assert np.isclose(float(np.asarray(d1[key])), float(np.asarray(d2[key])), rtol=1e-12)
+
+
+def test_ds_dt_matches_hand_computed_value_off_rest():
+    """Pin each coefficient of ds/dt = x - kappa*s - gamma*(f - 1) separately.
+
+    With kappa=0.65, gamma=0.41 and (x, s, f) = (0.3, 0.2, 1.1):
+        0.3 - 0.65 * 0.2 - 0.41 * 0.1 = 0.3 - 0.13 - 0.041 = 0.129
+    Every term has a different magnitude, so swapping kappa and gamma, flipping
+    either sign, or dropping the (f - 1) offset all change the result.
+    """
+    c = _mk_consts()
+    layer = _mk_layer(tau=1.0, x=0.3, s=0.2, f=1.1, v=1.0, q=1.0)
+    d = balloon_derivatives(layer, c, order="exact")
+    assert np.isclose(float(np.asarray(d["ds_dt"])), 0.129, atol=1e-12)
+
+
+def test_df_dt_is_exactly_s():
+    """The flow equation is df/dt = s with no coefficient, evaluated off-rest so
+    that a swapped source signal (e.g. x instead of s) is visible."""
+    c = _mk_consts()
+    layer = _mk_layer(tau=1.0, x=0.9, s=0.25, f=1.1, v=1.05, q=0.95)
+    d = balloon_derivatives(layer, c, order="exact")
+    assert np.isclose(float(np.asarray(d["df_dt"])), 0.25, atol=1e-12)
+
+
+def test_exact_order_outflow_uses_grubb_exponent_one_over_alpha():
+    """With f fixed at 1 and v inflated, dv/dt = (f - v**(1/alpha)) / tau must be
+    strongly negative: v**(1/alpha) with alpha=0.32 is v**3.125, so v=1.1 gives
+    an outflow well above 1. Inverting the exponent to v**alpha would give
+    1.1**0.32 ~ 1.031 and a dv/dt roughly 10x smaller in magnitude.
+    """
+    c = _mk_consts()
+    layer = _mk_layer(tau=1.0, x=0.0, s=0.0, f=1.0, v=1.1, q=1.0)
+    dv = float(np.asarray(balloon_derivatives(layer, c, order="exact")["dv_dt"]))
+    expected = 1.0 - 1.1 ** (1.0 / 0.32)
+    assert np.isclose(dv, expected, rtol=1e-12)
+    assert dv < -0.3, "outflow must dominate; a flipped exponent gives only ~-0.03"
+
+
+def test_vasodilatory_signal_decays_toward_rest():
+    """Sign convention: with no drive (x=0) and f at rest, a positive s must
+    produce a negative ds/dt, i.e. the vasodilatory signal decays. A flipped
+    sign on the -kappa*s term would make it grow without bound."""
+    c = _mk_consts()
+    layer = _mk_layer(tau=1.0, x=0.0, s=0.5, f=1.0, v=1.0, q=1.0)
+    ds = float(np.asarray(balloon_derivatives(layer, c, order="exact")["ds_dt"]))
+    assert ds < 0
+    assert np.isclose(ds, -0.65 * 0.5, atol=1e-12)
