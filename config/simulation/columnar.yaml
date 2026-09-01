@@ -1,0 +1,61 @@
+# Columnar geometry: cortex sampled as spatially-independent columns per layer
+# (each column is already an average of ~10-20 voxels in the real pipeline),
+# instead of a 2-D sheet. Represented as a degenerate width-1 sheet
+# (grid_size=[num_columns, 1]) so the existing 2-D machinery (PSF, diffusion,
+# SpatialEncoder) needs no code changes -- it's disabled purely via config:
+#   - diffusion_coefficient_intra: 0.0 -- no inter-column coupling
+#   - bold.psf_fwhm_mm: [0.0, 0.0]     -- no PSF (imaging blur already
+#     subsumed by the ~10-20-voxel column averaging upstream of this pipeline)
+#   - neural_noise_type: white         -- "pink" spatially correlates
+#     neighbouring grid cells via a 2-D FFT (see signals.py:Noise.generate),
+#     which would reintroduce cross-column correlation along the real axis
+# A real column spans all 3 layers at one location, so source_placement
+# reuses the existing "shared_position" cortical-column scenario.
+#
+# grid_size/time_duration/BOLD_SNR matched to the real V1 columnar dataset at
+# /media/RCPNAS/Data/Karolis/timecourses (see notebooks/04_real_vs_simulated_comparison.ipynb):
+# real n_columns_used is 38-81 per subject (mean/median ~60), real T is 163
+# volumes/run for nearly every subject.
+#
+# BOLD_SNR=-23.5 target derivation:
+#   1. Real target signal fraction f = Var(signal)/Var(total) ~ 0.09-0.12,
+#      measured directly from real cross-run reliability (mean column-wise
+#      correlation between repeated runs of the same task task, r~0.12; for
+#      independent per-run noise, corr(run_i,run_j) = Var(signal)/Var(total) = f).
+#   2. get_bold_from_state (balloon.py:792-805) sets noise amplitude from
+#      p_signal = mean(bold**2) computed over the FULL (T, num_columns, 1)
+#      grid at once, not per-column -- with diffusion_coefficient_intra=0.0,
+#      every off-source column is exactly zero (see the neuronal.py
+#      independence test), so p_signal is diluted by a factor of roughly
+#      num_columns relative to the source column's own power. The naive
+#      formula SNR_db = 10*log10(f/(1-f)) (~-9dB for f~0.1) therefore comes
+#      out far too high once actually realized at the source column.
+#   3. Confirmed empirically, not just by this reasoning: at BOLD_SNR=-9.0 the
+#      REALIZED signal fraction at the source column (measured directly as
+#      Var(source column) vs. Var(off-source columns) in the generated HDF5)
+#      was ~0.76, not ~0.10. A -14.5dB correction (predicted from the same
+#      linear noise-amplitude relationship, then re-simulated and re-measured
+#      to confirm) lands the realized f at ~0.12-0.13, matching the real target.
+#   NOTE: this dilution factor scales with grid_size (num_columns) and the
+#   number of simultaneously-active layers/sources -- if grid_size ever
+#   changes from 60, BOLD_SNR must be re-derived, not just copied.
+defaults:
+  - base
+  - _self_
+
+output_path: data/simulations-columnar.h5
+
+simulation:
+  grid_size: [60, 1]
+  time_duration: 163
+  BOLD_SNR: -23.5
+  diffusion_coefficient_intra: 0.0
+  neural_noise_type: white
+  min_active_layers: 2   # guarantees >=2 of the 3 layers share the column
+  max_active_layers: 3
+  source_placement:
+    sources_per_layer: [1, 1]   # exactly one source per active layer (required for shared_position)
+    shared_position: true
+
+bold:
+  psf_fwhm_mm: [0.0, 0.0]

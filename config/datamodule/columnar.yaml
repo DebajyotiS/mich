@@ -1,0 +1,6 @@
+defaults:
+  - default
+  - _self_
+
+data:
+  path: ${paths.data_dir}/simulations-columnar.h5

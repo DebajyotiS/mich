@@ -1,0 +1,40 @@
+# Columnar variant of the default model: disables SpatialEncoder's cross-position
+# mixing by setting every stage's dw_kernel to 1. A kernel_size=1 depthwise conv is
+# an exact per-position identity-shape op (no receptive field beyond the position
+# itself), not an approximation of "no coupling" -- this matches the columnar sim
+# config's diffusion_coefficient_intra=0.0 (see config/simulation/columnar.yaml)
+# and requires no changes to blocks.py: the module already supports any dw_kernel.
+defaults:
+  - default
+  - _self_
+
+heinzle_net:
+  spatial_encoder_config:
+    - cin: ${model.C}
+      cout: ${model.c_enc}
+      stride: 1
+      dw_kernel: 1
+      pw_kernel: 1
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
+      stride: 1
+      dw_kernel: 1
+      pw_kernel: 1
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
+      stride: 1
+      dw_kernel: 1
+      pw_kernel: 1
+      num_groups: 8
+      activation: silu
+    - cin: ${model.c_enc}
+      cout: ${model.c_enc}
+      stride: 1
+      dw_kernel: 1
+      pw_kernel: 1
+      num_groups: 8
+      activation: silu
