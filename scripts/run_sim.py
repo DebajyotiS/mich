@@ -236,7 +236,17 @@ def _run_neural(
             total_pulses_count += len(pulse_list)
 
     # Run execution loop through the coupled simulator framework
-    neural_noise = Noise(type="pink", seed=seed, domain="both")
+    neural_noise_type: str = sc.get("neural_noise_type", "pink")
+    neural_noise_domain: str = sc.get("neural_noise_domain", "both")
+    if neural_noise_type == "pink" and 1 in grid_size:
+        raise ValueError(
+            f"neural_noise_type='pink' spatially correlates neighbouring grid cells "
+            f"via a 2-D FFT (Noise.generate); grid_size={grid_size} has a degenerate "
+            "axis of size 1 (e.g. columnar data), so pink noise would silently "
+            "reintroduce cross-column correlation along the real axis. Use "
+            "neural_noise_type='white' or 'uniform' instead."
+        )
+    neural_noise = Noise(type=neural_noise_type, seed=seed, domain=neural_noise_domain)
     simulator = LayeredDiffusionSimulator(sim_params)
     history = simulator.simulate(
         sources=sources.get_sources(),
