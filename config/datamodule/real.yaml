@@ -1,0 +1,13 @@
+# Inference-only datamodule over scripts/preprocess_real.py's output directory.
+# No train/val/test split -- real data has no ground truth to hold anything out
+# for. See src/mich/data/real.py:RealColumnarDataModule.
+_target_: mich.data.real.RealColumnarDataModule
+
+data:
+  path: ${paths.data_dir}/real_preprocessed
+
+loader:
+  batch_size: 1   # see RealColumnarDataModule docstring: >1 requires every
+                   # subject to have the same column count C
+  num_workers: 4
+  pin_memory: false
