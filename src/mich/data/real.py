@@ -42,8 +42,7 @@ def load_run(path: Path, expected_volumes: int) -> np.ndarray:
         raise ValueError(f"{path}: expected a 3-D (L, C, T) array, got shape {arr.shape}")
     if arr.shape[-1] != expected_volumes:
         raise ValueError(
-            f"{path}: expected {expected_volumes} volumes, got {arr.shape[-1]} "
-            f"(shape {arr.shape})"
+            f"{path}: expected {expected_volumes} volumes, got {arr.shape[-1]} (shape {arr.shape})"
         )
     return arr
 
@@ -69,9 +68,7 @@ def zscore_run(run: np.ndarray, *, path_for_error: Path) -> np.ndarray:
     return (run - mean) / std
 
 
-def preprocess_subject(
-    subject_dir: Path, *, expected_volumes: int
-) -> tuple[np.ndarray, list[int]]:
+def preprocess_subject(subject_dir: Path, *, expected_volumes: int) -> tuple[np.ndarray, list[int]]:
     """Load, per-run z-score, and concatenate every run for one subject.
 
     Runs are z-scored *before* concatenation (not concatenated then z-scored

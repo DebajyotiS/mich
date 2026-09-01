@@ -715,10 +715,14 @@ def test_columnar_grid_has_zero_coupling_between_columns():
     """
     grid_size = (9, 1)
     source_col = 4
-    sim = _make_sim(num_layers=1, grid_size=grid_size, diff_intra=0.0, diff_inter=0.0, decay_rate=0.5)
+    sim = _make_sim(
+        num_layers=1, grid_size=grid_size, diff_intra=0.0, diff_inter=0.0, decay_rate=0.5
+    )
     signal = np.array([1.0, 2.0, -1.5, 3.0, 0.5])
     src = _source(layer=0, position=(source_col, 0), signal=signal)
-    hist = sim.simulate([src], steps=len(signal) + 5, snr_db=np.inf, noise=SpyNoise(domain="spatial"))
+    hist = sim.simulate(
+        [src], steps=len(signal) + 5, snr_db=np.inf, noise=SpyNoise(domain="spatial")
+    )
 
     other_cols = [c for c in range(grid_size[0]) if c != source_col]
     assert np.all(hist[:, 0, other_cols, 0] == 0.0)

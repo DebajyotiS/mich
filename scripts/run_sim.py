@@ -208,9 +208,7 @@ def _run_neural(
 
         for _ in range(num_positions):
             pos = (
-                shared_pos
-                if shared_position
-                else tuple(int(rng.integers(0, g)) for g in grid_size)
+                shared_pos if shared_position else tuple(int(rng.integers(0, g)) for g in grid_size)
             )
 
             if shared_pulse_data is not None:
