@@ -178,7 +178,7 @@ def _run_neural(
     # same (x, y) -- a cortical column -- instead of each layer drawing its own position.
     shared_pos: tuple[int, int] | None = None
     if shared_position:
-        shared_pos = tuple(rng.integers(0, grid_size[0], size=2).tolist())
+        shared_pos = tuple(int(rng.integers(0, g)) for g in grid_size)
 
     # When shared_pulse is set, every active layer's source also reuses the exact same
     # pulse train/waveform, drawn once here, instead of each layer drawing its own.
@@ -210,7 +210,7 @@ def _run_neural(
             pos = (
                 shared_pos
                 if shared_position
-                else tuple(rng.integers(0, grid_size[0], size=2).tolist())
+                else tuple(int(rng.integers(0, g)) for g in grid_size)
             )
 
             if shared_pulse_data is not None:
