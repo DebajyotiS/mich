@@ -704,3 +704,23 @@ def test_inter_layer_coupling_moves_activity_between_layers():
     col = hist[-1, 1].copy()
     col[4, 4] = 0.0
     assert np.all(np.abs(col) < 1e-15)
+
+
+def test_columnar_grid_has_zero_coupling_between_columns():
+    """Columnar geometry is represented as a degenerate width-1 sheet
+    (grid_size=(N, 1)) with diffusion_coefficient_intra=0.0. With no diffusion
+    term and no noise, a source at one column has no mechanism at all to reach
+    any other column, so every other column must stay exactly zero -- not just
+    approximately -- for the entire simulation.
+    """
+    grid_size = (9, 1)
+    source_col = 4
+    sim = _make_sim(num_layers=1, grid_size=grid_size, diff_intra=0.0, diff_inter=0.0, decay_rate=0.5)
+    signal = np.array([1.0, 2.0, -1.5, 3.0, 0.5])
+    src = _source(layer=0, position=(source_col, 0), signal=signal)
+    hist = sim.simulate([src], steps=len(signal) + 5, snr_db=np.inf, noise=SpyNoise(domain="spatial"))
+
+    other_cols = [c for c in range(grid_size[0]) if c != source_col]
+    assert np.all(hist[:, 0, other_cols, 0] == 0.0)
+    # sanity check the test isn't vacuous: the source column itself did move.
+    assert np.any(hist[: len(signal), 0, source_col, 0] != 0.0)
