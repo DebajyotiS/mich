@@ -1,4 +1,4 @@
-"""Optionally-learnable physiological constants (kappa/gamma/alpha/tau/V0/E0).
+"""Optionally-learnable physiological constants (kappa/gamma/alpha/tau/lambda_d/V0/E0).
 
 Parameterized in log-space so gradient descent can't push a physically positive-only
 quantity negative; `_physio()` exponentiates back on read. Any name not flagged True in
@@ -22,7 +22,7 @@ class LearnablePhysioMixin:
     Reads/uses, none of which this class defines itself:
       - `self.hparams` (from `LightningModule.save_hyperparameters`, inherited
         via the concrete model's `LightningModule` base): `self.hparams.haemo.{kappa,
-        gamma,alpha,tau}`, `self.hparams.V0`, `self.hparams.acquisition.{E0,k1,k2,k3,
+        gamma,alpha,tau,lambda_d}`, `self.hparams.V0`, `self.hparams.acquisition.{E0,k1,k2,k3,
         f0,TE,eps,r0}` -- the last four (`f0,TE,eps,r0`) only if `learnable_physio.E0`
         is True, since only then does `_current_acquisition` recompute k1/k2/k3.
       - `self.register_parameter` (from `nn.Module`, mixed in alongside this class
@@ -42,6 +42,7 @@ class LearnablePhysioMixin:
         "gamma": ("haemo", "gamma"),
         "alpha": ("haemo", "alpha"),
         "tau": ("haemo", "tau"),
+        "lambda_d": ("haemo", "lambda_d"),
         "V0": (None, "V0"),
         "E0": ("acquisition", "E0"),
     }

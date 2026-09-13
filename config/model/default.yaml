@@ -200,12 +200,13 @@ loss_config:
 image_log_every_n_val_calls: 1
 
 # set true to make a physiological constant learnable (optimized in log-space, init
-# from the simulation value). lambda_d/tau_d not yet supported; k1/k2/k3 recompute from E0.
+# from the simulation value). tau_d not yet supported; k1/k2/k3 recompute from E0.
 learnable_physio:
   kappa: false
   gamma: false
   alpha: false
   tau: false
+  lambda_d: false
   V0: false
   E0: false
 

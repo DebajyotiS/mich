@@ -589,7 +589,7 @@ class MICHLossMixin(CollocationMixin):
         _alpha = self._physio("alpha")
         gamma = self._physio("gamma")
         kappa = self._physio("kappa")
-        lambda_d = self.hparams.haemo.lambda_d  # not learnable (currently out of scope)
+        lambda_d = self._physio("lambda_d")
         tau = self._physio("tau")
         tau_d = self.hparams.haemo.tau_d  # not learnable (currently out of scope)
         _E0 = self._physio("E0")
@@ -959,7 +959,7 @@ class MICHLossMixin(CollocationMixin):
                 f_true, v_true, q_true, lc.order, need_v="v" in signals, need_q="q" in signals
             )
             if has_drain:
-                lambda_d = self.hparams.haemo.lambda_d
+                lambda_d = self._physio("lambda_d")
                 if "v" in signals:
                     v_star_true = batch["v_star"].float()[:, :, :T_min]
                     drain_v = torch.zeros_like(target_vdot)

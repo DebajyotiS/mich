@@ -136,6 +136,7 @@ learnable_physio:
   gamma: false
   alpha: false
   tau: false
+  lambda_d: false
   V0: false
   E0: false
 
