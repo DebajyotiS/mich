@@ -708,17 +708,22 @@ class MICH(LearnablePhysioMixin, MICHLossMixin, MICHLoggingMixin, LightningModul
 
         # Neural recovery metrics over the full val set (not just the plot subset),
         # averaged over every real source per sample (not just source slot 0) --
-        # padded slots (index >= num_sources) are masked out before averaging.
+        # padded slots (index >= num_sources) are masked out before averaging. Each
+        # source is gathered at its OWN layer only (all_src_l) -- indexing every layer
+        # at a source's (h, w) would pull in unrelated layers' activity at that same
+        # spatial position, diluting this into a source+incidental-background mix
+        # instead of a clean source-voxel metric (invisible at L=1, wrong for L>1).
         S = source_position.shape[1]
         all_src_h = source_position[..., 0].long()  # [B, S]
         all_src_w = source_position[..., 1].long()  # [B, S]
+        all_src_l = source_layer.long()  # [B, S]
         all_batch = (
             torch.arange(z_hat.shape[0], device=z_hat.device).unsqueeze(1).expand(-1, S)
         )  # [B, S]
         all_pred_neural = z_hat[
-            all_batch, self._signal_index("x"), :, :, all_src_h, all_src_w
-        ]  # [B, S, L, T]
-        all_true_neural = neural[all_batch, :, :, all_src_h, all_src_w]  # [B, S, L, T]
+            all_batch, self._signal_index("x"), all_src_l, :, all_src_h, all_src_w
+        ]  # [B, S, T]
+        all_true_neural = neural[all_batch, all_src_l, :, all_src_h, all_src_w]  # [B, S, T]
         src_mask = torch.arange(S, device=z_hat.device)[None, :] < num_sources[:, None]  # [B, S]
         metrics = self._neural_recovery_metrics(
             all_pred_neural[src_mask], all_true_neural[src_mask]

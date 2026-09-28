@@ -250,14 +250,21 @@ def infer_supervised(model, batch: dict):
 
 
 def gather_source_traces(
-    full: torch.Tensor, source_position: torch.Tensor, num_sources: torch.Tensor
+    full: torch.Tensor,
+    source_position: torch.Tensor,
+    source_layer: torch.Tensor,
+    num_sources: torch.Tensor,
 ):
-    """full: [B, L, T, H, W] -> [sum(valid sources), L, T], gathered at every real source."""
+    """full: [B, L, T, H, W] -> [sum(valid sources), T], gathered at each real source's
+    own layer. Indexing every layer at a source's (h, w) -- rather than just the layer
+    it actually belongs to -- would mix in unrelated layers' activity at that same
+    spatial position; invisible at L=1, wrong for L>1."""
     B, S = source_position.shape[:2]
     src_h = source_position[..., 0].long()
     src_w = source_position[..., 1].long()
+    src_l = source_layer.long()
     b_idx = torch.arange(B, device=full.device).unsqueeze(1).expand(-1, S)
-    gathered = full[b_idx, :, :, src_h, src_w]  # [B, S, L, T]
+    gathered = full[b_idx, src_l, :, src_h, src_w]  # [B, S, T]
     mask = torch.arange(S, device=full.device)[None, :] < num_sources[:, None]
     return gathered[mask]
 
@@ -274,6 +281,41 @@ def compute_grid_metrics(
     B, L, T, H, W = true_full.shape
     pred = pred_full.permute(0, 1, 3, 4, 2).reshape(-1, T)
     true = true_full.permute(0, 1, 3, 4, 2).reshape(-1, T)
+    if pred.shape[0] > max_rows:
+        idx = torch.randperm(pred.shape[0], device=pred.device)[:max_rows]
+        pred, true = pred[idx], true[idx]
+    return metrics_fn(pred, true)
+
+
+def compute_off_source_metrics(
+    pred_full: torch.Tensor,
+    true_full: torch.Tensor,
+    source_position: torch.Tensor,
+    source_layer: torch.Tensor,
+    num_sources: torch.Tensor,
+    metrics_fn,
+    max_rows: int = 20000,
+):
+    """Same R2/Pearson/lag metric as compute_grid_metrics, but excludes every real
+    source voxel (masked per its own layer) from the pool -- isolates purely
+    off-source/background recovery, unlike compute_grid_metrics's whole-grid pool
+    where a handful of well-recovered source voxels can mask poor background
+    recovery."""
+    B, L, T, H, W = true_full.shape
+    device = true_full.device
+    occ = torch.zeros(B, L, H, W, dtype=torch.bool, device=device)
+    S = source_position.shape[1]
+    src_h = source_position[..., 0].long()
+    src_w = source_position[..., 1].long()
+    src_l = source_layer.long()
+    valid = torch.arange(S, device=device)[None, :] < num_sources[:, None]
+    b_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, S)
+    occ[b_idx[valid], src_l[valid], src_h[valid], src_w[valid]] = True
+
+    pred = pred_full.permute(0, 1, 3, 4, 2).reshape(-1, T)
+    true = true_full.permute(0, 1, 3, 4, 2).reshape(-1, T)
+    off_mask = (~occ).reshape(-1)
+    pred, true = pred[off_mask], true[off_mask]
     if pred.shape[0] > max_rows:
         idx = torch.randperm(pred.shape[0], device=pred.device)[:max_rows]
         pred, true = pred[idx], true[idx]
@@ -458,22 +500,38 @@ def evaluate_one(model, model_kind: str, batch: dict, label: str, args, out_dir:
         pred_bold, z_hat = None, None
 
     source_metrics = metrics_fn(
-        gather_source_traces(pred_neural, batch["source_position"], batch["num_sources"]),
-        gather_source_traces(batch["neural"], batch["source_position"], batch["num_sources"]),
+        gather_source_traces(
+            pred_neural, batch["source_position"], batch["source_layer"], batch["num_sources"]
+        ),
+        gather_source_traces(
+            batch["neural"], batch["source_position"], batch["source_layer"], batch["num_sources"]
+        ),
     )
     grid_metrics = compute_grid_metrics(pred_neural, batch["neural"], metrics_fn)
+    off_source_metrics = compute_off_source_metrics(
+        pred_neural,
+        batch["neural"],
+        batch["source_position"],
+        batch["source_layer"],
+        batch["num_sources"],
+        metrics_fn,
+    )
     metrics = {
         f"{model_kind}/source/r2": source_metrics["val/neural/r2"],
         f"{model_kind}/source/pearson": source_metrics["val/neural/pearson"],
         f"{model_kind}/source/lag_samples": source_metrics["val/neural/lag_samples"],
         f"{model_kind}/grid/r2": grid_metrics["val/neural/r2"],
         f"{model_kind}/grid/pearson": grid_metrics["val/neural/pearson"],
+        f"{model_kind}/off_source/r2": off_source_metrics["val/neural/r2"],
+        f"{model_kind}/off_source/pearson": off_source_metrics["val/neural/pearson"],
+        f"{model_kind}/off_source/lag_samples": off_source_metrics["val/neural/lag_samples"],
     }
 
+    n_plot = min(args.n_samples, getattr(args, "n_plot_samples", args.n_samples))
     pred_figs = plot_prediction_figures(
-        batch, pred_neural, pred_bold if pred_bold is not None else batch["bold"], args.n_samples
+        batch, pred_neural, pred_bold if pred_bold is not None else batch["bold"], n_plot
     )
-    latent_figs = plot_latent_figures(model, z_hat, batch, args.n_samples) if is_pinn else []
+    latent_figs = plot_latent_figures(model, z_hat, batch, n_plot) if is_pinn else []
 
     gif_paths = []
     if not args.no_gif:
@@ -569,6 +627,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="Samples loaded per data source, used for metrics + plots",
+    )
+    parser.add_argument(
+        "--n-plot-samples",
+        type=int,
+        default=8,
+        help="How many of --n-samples also get prediction/latent PNGs (capped to --n-samples); "
+        "keeps large -n metric runs from generating one figure per sample",
     )
     parser.add_argument(
         "--n-gif-samples",

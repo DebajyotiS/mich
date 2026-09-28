@@ -25,7 +25,7 @@ from pytorch_lightning.callbacks import Callback
 
 from mich.data.synthetic import SyntheticDataModule
 from mich.models.blocks import HeinzleNet
-from mich.models.mich import MICH
+from mich.models.mich import MICH, MICHManifest
 
 # -------------------------
 # Module-level constants
@@ -868,6 +868,45 @@ class TestMICHValidationEpochEnd:
         assert model.logged["val/neural/grid_pearson_layer0"] == pytest.approx(
             model.logged["val/neural/grid_pearson"]
         )
+
+    def test_source_metric_uses_only_the_sources_own_layer(self, monkeypatch):
+        """Regression test: `val/neural/pearson` for a source must come from its
+        own layer's trace only, not be diluted by unrelated activity in other
+        layers at the same (h, w) -- the bug this guards against indexed every
+        layer at a source's spatial position instead of `source_layer`
+        specifically (invisible at L=1, wrong for L>1)."""
+        model = _make_mich(L=_L3)
+        B, S = 1, 1
+        batch = _make_full_batch(B=B, L=_L3, T=_T, H=_H, W=_W, S=S)
+        batch["source_layer"] = torch.zeros(B, S, dtype=torch.long)  # source lives in layer 0
+        batch["num_sources"] = torch.ones(B, dtype=torch.long)
+        h, w = int(batch["source_position"][0, 0, 0]), int(batch["source_position"][0, 0, 1])
+
+        x_idx = model._signal_index("x")
+        true_neural = torch.randn(B, _L3, _T, _H, _W)
+        z_hat = torch.randn(B, 7, _L3, _T, _H, _W)
+        # Source's own layer (0): prediction matches truth exactly at the source voxel.
+        z_hat[:, x_idx, 0, :, h, w] = true_neural[:, 0, :, h, w]
+        # Other layers at that same (h, w): deliberately anti-correlated, so any
+        # leakage from indexing "every layer" instead of just layer 0 is detectable.
+        for layer in (1, 2):
+            z_hat[:, x_idx, layer, :, h, w] = -true_neural[:, layer, :, h, w]
+
+        fake_manifest = MICHManifest(
+            data_loss=torch.tensor(0.0),
+            physics_loss=torch.tensor(0.0),
+            total_loss=torch.tensor(0.0),
+            bold=batch["bold"],
+            neural=true_neural,
+            z_hat=z_hat,
+        )
+        monkeypatch.setattr(model, "_shared_step", lambda batch, stage: fake_manifest)
+        batch["neural"] = true_neural
+
+        self._run_validation_step_and_epoch_end(model, batch)
+
+        assert model.logged["val/neural/pearson"] == pytest.approx(1.0, abs=1e-4)
+        assert model.logged["val/neural/r2"] == pytest.approx(1.0, abs=1e-3)
 
     def test_validation_plots_split_five_source_five_off_source_of_ten(self, monkeypatch):
         model = _make_mich(L=_L3)
